@@ -262,6 +262,9 @@ int init_chunk(HexStateEngine *eng, uint64_t id, uint64_t num_hexits)
         c->hilbert.q_flags = 0x01;  /* superposed */
         c->hilbert.q_entangle_seed = 0;
         c->hilbert.q_basis_rotation = 0;
+        c->hilbert.q_joint_state = NULL;
+        c->hilbert.q_partner = 0;
+        c->hilbert.q_which = 0;
 
         printf("  [PARALLEL] Magic Pointer 0x%016lX — %lu hexits (infinite plane)\n",
                c->hilbert.magic_ptr, num_hexits);
@@ -334,12 +337,48 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
     Chunk *c = &eng->chunks[id];
 
     if (c->hilbert.shadow_state == NULL) {
-        /* ── WRITE basis rotation to Magic Pointer address ──
-         * Each Hadamard application increments the rotation counter.
-         * Measurement reads this to determine the basis. */
-        c->hilbert.q_basis_rotation++;
-        printf("  [H] Hadamard WRITTEN to Magic Pointer 0x%016lX (rotation=%lu)\n",
-               c->hilbert.magic_ptr, c->hilbert.q_basis_rotation);
+        /* ═══ WRITE DFT₆ transformation to Hilbert space ═══
+         * The joint state at the Magic Pointer address IS the
+         * quantum state. We transform it in-place — the Hilbert
+         * space does the computation. */
+        if (c->hilbert.q_joint_state) {
+            init_dft6();
+            Complex *joint = c->hilbert.q_joint_state;
+            uint8_t which = c->hilbert.q_which;
+            Complex tmp[6];
+
+            if (which == 0) {
+                /* DFT₆ on A side: for each fixed b, transform a */
+                for (int b = 0; b < 6; b++) {
+                    for (int j = 0; j < 6; j++) {
+                        tmp[j] = cmplx(0.0, 0.0);
+                        for (int k = 0; k < 6; k++)
+                            tmp[j] = cadd(tmp[j],
+                                cmul(dft6_matrix[j][k], joint[b * 6 + k]));
+                    }
+                    for (int j = 0; j < 6; j++)
+                        joint[b * 6 + j] = tmp[j];
+                }
+            } else {
+                /* DFT₆ on B side: for each fixed a, transform b */
+                for (int a = 0; a < 6; a++) {
+                    for (int j = 0; j < 6; j++) {
+                        tmp[j] = cmplx(0.0, 0.0);
+                        for (int k = 0; k < 6; k++)
+                            tmp[j] = cadd(tmp[j],
+                                cmul(dft6_matrix[j][k], joint[k * 6 + a]));
+                    }
+                    for (int j = 0; j < 6; j++)
+                        joint[j * 6 + a] = tmp[j];
+                }
+            }
+            printf("  [H] DFT₆ WRITTEN to Hilbert space at Ptr 0x%016lX (side %c)\n",
+                   c->hilbert.magic_ptr, which == 0 ? 'A' : 'B');
+        } else {
+            c->hilbert.q_basis_rotation++;
+            printf("  [H] Basis rotation WRITTEN to Ptr 0x%016lX (rot=%lu)\n",
+                   c->hilbert.magic_ptr, c->hilbert.q_basis_rotation);
+        }
         return;
     }
 
@@ -388,55 +427,88 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
     Chunk *c = &eng->chunks[id];
 
     if (c->hilbert.shadow_state == NULL) {
-        /* ═══ READ quantum state from Magic Pointer address ═══
-         * The HilbertRef struct at &eng->chunks[id] IS the memory
-         * referenced by Magic Pointer 0x4858...  We READ the
-         * quantum state that was WRITTEN there by:
-         *   create_superposition() → q_flags
-         *   braid_chunks()         → q_entangle_seed
-         *   apply_hadamard()       → q_basis_rotation
-         */
+        /* ═══ READ from Hilbert space at this Magic Pointer ═══
+         * The quantum state was WRITTEN here by braid_chunks()
+         * and transformed by apply_hadamard(). We READ the
+         * result via Born rule — the Hilbert space gives us
+         * the answer. */
+
+        if (c->hilbert.q_joint_state) {
+            /* ── Genuine quantum measurement (Born rule) ── */
+            Complex *joint = c->hilbert.q_joint_state;
+            uint8_t which = c->hilbert.q_which;
+
+            /* READ: compute marginal probabilities for our side */
+            double probs[6] = {0};
+            for (int me = 0; me < 6; me++) {
+                for (int them = 0; them < 6; them++) {
+                    int idx = (which == 0) ? them * 6 + me : me * 6 + them;
+                    probs[me] += cnorm2(joint[idx]);
+                }
+            }
+
+            /* Born rule: sample from the Hilbert space */
+            double r = prng_uniform(eng);
+            double cumul = 0.0;
+            int result = 5;
+            for (int i = 0; i < 6; i++) {
+                cumul += probs[i];
+                if (cumul >= r) { result = i; break; }
+            }
+
+            /* WRITE collapse back to Hilbert space:
+             * Zero all amplitudes incompatible with our outcome.
+             * The partner's state is automatically determined. */
+            double norm = 0.0;
+            for (int them = 0; them < 6; them++) {
+                for (int me = 0; me < 6; me++) {
+                    int idx = (which == 0) ? them * 6 + me : me * 6 + them;
+                    if (me != result) {
+                        joint[idx] = cmplx(0.0, 0.0);
+                    } else {
+                        norm += cnorm2(joint[idx]);
+                    }
+                }
+            }
+            /* Renormalize surviving amplitudes */
+            if (norm > 0.0) {
+                double scale = 1.0 / sqrt(norm);
+                for (int them = 0; them < 6; them++) {
+                    int idx = (which == 0) ? them * 6 + result : result * 6 + them;
+                    joint[idx] = cmplx(joint[idx].real * scale,
+                                       joint[idx].imag * scale);
+                }
+            }
+
+            eng->measured_values[id] = (uint64_t)result;
+            c->hilbert.q_flags = 0x02;  /* measured */
+
+            printf("  [MEAS] READ Hilbert space at Ptr 0x%016lX "
+                   "(side %c, Born rule) => %d\n",
+                   c->hilbert.magic_ptr, which == 0 ? 'A' : 'B', result);
+
+            return (uint64_t)result;
+        }
+
+        /* ── Fallback: seed-based (no joint state) ── */
         uint8_t  flags = c->hilbert.q_flags;
         uint64_t seed  = c->hilbert.q_entangle_seed;
         uint64_t basis = c->hilbert.q_basis_rotation;
-
         uint64_t result;
-        uint64_t modulus = 6;  /* 6 basis states */
 
         if (seed != 0 && (flags & 0x01)) {
-            /* ── Entangled + superposed ──
-             * The seed IS the shared quantum state — it was WRITTEN
-             * to both chunks by braid_chunks(). Both partners READ
-             * the same seed from their Magic Pointer address.
-             * Same input → same output → Bell correlation.
-             * Basis rotation modifies the readout (measurement basis). */
-            result = (seed ^ (basis * 2654435761ULL)) % modulus;
+            result = (seed ^ (basis * 2654435761ULL)) % 6;
         } else if (flags & 0x01) {
-            /* ── Superposed, not entangled ──
-             * Born rule on uniform superposition → uniform random. */
-            result = engine_prng(eng) % modulus;
+            result = engine_prng(eng) % 6;
         } else {
-            /* ── Not superposed: ground state |0⟩ ── */
             result = 0;
         }
 
-        /* ── WRITE collapse to Magic Pointer address ──
-         * This stores the measurement result at this sector.
-         * The quantum state is consumed (no longer superposed). */
-        c->hilbert.q_flags = 0x02;           /* measured */
-        c->hilbert.q_entangle_seed = 0;      /* entanglement consumed */
+        c->hilbert.q_flags = 0x02;
+        c->hilbert.q_entangle_seed = 0;
         eng->measured_values[id] = result;
-
-        printf("  [MEAS] READ Magic Pointer 0x%016lX → ",
-               c->hilbert.magic_ptr);
-        if (seed != 0)
-            printf("entangled (seed=0x%016lX, basis=%lu) ", seed, basis);
-        else if (flags & 0x01)
-            printf("superposed (Born rule) ");
-        else
-            printf("ground state ");
-        printf("=> %lu\n", result);
-
+        printf("  [MEAS] READ Ptr 0x%016lX (seed fallback) => %lu\n",
+               c->hilbert.magic_ptr, result);
         return result;
     }
 
@@ -561,22 +633,54 @@ void braid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b,
     link->hexit_a = hexit_a;
     link->hexit_b = hexit_b;
 
-    /* ── WRITE shared entanglement seed to BOTH Magic Pointer addresses ──
-     * This is the entanglement: the same data written to both sectors.
-     * When measure_chunk() reads from either pointer, it reads the
-     * same seed → produces the same outcome → Bell correlation. */
-    uint64_t entangle_seed = engine_prng(eng);
-    /* Ensure seed is never zero (zero = "no entanglement") */
-    if (entangle_seed == 0) entangle_seed = 0xDEADBEEF;
+    /* ═══ WRITE Bell state to Hilbert space at both Magic Pointers ═══
+     * Allocate a 2-particle joint state: |Ψ⟩ = (1/√6) Σ |k⟩_A |k⟩_B
+     * This IS the quantum state — 36 Complex amplitudes stored at
+     * the Magic Pointer addresses. Both pointers reference the same
+     * Hilbert space sector (shared allocation). */
+    if (eng->chunks[a].hilbert.shadow_state == NULL &&
+        eng->chunks[b].hilbert.shadow_state == NULL) {
 
-    eng->chunks[a].hilbert.q_entangle_seed = entangle_seed;
-    eng->chunks[b].hilbert.q_entangle_seed = entangle_seed;
+        /* Free any previous joint state */
+        if (eng->chunks[a].hilbert.q_joint_state &&
+            eng->chunks[a].hilbert.q_joint_state != eng->chunks[b].hilbert.q_joint_state) {
+            free(eng->chunks[a].hilbert.q_joint_state);
+        }
+        if (eng->chunks[b].hilbert.q_joint_state &&
+            eng->chunks[b].hilbert.q_joint_state != eng->chunks[a].hilbert.q_joint_state) {
+            free(eng->chunks[b].hilbert.q_joint_state);
+        }
 
-    printf("  [BRAID] Entanglement WRITTEN to Magic Pointers "
-           "0x%016lX <-> 0x%016lX (seed=0x%016lX)\n",
-           eng->chunks[a].hilbert.magic_ptr,
-           eng->chunks[b].hilbert.magic_ptr,
-           entangle_seed);
+        /* Allocate joint state in Hilbert space */
+        Complex *joint = calloc(36, sizeof(Complex));
+        double amp = 1.0 / sqrt(6.0);
+        for (int k = 0; k < 6; k++)
+            joint[k * 6 + k] = cmplx(amp, 0.0);  /* |k⟩_A |k⟩_B */
+
+        /* WRITE to both Magic Pointer addresses */
+        eng->chunks[a].hilbert.q_joint_state = joint;
+        eng->chunks[b].hilbert.q_joint_state = joint;
+        eng->chunks[a].hilbert.q_partner = b;
+        eng->chunks[b].hilbert.q_partner = a;
+        eng->chunks[a].hilbert.q_which = 0;  /* A side */
+        eng->chunks[b].hilbert.q_which = 1;  /* B side */
+        eng->chunks[a].hilbert.q_flags = 0x01;  /* superposed */
+        eng->chunks[b].hilbert.q_flags = 0x01;  /* superposed */
+
+        printf("  [BRAID] Bell state |Ψ⟩=(1/√6)Σ|k⟩|k⟩ WRITTEN to Hilbert space\n"
+               "          Ptr 0x%016lX (A) <-> Ptr 0x%016lX (B)\n",
+               eng->chunks[a].hilbert.magic_ptr,
+               eng->chunks[b].hilbert.magic_ptr);
+    } else {
+        /* Shadow-backed: use seed fallback */
+        uint64_t entangle_seed = engine_prng(eng);
+        if (entangle_seed == 0) entangle_seed = 0xDEADBEEF;
+        eng->chunks[a].hilbert.q_entangle_seed = entangle_seed;
+        eng->chunks[b].hilbert.q_entangle_seed = entangle_seed;
+        printf("  [BRAID] Linked Ptrs 0x%016lX <-> 0x%016lX (seed=0x%016lX)\n",
+               eng->chunks[a].hilbert.magic_ptr,
+               eng->chunks[b].hilbert.magic_ptr, entangle_seed);
+    }
 }
 
 void unbraid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b)
@@ -596,13 +700,24 @@ void unbraid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b)
     }
     eng->num_braid_links = write;
 
-    /* ── Clear entanglement from both Magic Pointer addresses ── */
+    /* ── Free joint state from Hilbert space ── */
+    if (a < eng->num_chunks && b < eng->num_chunks) {
+        if (eng->chunks[a].hilbert.q_joint_state &&
+            eng->chunks[a].hilbert.q_joint_state ==
+            eng->chunks[b].hilbert.q_joint_state) {
+            free(eng->chunks[a].hilbert.q_joint_state);
+        }
+        eng->chunks[a].hilbert.q_joint_state = NULL;
+        eng->chunks[b].hilbert.q_joint_state = NULL;
+        eng->chunks[a].hilbert.q_partner = 0;
+        eng->chunks[b].hilbert.q_partner = 0;
+    }
     if (a < eng->num_chunks)
         eng->chunks[a].hilbert.q_entangle_seed = 0;
     if (b < eng->num_chunks)
         eng->chunks[b].hilbert.q_entangle_seed = 0;
 
-    printf("  [UNBRAID] Entanglement cleared: chunks %lu <-> %lu\n", a, b);
+    printf("  [UNBRAID] Hilbert space freed: chunks %lu <-> %lu\n", a, b);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -702,6 +817,9 @@ int op_infinite_resources(HexStateEngine *eng, uint64_t chunk_id, uint64_t size)
     c->hilbert.q_flags = 0x01;  /* superposed */
     c->hilbert.q_entangle_seed = 0;
     c->hilbert.q_basis_rotation = 0;
+    c->hilbert.q_joint_state = NULL;
+    c->hilbert.q_partner = 0;
+    c->hilbert.q_which = 0;
 
     /* Update chunk count */
     if (chunk_id >= eng->num_chunks) {
