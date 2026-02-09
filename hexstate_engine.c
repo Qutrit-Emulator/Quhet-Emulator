@@ -375,11 +375,69 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
     Chunk *c = &eng->chunks[id];
 
     if (c->hilbert.shadow_state == NULL) {
-        /* Topological measurement on infinite plane */
-        uint64_t result = engine_prng(eng) % (c->num_states < 1000000
-                          ? c->num_states : 1000000);
+        /* ─── Topological measurement: walk braid graph ─────────────── */
+        /* For infinite chunks, measurement follows entanglement topology.
+         * If braided partners have been measured, the result correlates
+         * with theirs. This is how entanglement works: measuring one
+         * chunk constrains what braided partners will yield.
+         *
+         * Strategy:
+         *   1. Walk all braid links for this chunk
+         *   2. If ANY braided partner has already been measured (non-zero
+         *      in measured_values, or partner is collapsed), derive our
+         *      result from theirs via the braid's Magic Pointer pair
+         *   3. Otherwise generate fresh randomness and record it
+         */
+        uint64_t result = 0;
+        int found_partner = 0;
+        uint64_t partner_sum = 0;
+        int num_measured_partners = 0;
+
+        for (uint64_t i = 0; i < eng->num_braid_links; i++) {
+            BraidLink *l = &eng->braid_links[i];
+            uint64_t partner_id = UINT64_MAX;
+
+            if (l->chunk_a == id) {
+                partner_id = l->chunk_b;
+            } else if (l->chunk_b == id) {
+                partner_id = l->chunk_a;
+            }
+
+            if (partner_id == UINT64_MAX || partner_id >= eng->num_chunks)
+                continue;
+
+            Chunk *partner = &eng->chunks[partner_id];
+
+            /* Check if partner has been measured */
+            uint64_t partner_val = eng->measured_values[partner_id];
+            if (partner_val != 0 || partner->locked) {
+                /* Partner was measured — correlate via braid topology.
+                 * Use XOR mixing of partner value with the braid's
+                 * Magic Pointer pair (acts as basis rotation). */
+                uint64_t braid_phase = eng->chunks[id].hilbert.magic_ptr
+                                     ^ partner->hilbert.magic_ptr;
+                partner_sum += partner_val ^ (braid_phase & 0xFFFF);
+                num_measured_partners++;
+                found_partner = 1;
+            }
+        }
+
+        if (found_partner && num_measured_partners > 0) {
+            /* Derive result from measured partners — entanglement correlation */
+            uint64_t mixed = partner_sum / num_measured_partners;
+            /* Add small quantum noise (not perfectly deterministic) */
+            mixed ^= engine_prng(eng) & 0x3;  /* 2-bit noise */
+            result = mixed % (c->num_states < 1000000 ? c->num_states : 1000000);
+            printf("  [MEAS] Entangled topological measurement on chunk %lu => %lu "
+                   "(from %d braided partners)\n", id, result, num_measured_partners);
+        } else {
+            /* No measured partners — generate fresh randomness */
+            result = engine_prng(eng) % (c->num_states < 1000000
+                              ? c->num_states : 1000000);
+            printf("  [MEAS] Topological measurement on chunk %lu => %lu\n", id, result);
+        }
+
         eng->measured_values[id] = result;
-        printf("  [MEAS] Topological measurement on chunk %lu => %lu\n", id, result);
         return result;
     }
 
@@ -402,6 +460,43 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
             c->hilbert.shadow_state[i] = cmplx(1.0, 0.0);
         } else {
             c->hilbert.shadow_state[i] = cmplx(0.0, 0.0);
+        }
+    }
+
+    /* Propagate collapse to braided partners */
+    for (uint64_t i = 0; i < eng->num_braid_links; i++) {
+        BraidLink *l = &eng->braid_links[i];
+        uint64_t partner_id = UINT64_MAX;
+
+        if (l->chunk_a == id) partner_id = l->chunk_b;
+        else if (l->chunk_b == id) partner_id = l->chunk_a;
+
+        if (partner_id == UINT64_MAX || partner_id >= eng->num_chunks)
+            continue;
+
+        Chunk *partner = &eng->chunks[partner_id];
+        if (partner->hilbert.shadow_state != NULL && !partner->locked) {
+            /* Correlate partner: boost amplitude at matching outcome,
+             * reduce others — simulates entanglement collapse */
+            double boost = 0.7;
+            uint64_t correlated = outcome % partner->num_states;
+            double total = 0.0;
+            for (uint64_t j = 0; j < partner->num_states; j++) {
+                if (j == correlated) {
+                    partner->hilbert.shadow_state[j].real *= (1.0 + boost);
+                } else {
+                    partner->hilbert.shadow_state[j].real *= (1.0 - boost / (double)(partner->num_states - 1));
+                }
+                total += cnorm2(partner->hilbert.shadow_state[j]);
+            }
+            /* Renormalize */
+            if (total > 0.0) {
+                double norm = 1.0 / sqrt(total);
+                for (uint64_t j = 0; j < partner->num_states; j++) {
+                    partner->hilbert.shadow_state[j].real *= norm;
+                    partner->hilbert.shadow_state[j].imag *= norm;
+                }
+            }
         }
     }
 
