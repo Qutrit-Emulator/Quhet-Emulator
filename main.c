@@ -104,6 +104,13 @@ int main(int argc, char *argv[])
         return ret;
     }
 
+    if (argc >= 3 && strcmp(argv[1], "--shor") == 0) {
+        /* argv[2] is the decimal string N — passed as-is, no 64-bit limit */
+        int ret = run_shor_factoring(&eng, argv[2]);
+        engine_destroy(&eng);
+        return ret;
+    }
+
     if (argc >= 2) {
         /* Load and execute program */
         if (load_program(&eng, argv[1]) != 0) {
