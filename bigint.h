@@ -50,4 +50,10 @@ void     bigint_gcd(BigInt *result, const BigInt *a, const BigInt *b);
 void     bigint_pow_mod(BigInt *result, const BigInt *base,
                         const BigInt *exp, const BigInt *mod);
 
+/* ─── String Conversion ─── */
+/* Parse a decimal string into a BigInt. Returns 0 on success, -1 on error. */
+int      bigint_from_decimal(BigInt *a, const char *str);
+/* Write BigInt as decimal string into buf (must hold at least 1240 chars). */
+void     bigint_to_decimal(char *buf, size_t bufsize, const BigInt *a);
+
 #endif /* BIGINT_H */
