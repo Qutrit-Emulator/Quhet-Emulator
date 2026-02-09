@@ -89,6 +89,12 @@ typedef struct {
     uint64_t  magic_ptr;          /* (MAGIC_TAG << 48) | chunk_id */
     Complex  *shadow_state;       /* Local mmap'd shadow cache (may be NULL for infinite) */
     uint64_t  shadow_capacity;    /* Number of states in shadow cache */
+    /* ─── Quantum state stored AT this Magic Pointer address ───
+     * Written by create_superposition, braid_chunks, apply_hadamard.
+     * Read by measure_chunk.  This IS the external Hilbert space. */
+    uint8_t   q_flags;            /* bit 0 = superposed, bit 1 = measured */
+    uint64_t  q_entangle_seed;    /* Shared seed WRITTEN by braid — the entanglement */
+    uint64_t  q_basis_rotation;   /* WRITTEN by apply_hadamard — basis change */
 } HilbertRef;
 
 /* Chunk: logical unit of quantum state */
