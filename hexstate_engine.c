@@ -44,6 +44,11 @@ static inline Complex cadd(Complex a, Complex b)
     return cmplx(a.real + b.real, a.imag + b.imag);
 }
 
+static inline Complex csub(Complex a, Complex b)
+{
+    return cmplx(a.real - b.real, a.imag - b.imag);
+}
+
 static inline double cnorm2(Complex a)
 {
     return a.real * a.real + a.imag * a.imag;
@@ -373,43 +378,133 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
     Chunk *c = &eng->chunks[id];
 
     if (c->hilbert.shadow_state == NULL) {
-        /* ═══ WRITE DFT₆ transformation to Hilbert space ═══
-         * The joint state at the Magic Pointer address IS the
-         * quantum state. We transform it in-place — the Hilbert
-         * space does the computation. */
+        /* ═══ WRITE QFT to Hilbert space ═══
+         * The joint state IS the quantum state.
+         * Uses Cooley-Tukey FFT for power-of-2 dimensions (O(D·log D) per row).
+         * Falls back to direct DFT for other dimensions. */
         if (c->hilbert.q_joint_state) {
-            init_dft6();
             Complex *joint = c->hilbert.q_joint_state;
             uint8_t which = c->hilbert.q_which;
-            Complex tmp[6];
+            uint32_t dim = c->hilbert.q_joint_dim;
+            if (dim == 0) dim = 6;
+            double inv_sqrt_d = 1.0 / sqrt((double)dim);
 
-            if (which == 0) {
-                /* DFT₆ on A side: for each fixed b, transform a */
-                for (int b = 0; b < 6; b++) {
-                    for (int j = 0; j < 6; j++) {
-                        tmp[j] = cmplx(0.0, 0.0);
-                        for (int k = 0; k < 6; k++)
-                            tmp[j] = cadd(tmp[j],
-                                cmul(dft6_matrix[j][k], joint[b * 6 + k]));
+            /* Check if dim is power of 2 */
+            int is_pow2 = (dim > 0) && ((dim & (dim - 1)) == 0);
+
+            if (is_pow2 && dim > 1) {
+                /* ── Cooley-Tukey FFT: O(D·log D) per row/column ── */
+                Complex *buf = calloc(dim, sizeof(Complex));
+
+                if (which == 0) {
+                    /* FFT on A side: for each fixed b, FFT the row */
+                    for (uint32_t b = 0; b < dim; b++) {
+                        Complex *row = &joint[(uint64_t)b * dim];
+                        /* Bit-reversal permutation */
+                        for (uint32_t i = 0; i < dim; i++) buf[i] = row[i];
+                        uint32_t logN = 0; { uint32_t t = dim; while (t > 1) { logN++; t >>= 1; } }
+                        for (uint32_t i = 0; i < dim; i++) {
+                            uint32_t rev = 0;
+                            for (uint32_t bit = 0; bit < logN; bit++)
+                                if (i & (1u << bit)) rev |= (1u << (logN - 1 - bit));
+                            if (rev > i) { Complex t = buf[i]; buf[i] = buf[rev]; buf[rev] = t; }
+                        }
+                        /* Butterfly stages */
+                        for (uint32_t s = 1; s <= logN; s++) {
+                            uint32_t m = 1u << s;
+                            double angle = 2.0 * M_PI / m;
+                            Complex wm = cmplx(cos(angle), sin(angle));
+                            for (uint32_t k = 0; k < dim; k += m) {
+                                Complex w = cmplx(1.0, 0.0);
+                                for (uint32_t j = 0; j < m/2; j++) {
+                                    Complex t = cmul(w, buf[k + j + m/2]);
+                                    Complex u = buf[k + j];
+                                    buf[k + j] = cadd(u, t);
+                                    buf[k + j + m/2] = csub(u, t);
+                                    w = cmul(w, wm);
+                                }
+                            }
+                        }
+                        /* Scale by 1/√D */
+                        for (uint32_t i = 0; i < dim; i++)
+                            row[i] = cmplx(buf[i].real * inv_sqrt_d, buf[i].imag * inv_sqrt_d);
                     }
-                    for (int j = 0; j < 6; j++)
-                        joint[b * 6 + j] = tmp[j];
+                } else {
+                    /* FFT on B side: for each fixed a, FFT the column */
+                    for (uint32_t a = 0; a < dim; a++) {
+                        /* Gather column */
+                        for (uint32_t b = 0; b < dim; b++)
+                            buf[b] = joint[(uint64_t)b * dim + a];
+                        /* Bit-reversal permutation */
+                        uint32_t logN = 0; { uint32_t t = dim; while (t > 1) { logN++; t >>= 1; } }
+                        for (uint32_t i = 0; i < dim; i++) {
+                            uint32_t rev = 0;
+                            for (uint32_t bit = 0; bit < logN; bit++)
+                                if (i & (1u << bit)) rev |= (1u << (logN - 1 - bit));
+                            if (rev > i) { Complex t = buf[i]; buf[i] = buf[rev]; buf[rev] = t; }
+                        }
+                        /* Butterfly stages */
+                        for (uint32_t s = 1; s <= logN; s++) {
+                            uint32_t m = 1u << s;
+                            double angle = 2.0 * M_PI / m;
+                            Complex wm = cmplx(cos(angle), sin(angle));
+                            for (uint32_t k = 0; k < dim; k += m) {
+                                Complex w = cmplx(1.0, 0.0);
+                                for (uint32_t j = 0; j < m/2; j++) {
+                                    Complex t = cmul(w, buf[k + j + m/2]);
+                                    Complex u = buf[k + j];
+                                    buf[k + j] = cadd(u, t);
+                                    buf[k + j + m/2] = csub(u, t);
+                                    w = cmul(w, wm);
+                                }
+                            }
+                        }
+                        /* Scale and scatter back to column */
+                        for (uint32_t b = 0; b < dim; b++)
+                            joint[(uint64_t)b * dim + a] = cmplx(buf[b].real * inv_sqrt_d,
+                                                                   buf[b].imag * inv_sqrt_d);
+                    }
                 }
+                free(buf);
             } else {
-                /* DFT₆ on B side: for each fixed a, transform b */
-                for (int a = 0; a < 6; a++) {
-                    for (int j = 0; j < 6; j++) {
-                        tmp[j] = cmplx(0.0, 0.0);
-                        for (int k = 0; k < 6; k++)
-                            tmp[j] = cadd(tmp[j],
-                                cmul(dft6_matrix[j][k], joint[k * 6 + a]));
+                /* ── Direct DFT for non-power-of-2 (e.g. D=6) ── */
+                Complex *tmp = calloc(dim, sizeof(Complex));
+                if (which == 0) {
+                    for (uint32_t b = 0; b < dim; b++) {
+                        for (uint32_t j = 0; j < dim; j++) {
+                            tmp[j] = cmplx(0.0, 0.0);
+                            for (uint32_t k = 0; k < dim; k++) {
+                                double phase = 2.0 * M_PI * j * k / dim;
+                                Complex w = cmplx(cos(phase) * inv_sqrt_d,
+                                                  sin(phase) * inv_sqrt_d);
+                                tmp[j] = cadd(tmp[j],
+                                    cmul(w, joint[(uint64_t)b * dim + k]));
+                            }
+                        }
+                        for (uint32_t j = 0; j < dim; j++)
+                            joint[(uint64_t)b * dim + j] = tmp[j];
                     }
-                    for (int j = 0; j < 6; j++)
-                        joint[j * 6 + a] = tmp[j];
+                } else {
+                    for (uint32_t a = 0; a < dim; a++) {
+                        for (uint32_t j = 0; j < dim; j++) {
+                            tmp[j] = cmplx(0.0, 0.0);
+                            for (uint32_t k = 0; k < dim; k++) {
+                                double phase = 2.0 * M_PI * j * k / dim;
+                                Complex w = cmplx(cos(phase) * inv_sqrt_d,
+                                                  sin(phase) * inv_sqrt_d);
+                                tmp[j] = cadd(tmp[j],
+                                    cmul(w, joint[(uint64_t)k * dim + a]));
+                            }
+                        }
+                        for (uint32_t j = 0; j < dim; j++)
+                            joint[(uint64_t)j * dim + a] = tmp[j];
+                    }
                 }
+                free(tmp);
             }
-            printf("  [H] DFT₆ WRITTEN to Hilbert space at Ptr 0x%016lX (side %c)\n",
-                   c->hilbert.magic_ptr, which == 0 ? 'A' : 'B');
+            printf("  [H] QFT_%u WRITTEN to Hilbert space at Ptr 0x%016lX (side %c%s)\n",
+                   dim, c->hilbert.magic_ptr, which == 0 ? 'A' : 'B',
+                   is_pow2 ? ", FFT" : "");
         } else {
             c->hilbert.q_basis_rotation++;
             printf("  [H] Basis rotation WRITTEN to Ptr 0x%016lX (rot=%lu)\n",
@@ -479,12 +574,16 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
             /* ── Genuine quantum measurement (Born rule) ── */
             Complex *joint = c->hilbert.q_joint_state;
             uint8_t which = c->hilbert.q_which;
+            uint32_t dim = c->hilbert.q_joint_dim;
+            if (dim == 0) dim = 6;
 
             /* READ: compute marginal probabilities for our side */
-            double probs[6] = {0};
-            for (int me = 0; me < 6; me++) {
-                for (int them = 0; them < 6; them++) {
-                    int idx = (which == 0) ? them * 6 + me : me * 6 + them;
+            double *probs = calloc(dim, sizeof(double));
+            for (uint32_t me = 0; me < dim; me++) {
+                for (uint32_t them = 0; them < dim; them++) {
+                    uint64_t idx = (which == 0)
+                        ? (uint64_t)them * dim + me
+                        : (uint64_t)me * dim + them;
                     probs[me] += cnorm2(joint[idx]);
                 }
             }
@@ -492,20 +591,23 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
             /* Born rule: sample from the Hilbert space */
             double r = prng_uniform(eng);
             double cumul = 0.0;
-            int result = 5;
-            for (int i = 0; i < 6; i++) {
+            int result = (int)(dim - 1);
+            for (uint32_t i = 0; i < dim; i++) {
                 cumul += probs[i];
-                if (cumul >= r) { result = i; break; }
+                if (cumul >= r) { result = (int)i; break; }
             }
+            free(probs);
 
             /* WRITE collapse back to Hilbert space:
              * Zero all amplitudes incompatible with our outcome.
              * The partner's state is automatically determined. */
             double norm = 0.0;
-            for (int them = 0; them < 6; them++) {
-                for (int me = 0; me < 6; me++) {
-                    int idx = (which == 0) ? them * 6 + me : me * 6 + them;
-                    if (me != result) {
+            for (uint32_t them = 0; them < dim; them++) {
+                for (uint32_t me = 0; me < dim; me++) {
+                    uint64_t idx = (which == 0)
+                        ? (uint64_t)them * dim + me
+                        : (uint64_t)me * dim + them;
+                    if ((int)me != result) {
                         joint[idx] = cmplx(0.0, 0.0);
                     } else {
                         norm += cnorm2(joint[idx]);
@@ -515,8 +617,10 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
             /* Renormalize surviving amplitudes */
             if (norm > 0.0) {
                 double scale = 1.0 / sqrt(norm);
-                for (int them = 0; them < 6; them++) {
-                    int idx = (which == 0) ? them * 6 + result : result * 6 + them;
+                for (uint32_t them = 0; them < dim; them++) {
+                    uint64_t idx = (which == 0)
+                        ? (uint64_t)them * dim + result
+                        : (uint64_t)result * dim + them;
                     joint[idx] = cmplx(joint[idx].real * scale,
                                        joint[idx].imag * scale);
                 }
@@ -526,8 +630,8 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
             c->hilbert.q_flags = 0x02;  /* measured */
 
             printf("  [MEAS] READ Hilbert space at Ptr 0x%016lX "
-                   "(side %c, Born rule) => %d\n",
-                   c->hilbert.magic_ptr, which == 0 ? 'A' : 'B', result);
+                   "(side %c, Born rule, D=%u) => %d\n",
+                   c->hilbert.magic_ptr, which == 0 ? 'A' : 'B', dim, result);
 
             return (uint64_t)result;
         }
