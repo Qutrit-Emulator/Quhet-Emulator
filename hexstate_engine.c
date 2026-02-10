@@ -521,39 +521,45 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
     if (state == NULL) return;  /* shouldn't happen on this path */
 
     /*
-     * Apply DFT₆ to the specified hexit.
+     * Apply DFT to the specified hexit (dimension-agnostic).
      * For each group of states sharing the same "other hexits",
-     * transform the 6 amplitudes indexed by the target hexit.
-     *
-     * State index decomposition:
-     *   index = ... + h_k * stride_k + ...
-     *   stride for hexit k = 6^k
+     * transform the D amplitudes indexed by the target hexit.
+     * D defaults to 6 (hexit base) but reads q_joint_dim if set.
      */
+    uint32_t base_d = c->hilbert.q_joint_dim;
+    if (base_d == 0) base_d = 6;
     uint64_t stride = power_of_6(hexit_index);
+    double inv_sqrt_d = 1.0 / sqrt((double)base_d);
 
-    Complex temp[6];
+    Complex *temp = calloc(base_d, sizeof(Complex));
+    Complex *out  = calloc(base_d, sizeof(Complex));
 
     for (uint64_t base = 0; base < ns; base++) {
-        /* Skip if not at the start of a block for this hexit */
-        if ((base / stride) % 6 != 0) continue;
+        if ((base / stride) % base_d != 0) continue;
 
-        /* Gather the 6 amplitudes */
-        for (int j = 0; j < 6; j++) {
+        /* Gather amplitudes */
+        for (uint32_t j = 0; j < base_d; j++)
             temp[j] = state[base + j * stride];
-        }
 
-        /* Apply DFT₆ */
-        for (int j = 0; j < 6; j++) {
-            Complex sum = cmplx(0.0, 0.0);
-            for (int k = 0; k < 6; k++) {
-                sum = cadd(sum, cmul(dft6_matrix[j][k], temp[k]));
+        /* Apply DFT_D */
+        for (uint32_t j = 0; j < base_d; j++) {
+            out[j] = cmplx(0.0, 0.0);
+            for (uint32_t k = 0; k < base_d; k++) {
+                double phase = 2.0 * M_PI * j * k / base_d;
+                Complex w = cmplx(cos(phase) * inv_sqrt_d,
+                                  sin(phase) * inv_sqrt_d);
+                out[j] = cadd(out[j], cmul(w, temp[k]));
             }
-            state[base + j * stride] = sum;
         }
-    }
 
-    printf("  [H] DFT₆ Hadamard on chunk %lu, hexit %lu via Ptr 0x%016lX\n",
-           id, hexit_index, c->hilbert.magic_ptr);
+        for (uint32_t j = 0; j < base_d; j++)
+            state[base + j * stride] = out[j];
+    }
+    free(temp);
+    free(out);
+
+    printf("  [H] DFT_%u Hadamard on chunk %lu, hexit %lu via Ptr 0x%016lX\n",
+           base_d, id, hexit_index, c->hilbert.magic_ptr);
 }
 
 /* ─── Measurement (Born Rule) ─────────────────────────────────────────────── */
@@ -641,11 +647,13 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
         uint64_t seed  = c->hilbert.q_entangle_seed;
         uint64_t basis = c->hilbert.q_basis_rotation;
         uint64_t result;
+        uint32_t fdim = c->hilbert.q_joint_dim;
+        if (fdim == 0) fdim = 6;
 
         if (seed != 0 && (flags & 0x01)) {
-            result = (seed ^ (basis * 2654435761ULL)) % 6;
+            result = (seed ^ (basis * 2654435761ULL)) % fdim;
         } else if (flags & 0x01) {
-            result = engine_prng(eng) % 6;
+            result = engine_prng(eng) % fdim;
         } else {
             result = 0;
         }
@@ -2271,4 +2279,118 @@ int run_self_test(HexStateEngine *eng)
     printf("══════════════════════════════════════════════════════\n\n");
 
     return pass ? 0 : 1;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * HILBERT SPACE READOUT — works at any D
+ * The Hilbert space does the computation. We just read it.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+double *hilbert_read_joint_probs(HexStateEngine *eng, uint64_t id)
+{
+    if (id >= eng->num_chunks) return NULL;
+    Chunk *c = &eng->chunks[id];
+    if (!c->hilbert.q_joint_state) return NULL;
+
+    uint32_t dim = c->hilbert.q_joint_dim;
+    if (dim == 0) dim = 6;
+    uint64_t d2 = (uint64_t)dim * dim;
+
+    Complex *joint = c->hilbert.q_joint_state;
+    double *probs = calloc(d2, sizeof(double));
+
+    for (uint64_t i = 0; i < d2; i++)
+        probs[i] = cnorm2(joint[i]);
+
+    return probs;
+}
+
+double hilbert_compute_cglmp(double *P00, double *P01, double *P10, double *P11,
+                             uint32_t dim)
+{
+    double I_D = 0.0;
+
+    for (uint32_t k = 0; k < dim / 2; k++) {
+        double c_k = 1.0 - 2.0 * k / (dim - 1.0);
+
+        double sum00 = 0, sum01 = 0, sum10 = 0, sum11 = 0;
+
+        for (uint32_t b = 0; b < dim; b++) {
+            uint32_t a_fwd  = (b + k) % dim;
+            uint32_t a_bck  = (b - k + dim) % dim;
+            uint32_t a_bck1 = (b - k - 1 + dim) % dim;
+
+            /* P(a-b = k) + P(b-a = k+1) for settings 00, 01 */
+            sum00 += P00[(uint64_t)b * dim + a_fwd]
+                   + P00[(uint64_t)b * dim + a_bck1];
+            sum01 += P01[(uint64_t)b * dim + a_fwd]
+                   + P01[(uint64_t)b * dim + a_bck];
+
+            /* P(a-b = k) + P(b-a = k) for settings 10 */
+            sum10 += P10[(uint64_t)b * dim + a_fwd]
+                   + P10[(uint64_t)b * dim + a_bck];
+
+            /* P(a-b = k) + P(b-a = k+1) for settings 11 (subtracted) */
+            sum11 += P11[(uint64_t)b * dim + a_fwd]
+                   + P11[(uint64_t)b * dim + a_bck1];
+        }
+
+        I_D += c_k * (sum00 + sum01 + sum10 - sum11);
+    }
+
+    return I_D;
+}
+
+/* Internal phase oracle for hilbert_bell_test */
+typedef struct { double theta_A; double theta_B; } BellPhaseCtx;
+static void bell_phase_oracle(HexStateEngine *e, uint64_t id, void *u) {
+    BellPhaseCtx *p = (BellPhaseCtx *)u;
+    Chunk *ch = &e->chunks[id];
+    if (!ch->hilbert.q_joint_state) return;
+    uint32_t dim = ch->hilbert.q_joint_dim;
+    Complex *joint = ch->hilbert.q_joint_state;
+
+    for (uint32_t b = 0; b < dim; b++) {
+        for (uint32_t a = 0; a < dim; a++) {
+            double phase = 2.0 * M_PI * (a * p->theta_A + b * p->theta_B) / dim;
+            uint64_t idx = (uint64_t)b * dim + a;
+            double re = joint[idx].real, im = joint[idx].imag;
+            double cp = cos(phase), sp = sin(phase);
+            joint[idx].real = cp*re - sp*im;
+            joint[idx].imag = cp*im + sp*re;
+        }
+    }
+}
+
+static double *bell_read_setting(HexStateEngine *eng, BellPhaseCtx *ctx,
+                                 double tA, double tB, uint32_t dim) {
+    init_chunk(eng, 950, 100000000000000ULL);
+    init_chunk(eng, 951, 100000000000000ULL);
+    braid_chunks_dim(eng, 950, 951, 0, 0, dim);
+    ctx->theta_A = tA;
+    ctx->theta_B = tB;
+    execute_oracle(eng, 950, 0xBE);
+    apply_hadamard(eng, 950, 0);
+    apply_hadamard(eng, 951, 0);
+    double *probs = hilbert_read_joint_probs(eng, 950);
+    unbraid_chunks(eng, 950, 951);
+    return probs;
+}
+
+double hilbert_bell_test(HexStateEngine *eng, double alpha, double beta, uint32_t dim)
+{
+    BellPhaseCtx ctx;
+    oracle_register(eng, 0xBE, "BellPhase", bell_phase_oracle, &ctx);
+
+    double *P00 = bell_read_setting(eng, &ctx, 0.0,   beta,  dim);
+    double *P01 = bell_read_setting(eng, &ctx, 0.0,  -beta,  dim);
+    double *P10 = bell_read_setting(eng, &ctx, alpha,  beta,  dim);
+    double *P11 = bell_read_setting(eng, &ctx, alpha, -beta,  dim);
+
+    double I_D = hilbert_compute_cglmp(P00, P01, P10, P11, dim);
+
+    free(P00); free(P01); free(P10); free(P11);
+    oracle_unregister(eng, 0xBE);
+
+    return I_D;
 }
