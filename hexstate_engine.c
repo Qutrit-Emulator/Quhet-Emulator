@@ -285,6 +285,25 @@ int engine_init(HexStateEngine *eng)
 
 void engine_destroy(HexStateEngine *eng)
 {
+    if (!eng) return;
+
+    /* Free all HilbertGroups (track to avoid double-free) */
+    HilbertGroup *freed_groups[1024];
+    uint32_t nfreed = 0;
+    for (uint64_t i = 0; i < eng->num_chunks; i++) {
+        HilbertGroup *g = eng->chunks[i].hilbert.group;
+        if (!g) continue;
+        int already = 0;
+        for (uint32_t f = 0; f < nfreed; f++)
+            if (freed_groups[f] == g) { already = 1; break; }
+        if (already) continue;
+        if (nfreed < 1024) freed_groups[nfreed++] = g;
+        free(g->basis_indices);
+        free(g->amplitudes);
+        free(g);
+        eng->chunks[i].hilbert.group = NULL;
+    }
+
     /* Free all local states and joint states from braid partners */
     for (uint64_t i = 0; i < eng->num_chunks; i++) {
         Chunk *c = &eng->chunks[i];
