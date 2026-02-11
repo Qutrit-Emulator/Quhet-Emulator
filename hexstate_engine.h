@@ -84,6 +84,25 @@ typedef struct {
     double imag;
 } Complex;
 
+/* ─── Shared multi-party Hilbert space ───
+ * When registers are braided, they join the SAME group and share a
+ * single state vector. The Hilbert space IS the shared memory —
+ * collapse is automatic because all members read from it.
+ * Sparse representation: for GHZ states, only D entries regardless
+ * of group size. */
+#define MAX_GROUP_MEMBERS 1024
+typedef struct HilbertGroup {
+    uint32_t  dim;              /* Per-register dimension (6) */
+    uint32_t  num_members;      /* How many registers share this state */
+    uint64_t  member_ids[MAX_GROUP_MEMBERS]; /* Chunk IDs in order */
+    /* Sparse state: only store nonzero amplitudes */
+    uint32_t  num_nonzero;      /* Number of nonzero amplitude entries */
+    uint32_t  sparse_cap;       /* Allocated capacity */
+    uint32_t *basis_indices;    /* Flattened: num_nonzero × num_members indices */
+    Complex  *amplitudes;       /* num_nonzero amplitudes */
+    uint8_t   collapsed;        /* 1 if a measurement has collapsed this group */
+} HilbertGroup;
+
 /* Hilbert Space Reference (Magic Pointer) */
 typedef struct {
     uint64_t  magic_ptr;          /* (MAGIC_TAG << 48) | chunk_id */
@@ -96,7 +115,10 @@ typedef struct {
     /* ─── Local single-particle Hilbert space ─── */
     Complex  *q_local_state;      /* Local D-dimensional state vector (D amplitudes) */
     uint32_t  q_local_dim;        /* Dimension of local state (default 6) */
-    /* ─── Joint quantum state (genuine Hilbert space) ─── */
+    /* ─── Shared multi-party Hilbert space group ─── */
+    HilbertGroup *group;          /* Shared state (NULL if not in a group) */
+    uint32_t  group_index;        /* This register's position within the group */
+    /* ─── Joint quantum state (pairwise fallback) ─── */
 #define MAX_BRAID_PARTNERS 1024
     struct {
         Complex  *q_joint_state;  /* Shared 2-particle state: dim² amplitudes */
