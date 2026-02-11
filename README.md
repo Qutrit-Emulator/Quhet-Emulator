@@ -1,3 +1,6 @@
+# Notice to those cloning this
+If there is a test folder, it is stable; if there is no test folder it is being actively updated.
+
 <p align="center">
   <strong>⬡ HEXSTATE ENGINE</strong>
 </p>
