@@ -2491,9 +2491,9 @@ double hilbert_compute_cglmp(double *P00, double *P01, double *P10, double *P11,
 }
 
 /* Internal phase oracle for hilbert_bell_test */
-typedef struct { double theta_A; double theta_B; } BellPhaseCtx;
-static void bell_phase_oracle(HexStateEngine *e, uint64_t id, void *u) {
-    BellPhaseCtx *p = (BellPhaseCtx *)u;
+/* BellPhaseCtx typedef is now in hexstate_engine.h */
+void bell_phase_oracle(HexStateEngine *e, uint64_t id, BellPhaseCtx *ctx) {
+    BellPhaseCtx *p = ctx;
     Chunk *ch = &e->chunks[id];
     if (ch->hilbert.num_partners == 0 || !ch->hilbert.partners[0].q_joint_state) return;
     uint32_t dim = ch->hilbert.partners[0].q_joint_dim;
@@ -2529,7 +2529,7 @@ static double *bell_read_setting(HexStateEngine *eng, BellPhaseCtx *ctx,
 double hilbert_bell_test(HexStateEngine *eng, double alpha, double beta, uint32_t dim)
 {
     BellPhaseCtx ctx;
-    oracle_register(eng, 0xBE, "BellPhase", bell_phase_oracle, &ctx);
+    oracle_register(eng, 0xBE, "BellPhase", (OracleFunc)bell_phase_oracle, &ctx);
 
     double *P00 = bell_read_setting(eng, &ctx, 0.0,   beta,  dim);
     double *P01 = bell_read_setting(eng, &ctx, 0.0,  -beta,  dim);
