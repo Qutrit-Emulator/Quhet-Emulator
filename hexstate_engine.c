@@ -502,6 +502,126 @@ void create_superposition(HexStateEngine *eng, uint64_t id)
            id, ns, inv_sqrt_n, c->hilbert.magic_ptr);
 }
 
+/* ─── Group-Aware Unitary ──────────────────────────────────────────────────
+ * Apply a D×D unitary matrix U to one register within a HilbertGroup.
+ *
+ * For a sparse multi-party state |Ψ⟩ = Σ α_e |k₀,k₁,...,kₙ⟩,
+ * applying U to register i transforms:
+ *   α'_{...,j,...} = Σ_k U[j][k] × α_{...,k,...}
+ *
+ * This potentially EXPANDS the number of nonzero entries from N to N×D
+ * in the worst case, because each entry spawns D output values.
+ * We then compact by merging entries with identical index tuples.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+void apply_group_unitary(HexStateEngine *eng, uint64_t id,
+                         Complex *U, uint32_t dim)
+{
+    if (id >= eng->num_chunks) return;
+    Chunk *c = &eng->chunks[id];
+    HilbertGroup *g = c->hilbert.group;
+
+    if (!g) {
+        /* No group — apply to local state if present */
+        if (c->hilbert.q_local_state && dim <= c->hilbert.q_local_dim) {
+            Complex *s = c->hilbert.q_local_state;
+            Complex *tmp = calloc(dim, sizeof(Complex));
+            for (uint32_t i = 0; i < dim; i++)
+                for (uint32_t j = 0; j < dim; j++) {
+                    tmp[i].real += U[i * dim + j].real * s[j].real
+                                 - U[i * dim + j].imag * s[j].imag;
+                    tmp[i].imag += U[i * dim + j].real * s[j].imag
+                                 + U[i * dim + j].imag * s[j].real;
+                }
+            for (uint32_t i = 0; i < dim; i++) s[i] = tmp[i];
+            free(tmp);
+            printf("  [U] Applied %u×%u unitary to local state of chunk %lu\n",
+                   dim, dim, id);
+        }
+        return;
+    }
+
+    uint32_t my_idx = c->hilbert.group_index;
+    uint32_t nm = g->num_members;
+
+    /* Worst case: each entry spawns D output entries */
+    uint32_t max_out = g->num_nonzero * dim;
+    uint32_t *out_indices = calloc((size_t)max_out * nm, sizeof(uint32_t));
+    Complex  *out_amps    = calloc(max_out, sizeof(Complex));
+    uint32_t  out_count   = 0;
+
+    /* For each existing entry, apply U to produce D new entries */
+    for (uint32_t e = 0; e < g->num_nonzero; e++) {
+        uint32_t *row = &g->basis_indices[e * nm];
+        uint32_t old_val = row[my_idx];
+
+        for (uint32_t new_val = 0; new_val < dim; new_val++) {
+            /* U[new_val][old_val] × amplitude */
+            Complex u_elem = U[new_val * dim + old_val];
+            Complex contrib;
+            contrib.real = u_elem.real * g->amplitudes[e].real
+                         - u_elem.imag * g->amplitudes[e].imag;
+            contrib.imag = u_elem.real * g->amplitudes[e].imag
+                         + u_elem.imag * g->amplitudes[e].real;
+
+            if (cnorm2(contrib) < 1e-30) continue;  /* skip negligible */
+
+            /* Check if this index tuple already exists in output */
+            int found = -1;
+            for (uint32_t o = 0; o < out_count; o++) {
+                int match = 1;
+                for (uint32_t m = 0; m < nm; m++) {
+                    uint32_t expected = (m == my_idx) ? new_val : row[m];
+                    if (out_indices[o * nm + m] != expected) {
+                        match = 0;
+                        break;
+                    }
+                }
+                if (match) { found = (int)o; break; }
+            }
+
+            if (found >= 0) {
+                /* Accumulate into existing entry */
+                out_amps[found].real += contrib.real;
+                out_amps[found].imag += contrib.imag;
+            } else {
+                /* New entry */
+                for (uint32_t m = 0; m < nm; m++)
+                    out_indices[out_count * nm + m] =
+                        (m == my_idx) ? new_val : row[m];
+                out_amps[out_count] = contrib;
+                out_count++;
+            }
+        }
+    }
+
+    /* Compact: remove near-zero entries */
+    uint32_t write = 0;
+    for (uint32_t o = 0; o < out_count; o++) {
+        if (cnorm2(out_amps[o]) < 1e-28) continue;
+        if (write != o) {
+            memcpy(&out_indices[write * nm], &out_indices[o * nm],
+                   nm * sizeof(uint32_t));
+            out_amps[write] = out_amps[o];
+        }
+        write++;
+    }
+
+    /* Replace group's sparse state */
+    free(g->basis_indices);
+    free(g->amplitudes);
+    g->basis_indices = realloc(out_indices, (size_t)write * nm * sizeof(uint32_t));
+    g->amplitudes    = realloc(out_amps, (size_t)write * sizeof(Complex));
+    if (!g->basis_indices) g->basis_indices = out_indices;
+    if (!g->amplitudes)    g->amplitudes    = out_amps;
+    g->num_nonzero = write;
+    g->sparse_cap  = write;
+
+    printf("  [U] Applied %u×%u unitary to member %u/%u of group "
+           "(%u nonzero entries)\n",
+           dim, dim, my_idx, nm, write);
+}
+
 /* ─── Hadamard (DFT₆) Gate ────────────────────────────────────────────────── */
 
 void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
@@ -510,10 +630,27 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
     Chunk *c = &eng->chunks[id];
 
     if (c->hilbert.shadow_state == NULL) {
-        /* ═══ WRITE QFT to Hilbert space ═══
-         * The joint state IS the quantum state.
-         * Uses Cooley-Tukey FFT for power-of-2 dimensions (O(D·log D) per row).
-         * Falls back to direct DFT for other dimensions. */
+        /* ═══ WRITE QFT to Hilbert space ═══ */
+
+        /* ── Group-first: apply DFT via apply_group_unitary ── */
+        if (c->hilbert.group) {
+            uint32_t dim = c->hilbert.group->dim;
+            double inv_sqrt_d = 1.0 / sqrt((double)dim);
+            Complex *dft = calloc((size_t)dim * dim, sizeof(Complex));
+            for (uint32_t j = 0; j < dim; j++)
+                for (uint32_t k = 0; k < dim; k++) {
+                    double angle = -2.0 * M_PI * j * k / (double)dim;
+                    dft[j * dim + k] = cmplx(inv_sqrt_d * cos(angle),
+                                              inv_sqrt_d * sin(angle));
+                }
+            apply_group_unitary(eng, id, dft, dim);
+            free(dft);
+            printf("  [H] DFT_%u applied to group member %u via Hilbert space group\n",
+                   dim, c->hilbert.group_index);
+            return;
+        }
+
+        /* ── Pairwise joint state DFT ── */
         if (c->hilbert.num_partners > 0 && c->hilbert.partners[0].q_joint_state) {
             Complex *joint = c->hilbert.partners[0].q_joint_state;
             uint8_t which = c->hilbert.partners[0].q_which;
@@ -1138,28 +1275,7 @@ void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
                    dim * (2 * sizeof(uint32_t) + sizeof(Complex)));
         }
 
-        /* Also maintain pairwise partner arrays for backward compatibility */
-        uint16_t pa = eng->chunks[a].hilbert.num_partners;
-        uint16_t pb = eng->chunks[b].hilbert.num_partners;
-        if (pa < MAX_BRAID_PARTNERS && pb < MAX_BRAID_PARTNERS) {
-            uint64_t joint_size = (uint64_t)dim * dim;
-            Complex *joint = calloc(joint_size, sizeof(Complex));
-            double amp = 1.0 / sqrt((double)dim);
-            for (uint32_t k = 0; k < dim; k++)
-                joint[k * dim + k] = cmplx(amp, 0.0);
 
-            eng->chunks[a].hilbert.partners[pa].q_joint_state = joint;
-            eng->chunks[a].hilbert.partners[pa].q_joint_dim = dim;
-            eng->chunks[a].hilbert.partners[pa].q_partner = b;
-            eng->chunks[a].hilbert.partners[pa].q_which = 0;
-            eng->chunks[a].hilbert.num_partners = pa + 1;
-
-            eng->chunks[b].hilbert.partners[pb].q_joint_state = joint;
-            eng->chunks[b].hilbert.partners[pb].q_joint_dim = dim;
-            eng->chunks[b].hilbert.partners[pb].q_partner = a;
-            eng->chunks[b].hilbert.partners[pb].q_which = 1;
-            eng->chunks[b].hilbert.num_partners = pb + 1;
-        }
 
     } else {
         /* Shadow-backed: create joint state via Hilbert space too */
