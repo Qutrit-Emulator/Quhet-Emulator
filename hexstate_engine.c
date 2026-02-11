@@ -473,6 +473,38 @@ void create_superposition(HexStateEngine *eng, uint64_t id)
     if (id >= eng->num_chunks) return;
     Chunk *c = &eng->chunks[id];
 
+    /* ── Group-aware superposition ──
+     * If this register is in a HilbertGroup, we apply the superposition
+     * within the shared state. For each existing sparse entry, we replace
+     * the register's fixed value with an equal superposition over all D
+     * values. This expands the sparse state but correctly handles
+     * entanglement — the other members' correlations are preserved. */
+    if (c->hilbert.group) {
+        HilbertGroup *g = c->hilbert.group;
+        uint32_t my_idx = c->hilbert.group_index;
+        uint32_t dim = g->dim;
+        uint32_t nm = g->num_members;
+
+        /* Build the D×D matrix for "reset to equal superposition":
+         * This is a matrix where every column is (1/√D, 1/√D, ..., 1/√D)
+         * i.e. U[j][k] = 1/√D for all j,k.
+         * Applying this replaces the register's state with |+⟩ regardless
+         * of its current value. */
+        Complex *U = calloc((size_t)dim * dim, sizeof(Complex));
+        double amp = 1.0 / sqrt((double)dim);
+        for (uint32_t j = 0; j < dim; j++)
+            for (uint32_t k = 0; k < dim; k++)
+                U[j * dim + k] = cmplx(amp, 0.0);
+
+        apply_group_unitary(eng, id, U, dim);
+        free(U);
+
+        c->hilbert.q_flags = 0x01;  /* superposed */
+        printf("  [SUP] Superposition WRITTEN to Hilbert space group "
+               "(member %u/%u, D=%u)\n", my_idx, nm, dim);
+        return;
+    }
+
     /* ═══ Resolve Magic Pointer ═══ */
     uint64_t ns = 0;
     Complex *state = resolve_shadow(eng, id, &ns);
