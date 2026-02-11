@@ -267,8 +267,15 @@ void     print_chunk_state(HexStateEngine *eng, uint64_t id);
  * dim is read from q_joint_dim (whatever D the state was braided at). */
 double *hilbert_read_joint_probs(HexStateEngine *eng, uint64_t id);
 
+/* ═══ Bell inequality tools ═══ */
+
+typedef struct { double theta_A; double theta_B; } BellPhaseCtx;
+
+/* Apply measurement-setting–dependent phase rotation to joint state */
+void bell_phase_oracle(HexStateEngine *eng, uint64_t id, BellPhaseCtx *ctx);
+
 /* Compute CGLMP I_D Bell inequality from 4 probability tables.
- * Classical bound: I_D ≤ 0.  Quantum violation: I_D > 0.
+ * Classical bound: I_D ≤ 2.  Quantum violation: I_D > 2.
  * Works at any D. */
 double hilbert_compute_cglmp(double *P00, double *P01, double *P10, double *P11,
                              uint32_t dim);
