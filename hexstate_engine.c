@@ -294,7 +294,7 @@ void engine_destroy(HexStateEngine *eng)
             c->hilbert.q_local_state = NULL;
         }
         /* Free joint states (only side A to avoid double-free) */
-        for (uint8_t p = 0; p < c->hilbert.num_partners; p++) {
+        for (uint16_t p = 0; p < c->hilbert.num_partners; p++) {
             Complex *js = c->hilbert.partners[p].q_joint_state;
             if (!js) continue;
             /* Only free if we are side A (avoid double-free with partner's copy) */
@@ -730,7 +730,7 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
             /* WRITE collapse back to ALL partner joint states:
              * Zero all amplitudes incompatible with our outcome.
              * Each partner's state is automatically determined. */
-            for (uint8_t p = 0; p < c->hilbert.num_partners; p++) {
+            for (uint16_t p = 0; p < c->hilbert.num_partners; p++) {
                 Complex *pj = c->hilbert.partners[p].q_joint_state;
                 uint8_t pw = c->hilbert.partners[p].q_which;
                 uint32_t pd = c->hilbert.partners[p].q_joint_dim;
@@ -949,8 +949,8 @@ void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
         eng->chunks[b].hilbert.shadow_state == NULL) {
 
         /* Check partner capacity */
-        uint8_t pa = eng->chunks[a].hilbert.num_partners;
-        uint8_t pb = eng->chunks[b].hilbert.num_partners;
+        uint16_t pa = eng->chunks[a].hilbert.num_partners;
+        uint16_t pb = eng->chunks[b].hilbert.num_partners;
         if (pa >= MAX_BRAID_PARTNERS || pb >= MAX_BRAID_PARTNERS) {
             printf("  [BRAID] ERROR: max partners reached (chunk %lu=%u, chunk %lu=%u)\n",
                    a, pa, b, pb);
