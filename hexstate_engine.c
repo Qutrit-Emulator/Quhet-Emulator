@@ -285,9 +285,15 @@ int engine_init(HexStateEngine *eng)
 
 void engine_destroy(HexStateEngine *eng)
 {
-    /* Free all joint states from braid partners (avoid double-free) */
+    /* Free all local states and joint states from braid partners */
     for (uint64_t i = 0; i < eng->num_chunks; i++) {
         Chunk *c = &eng->chunks[i];
+        /* Free local Hilbert space */
+        if (c->hilbert.q_local_state) {
+            free(c->hilbert.q_local_state);
+            c->hilbert.q_local_state = NULL;
+        }
+        /* Free joint states (only side A to avoid double-free) */
         for (uint8_t p = 0; p < c->hilbert.num_partners; p++) {
             Complex *js = c->hilbert.partners[p].q_joint_state;
             if (!js) continue;
@@ -418,8 +424,10 @@ int init_chunk(HexStateEngine *eng, uint64_t id, uint64_t num_hexits)
         c->hilbert.shadow_capacity = 0;
         /* WRITE quantum state to Magic Pointer address */
         c->hilbert.q_flags = 0x01;  /* superposed */
-        c->hilbert.q_entangle_seed = 0;
-        c->hilbert.q_basis_rotation = 0;
+        /* Allocate local D=6 Hilbert space: |0⟩ */
+        c->hilbert.q_local_dim = 6;
+        c->hilbert.q_local_state = calloc(6, sizeof(Complex));
+        c->hilbert.q_local_state[0] = cmplx(1.0, 0.0);  /* |0⟩ */
         memset(c->hilbert.partners, 0, sizeof(c->hilbert.partners));
         c->hilbert.num_partners = 0;
 
@@ -470,12 +478,16 @@ void create_superposition(HexStateEngine *eng, uint64_t id)
     Complex *state = resolve_shadow(eng, id, &ns);
 
     if (state == NULL) {
-        /* ── WRITE superposition to Magic Pointer address ──
-         * The HilbertRef struct IS the memory at this pointer.
-         * Setting q_flags stores the quantum state there. */
+        /* ── WRITE superposition to local Hilbert space ── */
         c->hilbert.q_flags = 0x01;  /* superposed */
-        c->hilbert.q_basis_rotation = 0;
-        printf("  [SUP] Superposition WRITTEN to Magic Pointer 0x%016lX\n",
+        if (c->hilbert.q_local_state) {
+            uint32_t d = c->hilbert.q_local_dim;
+            if (d == 0) d = 6;
+            double amp = 1.0 / sqrt((double)d);
+            for (uint32_t i = 0; i < d; i++)
+                c->hilbert.q_local_state[i] = cmplx(amp, 0.0);
+        }
+        printf("  [SUP] Superposition WRITTEN to Hilbert space at Ptr 0x%016lX\n",
                c->hilbert.magic_ptr);
         return;
     }
@@ -613,10 +625,18 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
             printf("  [H] QFT_%u WRITTEN to Hilbert space at Ptr 0x%016lX (side %c%s)\n",
                    dim, c->hilbert.magic_ptr, which == 0 ? 'A' : 'B',
                    is_pow2 ? ", FFT" : ", Bluestein");
-        } else {
-            c->hilbert.q_basis_rotation++;
-            printf("  [H] Basis rotation WRITTEN to Ptr 0x%016lX (rot=%lu)\n",
-                   c->hilbert.magic_ptr, c->hilbert.q_basis_rotation);
+        } else if (c->hilbert.q_local_state) {
+            /* ── Apply DFT to local single-particle Hilbert space ── */
+            uint32_t d = c->hilbert.q_local_dim;
+            if (d == 0) d = 6;
+            bluestein_dft(c->hilbert.q_local_state, d);
+            double inv_sqrt_d = 1.0 / sqrt((double)d);
+            for (uint32_t i = 0; i < d; i++)
+                c->hilbert.q_local_state[i] = cmplx(
+                    c->hilbert.q_local_state[i].real * inv_sqrt_d,
+                    c->hilbert.q_local_state[i].imag * inv_sqrt_d);
+            printf("  [H] DFT_%u WRITTEN to local Hilbert space at Ptr 0x%016lX\n",
+                   d, c->hilbert.magic_ptr);
         }
         return;
     }
@@ -753,14 +773,29 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
             return (uint64_t)result;
         }
 
-        /* No joint state — unentangled infinite chunk.
-         * Measure uniformly from D=6 Hilbert space. */
-        uint64_t result = engine_prng(eng) % 6;
-        c->hilbert.q_flags = 0x02;
-        eng->measured_values[id] = result;
-        printf("  [MEAS] READ Ptr 0x%016lX (unentangled, D=6) => %lu\n",
-               c->hilbert.magic_ptr, result);
-        return result;
+        /* ── Born rule on local single-particle Hilbert space ── */
+        if (c->hilbert.q_local_state) {
+            uint32_t d = c->hilbert.q_local_dim;
+            if (d == 0) d = 6;
+            double r = prng_uniform(eng);
+            double cumul = 0.0;
+            uint64_t result = d - 1;
+            for (uint32_t i = 0; i < d; i++) {
+                cumul += cnorm2(c->hilbert.q_local_state[i]);
+                if (cumul >= r) { result = i; break; }
+            }
+            /* Collapse: set measured state to |result⟩ */
+            for (uint32_t i = 0; i < d; i++)
+                c->hilbert.q_local_state[i] = cmplx(i == result ? 1.0 : 0.0, 0.0);
+            c->hilbert.q_flags = 0x02;
+            eng->measured_values[id] = result;
+            printf("  [MEAS] READ local Hilbert space at Ptr 0x%016lX "
+                   "(Born rule, D=%u) => %lu\n",
+                   c->hilbert.magic_ptr, d, result);
+            return result;
+        }
+        /* Truly empty chunk — return 0 */
+        return 0;
     }
 
     /* ═══ Resolve Magic Pointer ═══ */
@@ -1108,8 +1143,10 @@ int op_infinite_resources(HexStateEngine *eng, uint64_t chunk_id, uint64_t size)
     c->hilbert.shadow_capacity = 0;
     /* WRITE quantum state to Magic Pointer address */
     c->hilbert.q_flags = 0x01;  /* superposed */
-    c->hilbert.q_entangle_seed = 0;
-    c->hilbert.q_basis_rotation = 0;
+    /* Allocate local D=6 Hilbert space: |0⟩ */
+    c->hilbert.q_local_dim = 6;
+    c->hilbert.q_local_state = calloc(6, sizeof(Complex));
+    c->hilbert.q_local_state[0] = cmplx(1.0, 0.0);
     memset(c->hilbert.partners, 0, sizeof(c->hilbert.partners));
     c->hilbert.num_partners = 0;
 
