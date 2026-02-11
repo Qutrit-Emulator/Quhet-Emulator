@@ -1310,8 +1310,76 @@ void unbraid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b)
     }
     eng->num_braid_links = write;
 
-    /* ── Remove partner entries from both chunks ── */
+    /* ── Clean up HilbertGroup membership ── */
     if (a < eng->num_chunks && b < eng->num_chunks) {
+        HilbertGroup *ga = eng->chunks[a].hilbert.group;
+        HilbertGroup *gb = eng->chunks[b].hilbert.group;
+
+        if (ga && ga == gb) {
+            /* Both in the same group */
+            if (ga->num_members <= 2) {
+                /* Group has only these two — free the whole group */
+                free(ga->basis_indices);
+                free(ga->amplitudes);
+                free(ga);
+                eng->chunks[a].hilbert.group = NULL;
+                eng->chunks[a].hilbert.group_index = 0;
+                eng->chunks[b].hilbert.group = NULL;
+                eng->chunks[b].hilbert.group_index = 0;
+            } else {
+                /* Larger group — remove both a and b from the group.
+                 * For simplicity, remove b's slot, then a's slot. */
+                uint32_t idx_a = eng->chunks[a].hilbert.group_index;
+                uint32_t idx_b = eng->chunks[b].hilbert.group_index;
+                /* Remove higher index first to avoid shifting issues */
+                uint32_t first = (idx_a > idx_b) ? idx_a : idx_b;
+                uint32_t second = (idx_a > idx_b) ? idx_b : idx_a;
+
+                /* Remove member at 'first' */
+                for (uint32_t m = first; m + 1 < ga->num_members; m++)
+                    ga->member_ids[m] = ga->member_ids[m + 1];
+                /* Remove column from all sparse entries */
+                for (uint32_t e = 0; e < ga->num_nonzero; e++) {
+                    uint32_t *row = &ga->basis_indices[e * ga->num_members];
+                    for (uint32_t m = first; m + 1 < ga->num_members; m++)
+                        row[m] = row[m + 1];
+                }
+                ga->num_members--;
+
+                /* Remove member at 'second' (now shifted) */
+                for (uint32_t m = second; m + 1 < ga->num_members; m++)
+                    ga->member_ids[m] = ga->member_ids[m + 1];
+                for (uint32_t e = 0; e < ga->num_nonzero; e++) {
+                    uint32_t *row = &ga->basis_indices[e * ga->num_members];
+                    for (uint32_t m = second; m + 1 < ga->num_members; m++)
+                        row[m] = row[m + 1];
+                }
+                ga->num_members--;
+
+                /* Update group_index for remaining members */
+                for (uint32_t m = 0; m < ga->num_members; m++) {
+                    eng->chunks[ga->member_ids[m]].hilbert.group_index = m;
+                }
+
+                /* Clear removed chunks' group pointers */
+                eng->chunks[a].hilbert.group = NULL;
+                eng->chunks[a].hilbert.group_index = 0;
+                eng->chunks[b].hilbert.group = NULL;
+                eng->chunks[b].hilbert.group_index = 0;
+            }
+        } else {
+            /* Different groups or not in groups — null out individually */
+            if (ga) {
+                eng->chunks[a].hilbert.group = NULL;
+                eng->chunks[a].hilbert.group_index = 0;
+            }
+            if (gb) {
+                eng->chunks[b].hilbert.group = NULL;
+                eng->chunks[b].hilbert.group_index = 0;
+            }
+        }
+
+        /* ── Remove partner entries from both chunks ── */
         Complex *freed_joint = NULL;
 
         /* Remove b from a's partner list */
