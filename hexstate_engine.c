@@ -643,6 +643,110 @@ void apply_group_unitary(HexStateEngine *eng, uint64_t id,
            dim, dim, my_idx, nm, new_count);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * LOCAL UNITARY — transforms ONE member's basis index independently
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Unlike apply_group_unitary (which transforms the shared amplitude vector),
+ * this applies U to ONE member's index while leaving all other members'
+ * indices unchanged. This is a proper local unitary on one subsystem:
+ *
+ *   For entry |..., k_A, ...⟩ with amplitude α:
+ *   → creates D entries |..., j, ...⟩ with amplitude α × U[j][k_A]
+ *
+ * This is essential for Bell violation tests: Alice and Bob need
+ * independent measurement bases. Alice's rotation changes only her
+ * basis index, not Bob's — enabling disagreement between them.
+ *
+ * State may expand from N entries to up to N×D entries.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+void apply_local_unitary(HexStateEngine *eng, uint64_t id,
+                         const Complex *U, uint32_t dim)
+{
+    if (id >= eng->num_chunks) return;
+    Chunk *c = &eng->chunks[id];
+    HilbertGroup *g = c->hilbert.group;
+    if (!g || g->num_nonzero == 0) return;
+
+    uint32_t nm = g->num_members;
+    uint32_t ns = g->num_nonzero;
+    uint32_t my_idx = c->hilbert.group_index;
+
+    /* Maximum output: each entry can split into dim entries */
+    uint32_t max_out = ns * dim;
+    uint32_t *new_indices = calloc((size_t)max_out * nm, sizeof(uint32_t));
+    Complex  *new_amps    = calloc(max_out, sizeof(Complex));
+    uint32_t  out_count   = 0;
+
+    for (uint32_t e = 0; e < ns; e++) {
+        uint32_t *old_row = &g->basis_indices[e * nm];
+        uint32_t k = old_row[my_idx];  /* this member's current basis index */
+        Complex  alpha = g->amplitudes[e];
+
+        /* U transforms this member's index: |k⟩ → Σ_j U[j][k] |j⟩ */
+        for (uint32_t j = 0; j < dim; j++) {
+            /* New amplitude = α × U[j][k] */
+            Complex u_jk = U[j * dim + k];
+            Complex new_amp;
+            new_amp.real = alpha.real * u_jk.real - alpha.imag * u_jk.imag;
+            new_amp.imag = alpha.real * u_jk.imag + alpha.imag * u_jk.real;
+
+            if (cnorm2(new_amp) < 1e-28) continue;
+
+            /* Copy all other members' indices unchanged */
+            uint32_t *new_row = &new_indices[out_count * nm];
+            memcpy(new_row, old_row, nm * sizeof(uint32_t));
+            /* Only change THIS member's index to j */
+            new_row[my_idx] = j;
+            new_amps[out_count] = new_amp;
+            out_count++;
+        }
+    }
+
+    /* Deduplicate: merge entries with identical index tuples */
+    for (uint32_t i = 0; i < out_count; i++) {
+        if (cnorm2(new_amps[i]) < 1e-28) continue;
+        for (uint32_t j = i + 1; j < out_count; j++) {
+            if (cnorm2(new_amps[j]) < 1e-28) continue;
+            int same = 1;
+            for (uint32_t m = 0; m < nm; m++) {
+                if (new_indices[i * nm + m] != new_indices[j * nm + m]) {
+                    same = 0; break;
+                }
+            }
+            if (same) {
+                new_amps[i].real += new_amps[j].real;
+                new_amps[i].imag += new_amps[j].imag;
+                new_amps[j].real = 0.0;
+                new_amps[j].imag = 0.0;
+            }
+        }
+    }
+
+    /* Compact: remove zero entries */
+    uint32_t w = 0;
+    for (uint32_t i = 0; i < out_count; i++) {
+        if (cnorm2(new_amps[i]) < 1e-28) continue;
+        if (w != i) {
+            memcpy(&new_indices[w * nm], &new_indices[i * nm],
+                   nm * sizeof(uint32_t));
+            new_amps[w] = new_amps[i];
+        }
+        w++;
+    }
+
+    free(g->basis_indices);
+    free(g->amplitudes);
+    g->basis_indices = new_indices;
+    g->amplitudes    = new_amps;
+    g->num_nonzero   = w;
+    g->sparse_cap    = max_out;
+
+    printf("  [LOCAL U] Applied %u×%u local unitary to member %u/%u "
+           "(%u → %u entries)\n",
+           dim, dim, my_idx, nm, ns, w);
+}
+
 /* ─── Hadamard (DFT₆) Gate ────────────────────────────────────────────────── */
 
 void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
