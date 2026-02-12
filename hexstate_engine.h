@@ -389,6 +389,57 @@ BellResult bell_test(HexStateEngine *eng, uint32_t dim, uint32_t n_shots);
 /* Print formatted Bell test results */
 void bell_test_print(BellResult *r);
 
+/* ═══ N-Party Mermin Inequality — D-dimensional native ═══════════════════
+ *
+ * The Mermin inequality is the correct N-party generalization of CHSH.
+ * For an N-party GHZ state |GHZ⟩ = (1/√D) Σ_k |k⟩^N :
+ *
+ *   Z-test: all N parties measure in computational basis → all agree
+ *   X-test: all N parties measure in DFT_D basis → Σ outcomes ≡ 0 mod D
+ *
+ * No classical state can satisfy BOTH:
+ *   W = P(Z agree) + P(X parity) - 1
+ *   Classical: W ≤ 1/D     Quantum GHZ: W = 1.0
+ *
+ * Invocable via mermin_test() engine function.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* Result from an N-party Mermin inequality test */
+typedef struct {
+    /* ── Core results ── */
+    double   pz;                /* P(all agree in Z-basis) */
+    double   px;                /* P(Σ ≡ 0 mod D in X-basis) */
+    double   witness;           /* W = pz + px - 1 */
+    double   classical_bound;   /* 1/D */
+
+    /* ── Metadata ── */
+    uint32_t n_parties;         /* Number of registers in GHZ */
+    uint32_t dim;               /* Hilbert space dimension (D) */
+    uint32_t n_shots;           /* Shots per test */
+    int      violation;         /* 1 if W > 1/D */
+    double   elapsed_ms;        /* Wall-clock time */
+
+    /* ── Z-basis value distribution ── */
+    int      z_counts[NUM_BASIS_STATES]; /* Per-value counts from Z-test */
+} MerminResult;
+
+/* Run an N-party Mermin inequality test.
+ * Creates n_parties registers (100T quhits each), star-topology GHZ,
+ * then runs Z-test and X-test with n_shots each.
+ * Returns MerminResult with witness W and violation flag. */
+MerminResult mermin_test(HexStateEngine *eng, uint32_t n_parties,
+                         uint32_t n_shots);
+
+/* Print formatted Mermin test results */
+void mermin_test_print(MerminResult *r);
+
+/* ── DFT_D convenience function ──
+ * Apply the D-dimensional Discrete Fourier Transform to a chunk.
+ * This is the generalized Hadamard for D>2:
+ *   F[j,k] = (1/√D) ω^(jk),  ω = e^(2πi/D)
+ * Works on both shadow and Hilbert space states. */
+void apply_dft(HexStateEngine *eng, uint64_t chunk_id, uint32_t dim);
+
 /* ═══ Hilbert Space Inspector — non-destructive state extraction ═══
  *
  * CONTROVERSIAL: In real quantum mechanics, you CANNOT read the
