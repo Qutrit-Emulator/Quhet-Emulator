@@ -1259,6 +1259,24 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
                         c_k[e].imag = old.real * u_val.imag + old.imag * u_val.real;
                     }
 
+                    /* ── Renormalize c_k to prevent numerical underflow ──
+                     * Each step multiplies |c_k| by |U[v,k]| ≈ 1/√D.
+                     * After N steps, |c_k| ≈ (1/√D)^N which underflows
+                     * for large N (e.g. N=1000, D=6 → (0.408)^1000 ≈ 0).
+                     * Renormalizing preserves relative phases/magnitudes. */
+                    {
+                        double ck_norm = 0.0;
+                        for (uint32_t e = 0; e < ns; e++)
+                            ck_norm += cnorm2(c_k[e]);
+                        if (ck_norm > 0.0 && (ck_norm < 1e-200 || ck_norm > 1e200)) {
+                            double scale = 1.0 / sqrt(ck_norm);
+                            for (uint32_t e = 0; e < ns; e++) {
+                                c_k[e].real *= scale;
+                                c_k[e].imag *= scale;
+                            }
+                        }
+                    }
+
                     /* ═══ CZ ABSORPTION ═══
                      * After sampling outcome v for member m, absorb CZ phases
                      * into unmeasured partners' unitaries.
