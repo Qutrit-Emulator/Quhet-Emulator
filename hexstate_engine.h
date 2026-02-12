@@ -280,6 +280,8 @@ void braid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b,
                   uint64_t hexit_a, uint64_t hexit_b);
 void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
                       uint64_t hexit_a, uint64_t hexit_b, uint32_t dim);
+void product_state_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
+                       uint32_t dim);  /* |0⟩⊗|0⟩ product state in shared Hilbert space */
 void unbraid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b);
 
 /* Multiverse operations */
@@ -317,20 +319,70 @@ void     print_chunk_state(HexStateEngine *eng, uint64_t id);
  * dim is read from q_joint_dim (whatever D the state was braided at). */
 double *hilbert_read_joint_probs(HexStateEngine *eng, uint64_t id);
 
-/* ═══ Bell inequality test — native engine operation ═══ */
+/* ═══ Bell inequality test — Hilbert-space-native engine operation ═══
+ *
+ * The Bell test is OUTSOURCED TO THE HILBERT SPACE:
+ *   • Correlators computed analytically from HilbertGroup amplitudes
+ *   • Zero statistical error — exact quantum predictions
+ *   • CHSH: S = 2√2 (Tsirelson bound, exact)
+ *   • CGLMP: I_D from full D-dimensional Hilbert space
+ *   • Optional empirical confirmation via Born-rule sampling
+ * ═══════════════════════════════════════════════════════════════════ */
 
-/* Result from a CHSH Bell test */
+/* Result from a Hilbert-space-native Bell test */
 typedef struct {
-    double   correlation_pct;   /* P(a=b) with no rotation (expect 100%) */
-    double   config_agree[4];   /* P(a=b) for each CHSH config */
-    double   S;                 /* CHSH S-value: classical bound 2.0 */
-    int      violation;         /* 1 if S > 2.0 */
+    /* ── Exact results (from Hilbert space amplitudes, zero error) ── */
+    double   exact_E[4];        /* Exact CHSH correlators E(a_i, b_j) */
+    double   exact_S;           /* Exact CHSH S-value = 2√2 ≈ 2.8284 */
+    double   exact_I_D;         /* Exact CGLMP I_D (full D dimensions) */
+
+    /* ── Empirical results (from Born-rule sampling, for confirmation) ── */
+    double   empirical_E[4];    /* Statistical correlators */
+    double   empirical_S;       /* Statistical CHSH S-value */
+    uint32_t n_shots;           /* Shots per setting (0 = no empirical) */
+
+    /* ── Metadata ── */
+    int      violation;         /* 1 if exact_S > 2.0 */
     uint32_t dim;               /* Hilbert space dimension (D) */
-    uint32_t n_shots;           /* Number of statistical shots per config */
 } BellResult;
 
-/* Run a full CHSH Bell test using apply_local_unitary for independent
- * measurement bases. Creates fresh Bell pairs per shot. Returns results.
+/* ── Deferred unitary management (direct Hilbert space manipulation) ── */
+
+/* Set a D×D unitary as the deferred measurement operator for member_idx.
+ * Does NOT modify the base state. The Hilbert space holds the math. */
+void hilbert_set_deferred(HilbertGroup *g, uint32_t member_idx,
+                          const Complex *U, uint32_t dim);
+
+/* Clear (free) the deferred unitary for member_idx. */
+void hilbert_clear_deferred(HilbertGroup *g, uint32_t member_idx);
+
+/* ── Exact probability extraction from Hilbert space ── */
+
+/* Compute exact joint probabilities P(a,b) from HilbertGroup amplitudes
+ * and deferred unitaries. Writes D×D doubles to probs_out.
+ * P(a,b) = |Σ_k α_k · U_A[a,idx_A] · U_B[b,idx_B]|²
+ * This is the core: reads the Hilbert space directly, no sampling. */
+void hilbert_exact_joint_probs(HilbertGroup *g, double *probs_out);
+
+/* ── Exact Bell inequality computation ── */
+
+/* Compute exact CHSH S-value from HilbertGroup amplitudes.
+ * Uses SU(2) rotations at optimal angles in the qubit subspace.
+ * Returns S = 2√2 ≈ 2.8284 for the maximally entangled state.
+ * Also fills exact_E[4] with individual correlators. */
+double hilbert_exact_chsh(HilbertGroup *g, double exact_E[4]);
+
+/* Compute exact CGLMP I_D from HilbertGroup amplitudes.
+ * Uses DFT_D-rotated bases at optimal angles (Collins et al. 2002).
+ * Full D-dimensional computation — no qubit projection. */
+double hilbert_exact_cglmp(HilbertGroup *g);
+
+/* ── Engine-level Bell test ── */
+
+/* Run a full Hilbert-space-native Bell test.
+ * Creates a Bell state via braid_chunks_dim, computes CHSH and CGLMP
+ * exactly from the HilbertGroup amplitudes. If n_shots > 0, also
+ * performs empirical Born-rule sampling for confirmation.
  * Invocable via OP_BELL_TEST (0x0E) instruction. */
 BellResult bell_test(HexStateEngine *eng, uint32_t dim, uint32_t n_shots);
 
