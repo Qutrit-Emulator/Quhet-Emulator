@@ -91,7 +91,7 @@ typedef struct {
  * collapse is automatic because all members read from it.
  * Sparse representation: for GHZ states, only D entries regardless
  * of group size. */
-#define MAX_GROUP_MEMBERS 16384
+#define MAX_GROUP_MEMBERS 131072  /* 128K — supports up to 100K+ qudit groups */
 typedef struct HilbertGroup {
     uint32_t  dim;              /* Per-register dimension (6) */
     uint32_t  num_members;      /* How many registers share this state */
