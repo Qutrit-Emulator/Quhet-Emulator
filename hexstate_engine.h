@@ -17,7 +17,7 @@
 #include "bigint.h"
 
 /* ─── Configuration Constants ─────────────────────────────────────────────── */
-#define NUM_BASIS_STATES      6
+#define NUM_BASIS_STATES      128   /* Was 6 — increased to support D > 6 gauge groups */
 #define MAX_CHUNK_SIZE        8           /* 6^8 = 1,679,616 states */
 #define MAX_STATES_STANDARD   1679616     /* 6^8 */
 #define MAX_CHUNKS            16777216
