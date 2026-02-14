@@ -103,14 +103,18 @@ typedef struct HilbertGroup {
     Complex  *amplitudes;       /* num_nonzero amplitudes */
     uint8_t   collapsed;        /* 1 if a measurement has collapsed this group */
 
-    /* ═══ Deferred Local Unitaries ═══
-     * Instead of materializing D^N entries, store each member's
-     * pending unitary as a D×D matrix. The state is implicitly:
-     *   |Ψ⟩ = [Π CZ] · Σ_k  α_k · ⊗_m (U_m |index_{m,k}⟩)
-     * Measurement samples from this in O((N+E) × D²) without ever
-     * building the full state. The Hilbert space holds the math. */
-    Complex  *deferred_U[MAX_GROUP_MEMBERS]; /* D×D unitary per member (NULL = identity) */
-    uint32_t  num_deferred;     /* How many members have pending unitaries */
+    /* ═══ Lazy Local Unitaries ═══
+     * Instead of composing D×D matrices eagerly (O(D³) per gate),
+     * store each operation as a separate D×D matrix in a per-member list.
+     * At measurement, replay as matrix-vector products: O(D² × L) total
+     * where L = number of ops. This is a factor of D faster than composition.
+     *
+     * State is implicitly:
+     *   |Ψ⟩ = [Π CZ] · Σ_k α_k · ⊗_m (U_L · ... · U_1 |index_{m,k}⟩) */
+    Complex  **lazy_U[MAX_GROUP_MEMBERS]; /* Array of D×D matrix pointers per member */
+    uint32_t  lazy_count[MAX_GROUP_MEMBERS]; /* Number of ops per member */
+    uint32_t  lazy_cap[MAX_GROUP_MEMBERS];   /* Capacity per member */
+    uint32_t  num_deferred;     /* Total members with pending ops */
     uint8_t   no_defer;         /* If set, force expansion (used during materialization) */
 
     /* ═══ Deferred CZ (Non-Local) Gates ═══
@@ -271,6 +275,7 @@ void apply_group_unitary(HexStateEngine *eng, uint64_t id,
 void apply_local_unitary(HexStateEngine *eng, uint64_t id,
                          const Complex *U, uint32_t dim);
 void materialize_deferred(HexStateEngine *eng, HilbertGroup *g);
+Complex *lazy_compose(Complex **ops, uint32_t num_ops, uint32_t dim);
 void apply_cz_gate(HexStateEngine *eng, uint64_t id_a, uint64_t id_b);
 uint64_t measure_chunk(HexStateEngine *eng, uint64_t id);
 void grover_diffusion(HexStateEngine *eng, uint64_t id);
