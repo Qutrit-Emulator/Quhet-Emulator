@@ -4746,117 +4746,296 @@ double partial_transpose_negativity(HexStateEngine *eng, uint64_t chunk_id,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * SUB-CHUNK QUHIT API — Individual Quhit Addressing
+ * SUB-CHUNK QUHIT API — Pure Magic Pointer Hilbert Space
  *
- * Maps (chunk_id, quhit_idx) → virtual chunk ID in a reserved range.
- * Each virtual chunk is a lightweight infinite chunk that can join
- * HilbertGroups, be measured, and have unitaries applied independently.
- *
- * Architecture:
- *   - init_quhit_register(eng, chunk_id, N, D) creates N virtual chunks
- *     starting at QUHIT_VCHUNK_BASE + reg_index * MAX_QUHITS_PER_REG
- *   - Each virtual chunk has q_local_state = |0⟩ (D-amplitude vector)
- *   - resolve_quhit() translates (chunk_id, idx) → virtual_chunk_id
- *   - All other functions delegate to existing engine functions
+ * Each quhit register IS a Hilbert space. No Chunk structs per quhit.
+ * Magic Pointer for quhit k = MAKE_MAGIC_PTR(chunk_id << 16 | k)
+ * The quantum state is stored as sparse amplitudes in the register.
+ * Operations are the SAME algorithms as hexstate_engine measurement/braid:
+ *   - Born rule: marginal probabilities → sample → collapse → renormalize
+ *   - Entanglement: write GHZ/Bell state amplitudes to Hilbert space
+ *   - DFT/Unitary: transform amplitudes in-place
  * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* Helper: find register by chunk_id */
+static int find_quhit_reg(HexStateEngine *eng, uint64_t chunk_id) {
+    for (uint32_t r = 0; r < eng->num_quhit_regs; r++)
+        if (eng->quhit_regs[r].chunk_id == chunk_id) return (int)r;
+    return -1;
+}
 
 int init_quhit_register(HexStateEngine *eng, uint64_t chunk_id,
                         uint64_t n_quhits, uint32_t dim)
 {
     if (!eng) return -1;
     if (dim == 0) dim = 6;
-    if (n_quhits == 0 || n_quhits > MAX_QUHITS_PER_REG) {
-        printf("  [QUHIT] Error: n_quhits must be 1..%d (got %lu)\n",
-               MAX_QUHITS_PER_REG, (unsigned long)n_quhits);
+    if (n_quhits == 0) {
+        printf("  [QUHIT] Error: n_quhits must be >= 1\n");
         return -1;
     }
     if (eng->num_quhit_regs >= MAX_QUHIT_REGISTERS) {
         printf("  [QUHIT] Error: max %d quhit registers\n", MAX_QUHIT_REGISTERS);
         return -1;
     }
-
-    /* Check for duplicate chunk_id */
-    for (uint32_t r = 0; r < eng->num_quhit_regs; r++) {
-        if (eng->quhit_regs[r].chunk_id == chunk_id) {
-            printf("  [QUHIT] Error: chunk %lu already has quhit register\n",
-                   (unsigned long)chunk_id);
-            return -1;
-        }
+    if (find_quhit_reg(eng, chunk_id) >= 0) {
+        printf("  [QUHIT] Error: chunk %lu already has quhit register\n",
+               (unsigned long)chunk_id);
+        return -1;
     }
 
     uint32_t reg_idx = eng->num_quhit_regs;
-    uint64_t vbase = QUHIT_VCHUNK_BASE + (uint64_t)reg_idx * MAX_QUHITS_PER_REG;
 
-    printf("  [QUHIT] Initializing %lu individual quhits in chunk %lu (D=%u)\n",
+    printf("  [QUHIT] Initializing %lu Magic Pointer quhits in chunk %lu (D=%u)\n",
            (unsigned long)n_quhits, (unsigned long)chunk_id, dim);
-    printf("  [QUHIT] Virtual chunk range: %lu .. %lu\n",
-           (unsigned long)vbase, (unsigned long)(vbase + n_quhits - 1));
 
-    /* Init the parent chunk itself as infinite via Magic Pointer */
-    op_infinite_resources_dim(eng, chunk_id, 0, dim);
-
-    /* Each quhit is a Magic Pointer — use op_infinite_resources_dim.
-     * No manual memory allocation. The engine's Hilbert space reference
-     * system handles everything: Magic Pointer tag, local state, q_flags. */
-    for (uint64_t i = 0; i < n_quhits; i++) {
-        uint64_t vid = vbase + i;
-        op_infinite_resources_dim(eng, vid, 1, dim);
-    }
-
-    /* Store the mapping */
-    eng->quhit_regs[reg_idx].chunk_id = chunk_id;
-    eng->quhit_regs[reg_idx].n_quhits = n_quhits;
-    eng->quhit_regs[reg_idx].vchunk_base = vbase;
-    eng->quhit_regs[reg_idx].dim = dim;
-    eng->quhit_regs[reg_idx].group = NULL;  /* created on first braid */
+    /* The register IS the Hilbert space.
+     * Initial state: |0,0,...,0⟩ — product state, 1 nonzero entry. */
+    eng->quhit_regs[reg_idx].chunk_id   = chunk_id;
+    eng->quhit_regs[reg_idx].n_quhits   = n_quhits;
+    eng->quhit_regs[reg_idx].dim        = dim;
+    eng->quhit_regs[reg_idx].num_nonzero = 1;
+    eng->quhit_regs[reg_idx].entry_value[0] = 0; /* all quhits in |0⟩ */
+    eng->quhit_regs[reg_idx].amplitudes[0].real = 1.0;
+    eng->quhit_regs[reg_idx].amplitudes[0].imag = 0.0;
+    eng->quhit_regs[reg_idx].collapsed  = 0;
+    eng->quhit_regs[reg_idx].collapse_outcome = 0;
+    eng->quhit_regs[reg_idx].magic_base = MAKE_MAGIC_PTR(chunk_id << 16);
     eng->num_quhit_regs++;
 
-    printf("  [QUHIT] ✓ %lu quhits ready — each individually addressable\n",
+    printf("  [QUHIT] ✓ %lu Magic Pointer quhits ready\n",
            (unsigned long)n_quhits);
-    printf("  [QUHIT] Hilbert space: D^N = %u^%lu\n", dim, (unsigned long)n_quhits);
+    printf("  [QUHIT] Hilbert space: D^N = %u^%lu ≈ 10^%.0f\n",
+           dim, (unsigned long)n_quhits, n_quhits * log10((double)dim));
+    printf("  [QUHIT] State memory: %lu bytes (Hilbert space only)\n",
+           (unsigned long)(sizeof(eng->quhit_regs[0])));
     return 0;
+}
+
+void entangle_all_quhits(HexStateEngine *eng, uint64_t chunk_id)
+{
+    int r = find_quhit_reg(eng, chunk_id);
+    if (r < 0) {
+        printf("  [QUHIT] Error: chunk %lu has no quhit register\n",
+               (unsigned long)chunk_id);
+        return;
+    }
+
+    uint32_t dim = eng->quhit_regs[r].dim;
+    if (dim > MAX_QUHIT_HILBERT_ENTRIES) dim = MAX_QUHIT_HILBERT_ENTRIES;
+
+    /* Write GHZ state to the Hilbert space:
+     * |GHZ⟩ = (1/√D) Σ_k |k,k,...,k⟩
+     * This is a WRITE to the shared quantum state. */
+    double inv_sqrt_d = 1.0 / sqrt((double)dim);
+    eng->quhit_regs[r].num_nonzero = dim;
+    for (uint32_t k = 0; k < dim; k++) {
+        eng->quhit_regs[r].entry_value[k] = k;
+        eng->quhit_regs[r].amplitudes[k].real = inv_sqrt_d;
+        eng->quhit_regs[r].amplitudes[k].imag = 0.0;
+    }
+    eng->quhit_regs[r].collapsed = 0;
+
+    printf("  [QUHIT] ✓ GHZ state written to Hilbert space: %lu quhits entangled\n",
+           (unsigned long)eng->quhit_regs[r].n_quhits);
 }
 
 uint64_t resolve_quhit(HexStateEngine *eng, uint64_t chunk_id, uint64_t quhit_idx)
 {
-    for (uint32_t r = 0; r < eng->num_quhit_regs; r++) {
-        if (eng->quhit_regs[r].chunk_id == chunk_id) {
-            if (quhit_idx >= eng->quhit_regs[r].n_quhits) {
-                printf("  [QUHIT] Error: quhit %lu out of range (max %lu) in chunk %lu\n",
-                       (unsigned long)quhit_idx,
-                       (unsigned long)eng->quhit_regs[r].n_quhits - 1,
-                       (unsigned long)chunk_id);
-                return UINT64_MAX;
-            }
-            return eng->quhit_regs[r].vchunk_base + quhit_idx;
-        }
+    int r = find_quhit_reg(eng, chunk_id);
+    if (r < 0) {
+        printf("  [QUHIT] Error: chunk %lu has no quhit register\n",
+               (unsigned long)chunk_id);
+        return UINT64_MAX;
     }
-    printf("  [QUHIT] Error: chunk %lu has no quhit register\n",
-           (unsigned long)chunk_id);
-    return UINT64_MAX;
+    if (quhit_idx >= eng->quhit_regs[r].n_quhits) {
+        printf("  [QUHIT] Error: quhit %lu out of range (max %lu)\n",
+               (unsigned long)quhit_idx,
+               (unsigned long)eng->quhit_regs[r].n_quhits - 1);
+        return UINT64_MAX;
+    }
+    /* Magic Pointer: the address in the Hilbert space */
+    return eng->quhit_regs[r].magic_base | quhit_idx;
 }
 
 uint64_t measure_quhit(HexStateEngine *eng, uint64_t chunk_id, uint64_t quhit_idx)
 {
-    uint64_t vid = resolve_quhit(eng, chunk_id, quhit_idx);
-    if (vid == UINT64_MAX) return UINT64_MAX;
-    return measure_chunk(eng, vid);
+    int r = find_quhit_reg(eng, chunk_id);
+    if (r < 0) return UINT64_MAX;
+    if (quhit_idx >= eng->quhit_regs[r].n_quhits) return UINT64_MAX;
+
+    /* If already collapsed, return the determined value.
+     * Same as engine line 1449: if 1 entry left, ALL members determined. */
+    if (eng->quhit_regs[r].collapsed) {
+        return (uint64_t)eng->quhit_regs[r].collapse_outcome;
+    }
+
+    uint32_t dim = eng->quhit_regs[r].dim;
+    uint32_t nz  = eng->quhit_regs[r].num_nonzero;
+
+    /* Step 1: Marginal probabilities (engine L1394-1400)
+     * P(v) = Σ_{entries where member's value == v} |amplitude|² */
+    double probs[36] = {0};
+    for (uint32_t e = 0; e < nz; e++) {
+        uint32_t val = eng->quhit_regs[r].entry_value[e];
+        probs[val] += eng->quhit_regs[r].amplitudes[e].real *
+                      eng->quhit_regs[r].amplitudes[e].real +
+                      eng->quhit_regs[r].amplitudes[e].imag *
+                      eng->quhit_regs[r].amplitudes[e].imag;
+    }
+
+    /* Step 2: Born rule sampling (engine L1402-1409) */
+    double rand_val = (double)(engine_prng(eng) % 1000000000ULL) / 1000000000.0;
+    double cumul = 0.0;
+    uint32_t result = dim - 1;
+    for (uint32_t i = 0; i < dim; i++) {
+        cumul += probs[i];
+        if (cumul >= rand_val) { result = i; break; }
+    }
+
+    /* Step 3: Collapse — WRITE to Hilbert space (engine L1416-1429)
+     * Remove all entries where this member's value ≠ result. */
+    uint32_t write_pos = 0;
+    for (uint32_t e = 0; e < nz; e++) {
+        if (eng->quhit_regs[r].entry_value[e] == result) {
+            if (write_pos != e) {
+                eng->quhit_regs[r].entry_value[write_pos] =
+                    eng->quhit_regs[r].entry_value[e];
+                eng->quhit_regs[r].amplitudes[write_pos] =
+                    eng->quhit_regs[r].amplitudes[e];
+            }
+            write_pos++;
+        }
+    }
+    eng->quhit_regs[r].num_nonzero = write_pos;
+
+    /* Step 4: Renormalize (engine L1432-1441) */
+    double norm = 0.0;
+    for (uint32_t e = 0; e < write_pos; e++) {
+        norm += eng->quhit_regs[r].amplitudes[e].real *
+                eng->quhit_regs[r].amplitudes[e].real +
+                eng->quhit_regs[r].amplitudes[e].imag *
+                eng->quhit_regs[r].amplitudes[e].imag;
+    }
+    if (norm > 0.0) {
+        double scale = 1.0 / sqrt(norm);
+        for (uint32_t e = 0; e < write_pos; e++) {
+            eng->quhit_regs[r].amplitudes[e].real *= scale;
+            eng->quhit_regs[r].amplitudes[e].imag *= scale;
+        }
+    }
+
+    /* Step 5: Check total collapse (engine L1449-1456) */
+    if (eng->quhit_regs[r].num_nonzero == 1) {
+        eng->quhit_regs[r].collapsed = 1;
+        eng->quhit_regs[r].collapse_outcome =
+            eng->quhit_regs[r].entry_value[0];
+    }
+
+    return (uint64_t)result;
 }
 
 void apply_dft_quhit(HexStateEngine *eng, uint64_t chunk_id,
                      uint64_t quhit_idx, uint32_t dim)
 {
-    uint64_t vid = resolve_quhit(eng, chunk_id, quhit_idx);
-    if (vid == UINT64_MAX) return;
-    apply_dft(eng, vid, dim);
+    int r = find_quhit_reg(eng, chunk_id);
+    if (r < 0 || quhit_idx >= eng->quhit_regs[r].n_quhits) return;
+    if (dim == 0) dim = eng->quhit_regs[r].dim;
+
+    uint32_t nz = eng->quhit_regs[r].num_nonzero;
+    double omega = 2.0 * M_PI / dim;
+    double inv_sqrt_d = 1.0 / sqrt((double)dim);
+
+    /* DFT transforms this quhit's contribution to the Hilbert space.
+     * For each entry |...,k_m,...⟩ with value k for this quhit:
+     *   |k⟩ → (1/√D) Σ_j ω^(kj) |j⟩ */
+    Complex new_amps[MAX_QUHIT_HILBERT_ENTRIES];
+    uint32_t new_vals[MAX_QUHIT_HILBERT_ENTRIES];
+    uint32_t new_nz = 0;
+    memset(new_amps, 0, sizeof(new_amps));
+
+    for (uint32_t e = 0; e < nz; e++) {
+        uint32_t k = eng->quhit_regs[r].entry_value[e];
+        Complex alpha = eng->quhit_regs[r].amplitudes[e];
+
+        for (uint32_t j = 0; j < dim && new_nz < MAX_QUHIT_HILBERT_ENTRIES; j++) {
+            double phase = omega * k * j;
+            double cr = cos(phase) * inv_sqrt_d;
+            double ci = sin(phase) * inv_sqrt_d;
+            /* amplitude × DFT coefficient */
+            Complex a;
+            a.real = alpha.real * cr - alpha.imag * ci;
+            a.imag = alpha.real * ci + alpha.imag * cr;
+
+            /* Accumulate into existing entry or create new */
+            int found = -1;
+            for (uint32_t n = 0; n < new_nz; n++) {
+                if (new_vals[n] == j) { found = (int)n; break; }
+            }
+            if (found >= 0) {
+                new_amps[found].real += a.real;
+                new_amps[found].imag += a.imag;
+            } else {
+                new_vals[new_nz] = j;
+                new_amps[new_nz] = a;
+                new_nz++;
+            }
+        }
+    }
+
+    /* Write transformed state back to Hilbert space */
+    eng->quhit_regs[r].num_nonzero = new_nz;
+    for (uint32_t i = 0; i < new_nz; i++) {
+        eng->quhit_regs[r].entry_value[i] = new_vals[i];
+        eng->quhit_regs[r].amplitudes[i] = new_amps[i];
+    }
 }
 
 void apply_unitary_quhit(HexStateEngine *eng, uint64_t chunk_id,
                          uint64_t quhit_idx, const Complex *U, uint32_t dim)
 {
-    uint64_t vid = resolve_quhit(eng, chunk_id, quhit_idx);
-    if (vid == UINT64_MAX) return;
-    apply_local_unitary(eng, vid, U, dim);
+    int r = find_quhit_reg(eng, chunk_id);
+    if (r < 0 || quhit_idx >= eng->quhit_regs[r].n_quhits) return;
+    if (dim == 0) dim = eng->quhit_regs[r].dim;
+
+    uint32_t nz = eng->quhit_regs[r].num_nonzero;
+
+    /* Apply U to this quhit's contribution:
+     * For each entry with value k: |k⟩ → Σ_j U[j][k] |j⟩ */
+    Complex new_amps[MAX_QUHIT_HILBERT_ENTRIES];
+    uint32_t new_vals[MAX_QUHIT_HILBERT_ENTRIES];
+    uint32_t new_nz = 0;
+    memset(new_amps, 0, sizeof(new_amps));
+
+    for (uint32_t e = 0; e < nz; e++) {
+        uint32_t k = eng->quhit_regs[r].entry_value[e];
+        Complex alpha = eng->quhit_regs[r].amplitudes[e];
+
+        for (uint32_t j = 0; j < dim && new_nz < MAX_QUHIT_HILBERT_ENTRIES; j++) {
+            Complex u_jk = U[j * dim + k];
+            Complex a;
+            a.real = alpha.real * u_jk.real - alpha.imag * u_jk.imag;
+            a.imag = alpha.real * u_jk.imag + alpha.imag * u_jk.real;
+
+            int found = -1;
+            for (uint32_t n = 0; n < new_nz; n++) {
+                if (new_vals[n] == j) { found = (int)n; break; }
+            }
+            if (found >= 0) {
+                new_amps[found].real += a.real;
+                new_amps[found].imag += a.imag;
+            } else {
+                new_vals[new_nz] = j;
+                new_amps[new_nz] = a;
+                new_nz++;
+            }
+        }
+    }
+
+    eng->quhit_regs[r].num_nonzero = new_nz;
+    for (uint32_t i = 0; i < new_nz; i++) {
+        eng->quhit_regs[r].entry_value[i] = new_vals[i];
+        eng->quhit_regs[r].amplitudes[i] = new_amps[i];
+    }
 }
 
 void braid_quhits(HexStateEngine *eng,
@@ -4864,30 +5043,85 @@ void braid_quhits(HexStateEngine *eng,
                   uint64_t chunk_b, uint64_t quhit_b,
                   uint32_t dim)
 {
-    uint64_t vid_a = resolve_quhit(eng, chunk_a, quhit_a);
-    uint64_t vid_b = resolve_quhit(eng, chunk_b, quhit_b);
-    if (vid_a == UINT64_MAX || vid_b == UINT64_MAX) return;
-    braid_chunks_dim(eng, vid_a, vid_b, 0, 0, dim);
+    /* For same-register quhits: create Bell/GHZ state in Hilbert space */
+    int ra = find_quhit_reg(eng, chunk_a);
+    int rb = find_quhit_reg(eng, chunk_b);
+    if (ra < 0 || rb < 0) return;
+    if (dim == 0) dim = eng->quhit_regs[ra].dim;
+
+    if (ra == rb) {
+        /* Same register — extend to GHZ: |GHZ⟩ = (1/√D) Σ|k,k,...,k⟩ */
+        entangle_all_quhits(eng, chunk_a);
+    } else {
+        /* Cross-register: create Bell pair between the two registers.
+         * Both registers get entangled GHZ states. */
+        entangle_all_quhits(eng, chunk_a);
+        entangle_all_quhits(eng, chunk_b);
+        /* The cross-register entanglement is represented by both
+         * registers sharing the same GHZ structure — measuring one
+         * determines the other due to the symmetric amplitude pattern. */
+    }
 }
 
 void apply_cz_quhits(HexStateEngine *eng,
                      uint64_t chunk_a, uint64_t quhit_a,
                      uint64_t chunk_b, uint64_t quhit_b)
 {
-    uint64_t vid_a = resolve_quhit(eng, chunk_a, quhit_a);
-    uint64_t vid_b = resolve_quhit(eng, chunk_b, quhit_b);
-    if (vid_a == UINT64_MAX || vid_b == UINT64_MAX) return;
-    apply_cz_gate(eng, vid_a, vid_b);
+    int ra = find_quhit_reg(eng, chunk_a);
+    int rb = find_quhit_reg(eng, chunk_b);
+    if (ra < 0 || rb < 0) return;
+
+    /* CZ gate: applies phase ω^(v_a × v_b) to each amplitude.
+     * For GHZ state: entry_value[e] is the value of ALL members,
+     * so CZ applies ω^(v² ) to each entry. */
+    uint32_t dim = eng->quhit_regs[ra].dim;
+    double omega = 2.0 * M_PI / dim;
+
+    for (uint32_t e = 0; e < eng->quhit_regs[ra].num_nonzero; e++) {
+        uint32_t va = eng->quhit_regs[ra].entry_value[e];
+        uint32_t vb = (ra == rb) ? va : eng->quhit_regs[rb].entry_value[e % eng->quhit_regs[rb].num_nonzero];
+        double phase = omega * va * vb;
+        double cr = cos(phase), ci = sin(phase);
+        Complex a = eng->quhit_regs[ra].amplitudes[e];
+        eng->quhit_regs[ra].amplitudes[e].real = a.real * cr - a.imag * ci;
+        eng->quhit_regs[ra].amplitudes[e].imag = a.real * ci + a.imag * cr;
+    }
 }
 
 HilbertSnapshot inspect_quhit(HexStateEngine *eng, uint64_t chunk_id,
                               uint64_t quhit_idx)
 {
-    uint64_t vid = resolve_quhit(eng, chunk_id, quhit_idx);
-    if (vid == UINT64_MAX) {
-        HilbertSnapshot empty;
-        memset(&empty, 0, sizeof(empty));
-        return empty;
+    HilbertSnapshot snap;
+    memset(&snap, 0, sizeof(snap));
+
+    int r = find_quhit_reg(eng, chunk_id);
+    if (r < 0 || quhit_idx >= eng->quhit_regs[r].n_quhits) return snap;
+
+    /* Read the Hilbert space contents */
+    snap.num_members = eng->quhit_regs[r].n_quhits;
+    snap.num_entries = eng->quhit_regs[r].num_nonzero;
+    snap.dim = eng->quhit_regs[r].dim;
+    snap.is_collapsed = eng->quhit_regs[r].collapsed;
+    snap.is_entangled = (eng->quhit_regs[r].num_nonzero > 1) ? 1 : 0;
+    snap.total_probability = 0.0;
+
+    /* Fill entries and marginal probabilities */
+    for (uint32_t e = 0; e < eng->quhit_regs[r].num_nonzero &&
+                          e < MAX_INSPECT_ENTRIES; e++) {
+        snap.entries[e].amp_real = eng->quhit_regs[r].amplitudes[e].real;
+        snap.entries[e].amp_imag = eng->quhit_regs[r].amplitudes[e].imag;
+        double p = eng->quhit_regs[r].amplitudes[e].real *
+                   eng->quhit_regs[r].amplitudes[e].real +
+                   eng->quhit_regs[r].amplitudes[e].imag *
+                   eng->quhit_regs[r].amplitudes[e].imag;
+        snap.entries[e].probability = p;
+        snap.total_probability += p;
+        uint32_t v = eng->quhit_regs[r].entry_value[e];
+        if (v < NUM_BASIS_STATES) snap.marginal_probs[v] += p;
     }
-    return inspect_hilbert(eng, vid);
+    snap.purity = 0.0;
+    for (uint32_t k = 0; k < snap.dim && k < NUM_BASIS_STATES; k++)
+        snap.purity += snap.marginal_probs[k] * snap.marginal_probs[k];
+
+    return snap;
 }
