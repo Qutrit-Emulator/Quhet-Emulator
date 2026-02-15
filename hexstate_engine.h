@@ -153,7 +153,7 @@ typedef struct {
     HilbertGroup *group;          /* Shared state (NULL if not in a group) */
     uint32_t  group_index;        /* This register's position within the group */
     /* ─── Joint quantum state (pairwise fallback) ─── */
-#define MAX_BRAID_PARTNERS 1024
+#define MAX_BRAID_PARTNERS 2   /* Legacy pairwise (HilbertGroup supersedes this) */
     struct {
         Complex  *q_joint_state;  /* Shared 2-particle state: dim² amplitudes */
         uint32_t  q_joint_dim;    /* Dimension of joint state (default 6) */
@@ -253,13 +253,24 @@ typedef struct HexStateEngine_s {
     /* BigInt workspace */
     BigInt          bigint_temp[3];
 
-    /* ═══ Sub-Chunk Quhit Mapping ═══ */
+    /* ═══ Sub-Chunk Quhit Registers — Pure Magic Pointer Hilbert Space ═══
+     *
+     * Each register IS a Hilbert space. No Chunk structs per quhit.
+     * Magic Pointer for quhit k = (MAGIC_TAG << 48) | (chunk_id << 16) | k
+     * The quantum state is stored directly as sparse amplitudes.
+     * Operations (measure, DFT, braid) work on the amplitudes. */
+#define MAX_QUHIT_HILBERT_ENTRIES 36  /* D² max for 2-member non-GHZ states */
     struct {
-        uint64_t  chunk_id;                          /* Parent chunk ID */
-        uint64_t  n_quhits;                          /* Number of quhits */
-        uint64_t  vchunk_base;                       /* First virtual chunk ID */
-        uint32_t  dim;                               /* Dimension per quhit */
-        HilbertGroup *group;                         /* Shared group for all quhits */
+        uint64_t  chunk_id;                   /* Parent chunk ID */
+        uint64_t  n_quhits;                   /* Number of Magic Pointer quhits */
+        uint32_t  dim;                        /* Dimension per quhit (D=6) */
+        /* ─── The Hilbert Space ─── */
+        uint32_t  num_nonzero;                /* Nonzero amplitude entries */
+        uint32_t  entry_value[MAX_QUHIT_HILBERT_ENTRIES]; /* Basis value per entry */
+        Complex   amplitudes[MAX_QUHIT_HILBERT_ENTRIES];  /* Complex amplitudes */
+        uint8_t   collapsed;                  /* 1 = measurement has occurred */
+        uint32_t  collapse_outcome;           /* Determined value (all members) */
+        uint64_t  magic_base;                 /* Base Magic Pointer for this register */
     } quhit_regs[MAX_QUHIT_REGISTERS];
     uint32_t        num_quhit_regs;
 } HexStateEngine;
@@ -531,37 +542,39 @@ void generalized_bell_state(HexStateEngine *eng, uint64_t a, uint64_t b,
 double partial_transpose_negativity(HexStateEngine *eng, uint64_t chunk_id,
                                     double *log_negativity);
 
-/* ═══ Sub-Chunk Quhit API — Individual Quhit Addressing ═══════════════════
+/* ═══ Sub-Chunk Quhit API — Pure Magic Pointer Hilbert Space ══════════════
  *
- * Address individual quhits within a chunk by index. Each quhit is an
- * independent D=6 quantum system within a shared HilbertGroup.
- *
- * Architecture: (chunk_id, quhit_idx) maps to a virtual chunk ID.
- * Virtual chunks are lightweight infinite chunks that share a
- * HilbertGroup with sparse representation.
+ * Each quhit register IS a Hilbert space. No Chunk structs per quhit.
+ * Magic Pointer for quhit k = (MAGIC_TAG << 48) | (chunk_id << 16) | k
+ * The quantum state is stored as sparse amplitudes in the register.
+ * Operations (measure, DFT, braid) work directly on the amplitudes.
  *
  * Usage:
- *   init_quhit_register(eng, 0, 100, 6);       // 100 D=6 quhits in chunk 0
- *   braid_quhits(eng, 0, 3, 0, 7, 6);           // entangle quhit 3 ↔ 7
- *   apply_dft_quhit(eng, 0, 3, 6);              // DFT on quhit 3
- *   uint64_t val = measure_quhit(eng, 0, 3);    // measure quhit 3
+ *   init_quhit_register(eng, 0, 100000000, 6);  // 100M Magic Pointer quhits
+ *   entangle_all_quhits(eng, 0);                 // GHZ state across all
+ *   uint64_t val = measure_quhit(eng, 0, 42);    // Born rule on quhit 42
+ *   // ALL 100M quhits now collapsed to val
  * ═══════════════════════════════════════════════════════════════════════ */
 
-/* Initialize N individually addressable quhits within a single chunk.
- * Each quhit starts in |0⟩. All share a HilbertGroup for efficient
- * sparse state tracking. */
+/* Initialize N individually addressable quhits as Magic Pointers.
+ * Each quhit starts in |0⟩. State stored in Hilbert space (not per-Chunk). */
 int init_quhit_register(HexStateEngine *eng, uint64_t chunk_id,
                         uint64_t n_quhits, uint32_t dim);
 
-/* Resolve (chunk_id, quhit_idx) → virtual chunk ID.
- * Returns the internal chunk ID for a specific quhit, or UINT64_MAX on error. */
+/* Entangle ALL quhits in a register into a GHZ state:
+ * |GHZ⟩ = (1/√D) Σ_k |k,k,...,k⟩
+ * Writes the entanglement directly to the Hilbert space. */
+void entangle_all_quhits(HexStateEngine *eng, uint64_t chunk_id);
+
+/* Resolve (chunk_id, quhit_idx) → Magic Pointer address.
+ * Returns the Magic Pointer for a specific quhit. */
 uint64_t resolve_quhit(HexStateEngine *eng, uint64_t chunk_id, uint64_t quhit_idx);
 
-/* Measure a specific quhit by index within a chunk.
- * Collapses that quhit and any entangled partners. */
+/* Measure a specific quhit — Born rule on the Hilbert space.
+ * Collapses that quhit and all entangled partners. */
 uint64_t measure_quhit(HexStateEngine *eng, uint64_t chunk_id, uint64_t quhit_idx);
 
-/* Apply DFT to a specific quhit within a chunk. */
+/* Apply DFT to a specific quhit's contribution to the Hilbert space. */
 void apply_dft_quhit(HexStateEngine *eng, uint64_t chunk_id,
                      uint64_t quhit_idx, uint32_t dim);
 
@@ -569,8 +582,8 @@ void apply_dft_quhit(HexStateEngine *eng, uint64_t chunk_id,
 void apply_unitary_quhit(HexStateEngine *eng, uint64_t chunk_id,
                          uint64_t quhit_idx, const Complex *U, uint32_t dim);
 
-/* Entangle two specific quhits (can be within same chunk or across chunks).
- * Creates a Bell state |Ψ⟩ = Σ|k,k⟩/√D in their joint space. */
+/* Entangle two specific quhits (within same chunk or across chunks).
+ * Creates Bell state |Ψ⟩ = Σ|k,k⟩/√D in their joint Hilbert space. */
 void braid_quhits(HexStateEngine *eng,
                   uint64_t chunk_a, uint64_t quhit_a,
                   uint64_t chunk_b, uint64_t quhit_b,
@@ -581,7 +594,7 @@ void apply_cz_quhits(HexStateEngine *eng,
                      uint64_t chunk_a, uint64_t quhit_a,
                      uint64_t chunk_b, uint64_t quhit_b);
 
-/* Non-destructive inspection of a specific quhit. */
+/* Non-destructive inspection of a specific quhit's Hilbert space. */
 HilbertSnapshot inspect_quhit(HexStateEngine *eng, uint64_t chunk_id,
                               uint64_t quhit_idx);
 
