@@ -4093,60 +4093,65 @@ MerminResult mermin_test(HexStateEngine *eng, uint32_t n_parties,
     /* ── Z-test: measure all N in computational basis, check all agree ── */
     int z_agree = 0;
     for (uint32_t shot = 0; shot < n_shots; shot++) {
-        HexStateEngine e;
-        engine_init(&e);
+        HexStateEngine *e = malloc(sizeof(HexStateEngine));
+        if (!e) { fprintf(real_stdout, "[MERMIN] malloc failed\n"); break; }
+        engine_init(e);
         stdout = devnull;
 
         for (uint32_t p = 0; p < n_parties; p++)
-            init_chunk(&e, p, quhits);
+            init_chunk(e, p, quhits);
         for (uint32_t p = 1; p < n_parties; p++)
-            braid_chunks_dim(&e, 0, p, 0, 0, dim);
+            braid_chunks_dim(e, 0, p, 0, 0, dim);
 
-        uint32_t first = (uint32_t)(measure_chunk(&e, 0) % dim);
+        uint32_t first = (uint32_t)(measure_chunk(e, 0) % dim);
         int agree = 1;
         for (uint32_t p = 1; p < n_parties; p++) {
-            uint32_t val = (uint32_t)(measure_chunk(&e, p) % dim);
+            uint32_t val = (uint32_t)(measure_chunk(e, p) % dim);
             if (val != first) { agree = 0; break; }
         }
 
         stdout = real_stdout;
 
         if (agree) { z_agree++; r.z_counts[first]++; }
-        engine_destroy(&e);
+        engine_destroy(e);
+        free(e);
     }
     r.pz = (double)z_agree / n_shots;
 
     /* ── X-test: apply DFT_D to ALL, measure ALL, check Σ ≡ 0 mod D ── */
     int x_parity = 0;
-    Complex U_DFT[NUM_BASIS_STATES * NUM_BASIS_STATES];
+    Complex *U_DFT = malloc(dim * dim * sizeof(Complex));
     mermin_build_dft(U_DFT, dim);
 
     for (uint32_t shot = 0; shot < n_shots; shot++) {
-        HexStateEngine e;
-        engine_init(&e);
+        HexStateEngine *e = malloc(sizeof(HexStateEngine));
+        if (!e) { fprintf(real_stdout, "[MERMIN] malloc failed\n"); break; }
+        engine_init(e);
         stdout = devnull;
 
         for (uint32_t p = 0; p < n_parties; p++)
-            init_chunk(&e, p, quhits);
+            init_chunk(e, p, quhits);
         for (uint32_t p = 1; p < n_parties; p++)
-            braid_chunks_dim(&e, 0, p, 0, 0, dim);
+            braid_chunks_dim(e, 0, p, 0, 0, dim);
 
         /* Apply DFT_D to ALL parties */
         for (uint32_t p = 0; p < n_parties; p++)
-            apply_local_unitary(&e, p, (const Complex *)U_DFT, dim);
+            apply_local_unitary(e, p, (const Complex *)U_DFT, dim);
 
         /* Measure ALL parties */
         int total = 0;
         for (uint32_t p = 0; p < n_parties; p++)
-            total += (int)(measure_chunk(&e, p) % dim);
+            total += (int)(measure_chunk(e, p) % dim);
 
         stdout = real_stdout;
 
         if (total % (int)dim == 0) x_parity++;
-        engine_destroy(&e);
+        engine_destroy(e);
+        free(e);
     }
     r.px = (double)x_parity / n_shots;
 
+    free(U_DFT);
     fclose(devnull);
 
     /* ── Mermin witness ── */
