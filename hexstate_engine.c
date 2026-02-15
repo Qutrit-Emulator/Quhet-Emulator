@@ -4970,7 +4970,11 @@ uint64_t resolve_quhit(HexStateEngine *eng, uint64_t chunk_id, uint64_t quhit_id
 
 /* Lazily resolve a quhit's value from a self-describing entry.
  * Scans the entry's address map; returns the individual value if found,
- * otherwise returns bulk_value (rule=0) or quhit_idx % dim (rule=1 cyclic). */
+ * otherwise:
+ *   rule=0: bulk_value (constant — all non-addressed share same value)
+ *   rule=1: (bulk_value + quhit_idx) % dim  (cyclic offset —
+ *           each quhit gets a unique value that shifts with the quantum state.
+ *           When bulk is in superposition, ALL quhits are entangled.) */
 static inline uint32_t lazy_resolve(const QuhitBasisEntry *e, uint64_t quhit_idx,
                                     uint8_t bulk_rule, uint32_t dim)
 {
@@ -4978,7 +4982,7 @@ static inline uint32_t lazy_resolve(const QuhitBasisEntry *e, uint64_t quhit_idx
         if (e->addr[i].quhit_idx == quhit_idx)
             return e->addr[i].value;
     }
-    if (bulk_rule == 1) return (uint32_t)(quhit_idx % dim);
+    if (bulk_rule == 1) return (uint32_t)((e->bulk_value + quhit_idx) % dim);
     return e->bulk_value;
 }
 
