@@ -4898,7 +4898,7 @@ double partial_transpose_negativity(HexStateEngine *eng, uint64_t chunk_id,
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 /* Helper: find register by chunk_id */
-static int find_quhit_reg(HexStateEngine *eng, uint64_t chunk_id) {
+int find_quhit_reg(HexStateEngine *eng, uint64_t chunk_id) {
     for (uint32_t r = 0; r < eng->num_quhit_regs; r++)
         if (eng->quhit_regs[r].chunk_id == chunk_id) return (int)r;
     return -1;
