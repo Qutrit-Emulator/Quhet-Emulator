@@ -540,6 +540,141 @@ void create_superposition(HexStateEngine *eng, uint64_t id)
            id, ns, inv_sqrt_n, c->hilbert.magic_ptr);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * DNA GATE — Physics-parameterized focusing unitary
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * The dual of Hadamard. Where DFT₆ SPREADS amplitude uniformly:
+ *
+ *   Hadamard:  |k⟩ → (1/√D) Σⱼ ω^{jk} |j⟩       (1 → D, exploration)
+ *   DNA gate:  |k⟩ → √F |comp(k)⟩ + small noise   (D → 1, focusing)
+ *
+ * The complement mapping comes from molecular physics:
+ *   |A⟩ → |T⟩,  |T⟩ → |A⟩,  |G⟩ → |C⟩,  |C⟩ → |G⟩
+ *   |dR⟩ → |dR⟩,  |Pi⟩ → |Pi⟩   (backbone self-pairs)
+ *
+ * Parameters:
+ *   bond_strength: coupling constant (default 1.0, biological range 0.5-3.0)
+ *                  Higher = tighter focusing (more deterministic)
+ *                  Lower  = more noise (approaches uniform)
+ *   temperature:   Kelvin (default 310 = body temperature)
+ *                  Higher = more thermal noise
+ *                  Lower  = sharper complement selection
+ *
+ * The gate is UNITARY (Gram-Schmidt orthogonalized) and feeds through
+ * apply_local_unitary → deferred chain → correct Born-rule measurement.
+ *
+ * KEY PROPERTY: Applied across N quhits, each independently focuses to
+ * its complement with probability F > (d+1)/(2d). This exceeds the
+ * universal quantum cloning bound, because the gate encodes KNOWLEDGE
+ * of the preferred basis (Watson-Crick pairing) from molecular physics.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+void apply_dna_gate(HexStateEngine *eng, uint64_t id,
+                    double bond_strength, double temperature)
+{
+    if (id >= eng->num_chunks) return;
+    Chunk *c = &eng->chunks[id];
+
+    /* Determine dimension from group or default D=6 */
+    uint32_t dim = 6;
+    if (c->hilbert.group)
+        dim = c->hilbert.group->dim;
+    else if (c->hilbert.num_partners > 0 && c->hilbert.partners[0].q_joint_dim > 0)
+        dim = c->hilbert.partners[0].q_joint_dim;
+
+    /* Complement mapping: Watson-Crick for bases 0-3, self for 4-5
+     * For arbitrary dimensions > 6, pair (0,1), (2,3), (4,5), ... */
+    int *comp = calloc(dim, sizeof(int));
+    for (uint32_t k = 0; k < dim; k++) {
+        if (k < 4) {
+            /* Watson-Crick: A↔T (0↔1), G↔C (2↔3) */
+            static const int wc[] = {1, 0, 3, 2};
+            comp[k] = wc[k];
+        } else if (k + 1 < dim && (k % 2) == 0) {
+            comp[k] = k + 1;    /* even → odd */
+        } else if ((k % 2) == 1) {
+            comp[k] = k - 1;    /* odd → even */
+        } else {
+            comp[k] = k;        /* self-pair for last odd dim */
+        }
+    }
+
+    /* Build the DNA unitary matrix */
+    double kT = 8.617e-5 * temperature;  /* kB * T in eV */
+    if (kT < 1e-10) kT = 1e-10;
+
+    /* Base coupling from bond energy (normalized to kT) */
+    double sigma = bond_strength / kT;    /* dimensionless coupling */
+    double complement_amp = 1.0 + sigma;  /* strong for complement */
+    double mismatch_amp   = 1.0 / (1.0 + sigma); /* weak for mismatch */
+
+    Complex *U = calloc((size_t)dim * dim, sizeof(Complex));
+    if (!U) { free(comp); return; }
+
+    for (uint32_t i = 0; i < dim; i++) {
+        for (uint32_t j = 0; j < dim; j++) {
+            double amp, phase;
+            if ((int)j == comp[i]) {
+                /* Complement pairing: STRONG amplitude */
+                amp = complement_amp;
+                phase = sigma * 0.1 * (double)i; /* small phase from bond energy */
+            } else if (i == j) {
+                /* Self-transition: moderate */
+                amp = 0.3 * mismatch_amp;
+                phase = 0.0;
+            } else {
+                /* Off-target: weak */
+                amp = mismatch_amp * 0.15;
+                phase = 0.5 * (double)((i + j) % dim);
+            }
+            U[i * dim + j] = cmplx(amp * cos(phase), amp * sin(phase));
+        }
+    }
+
+    /* Gram-Schmidt orthogonalization → proper unitary */
+    for (uint32_t i = 0; i < dim; i++) {
+        for (uint32_t k = 0; k < i; k++) {
+            double dr = 0, di = 0;
+            for (uint32_t j = 0; j < dim; j++) {
+                dr += U[k*dim+j].real * U[i*dim+j].real + U[k*dim+j].imag * U[i*dim+j].imag;
+                di += U[k*dim+j].real * U[i*dim+j].imag - U[k*dim+j].imag * U[i*dim+j].real;
+            }
+            for (uint32_t j = 0; j < dim; j++) {
+                U[i*dim+j].real -= dr * U[k*dim+j].real - di * U[k*dim+j].imag;
+                U[i*dim+j].imag -= dr * U[k*dim+j].imag + di * U[k*dim+j].real;
+            }
+        }
+        double norm = 0;
+        for (uint32_t j = 0; j < dim; j++)
+            norm += U[i*dim+j].real * U[i*dim+j].real + U[i*dim+j].imag * U[i*dim+j].imag;
+        if (norm > 1e-15) {
+            double inv = 1.0 / sqrt(norm);
+            for (uint32_t j = 0; j < dim; j++) {
+                U[i*dim+j].real *= inv;
+                U[i*dim+j].imag *= inv;
+            }
+        }
+    }
+
+    /* Apply through the deferred unitary chain */
+    apply_local_unitary(eng, id, U, dim);
+
+    /* Report */
+    double fidelity = 0;
+    for (uint32_t k = 0; k < dim; k++) {
+        int c_idx = comp[k];
+        fidelity += U[k*dim+c_idx].real * U[k*dim+c_idx].real +
+                    U[k*dim+c_idx].imag * U[k*dim+c_idx].imag;
+    }
+    fidelity /= dim;
+
+    printf("  [DNA] gate applied to chunk %lu (d=%u, bond=%.2f, T=%.0fK, F=%.1f%%)\n",
+           (unsigned long)id, dim, bond_strength, temperature, fidelity * 100);
+
+    free(U);
+    free(comp);
+}
+
 /* ─── Group-Aware Unitary ──────────────────────────────────────────────────
  * Apply a D×D unitary matrix U to one register within a HilbertGroup.
  *
@@ -4782,10 +4917,21 @@ int init_quhit_register(HexStateEngine *eng, uint64_t chunk_id,
         printf("  [QUHIT] Error: max %d quhit registers\n", MAX_QUHIT_REGISTERS);
         return -1;
     }
-    if (find_quhit_reg(eng, chunk_id) >= 0) {
-        printf("  [QUHIT] Error: chunk %lu already has quhit register\n",
-               (unsigned long)chunk_id);
-        return -1;
+    int existing = find_quhit_reg(eng, chunk_id);
+    if (existing >= 0) {
+        /* Reinitialize existing register in-place */
+        uint32_t reg_idx = (uint32_t)existing;
+        eng->quhit_regs[reg_idx].n_quhits   = n_quhits;
+        eng->quhit_regs[reg_idx].dim        = dim;
+        eng->quhit_regs[reg_idx].num_nonzero = 1;
+        memset(&eng->quhit_regs[reg_idx].entries[0], 0, sizeof(QuhitBasisEntry));
+        eng->quhit_regs[reg_idx].entries[0].amplitude.real = 1.0;
+        eng->quhit_regs[reg_idx].entries[0].bulk_value = 0;
+        eng->quhit_regs[reg_idx].entries[0].num_addr = 0;
+        eng->quhit_regs[reg_idx].collapsed  = 0;
+        eng->quhit_regs[reg_idx].collapse_outcome = 0;
+        eng->quhit_regs[reg_idx].bulk_rule  = 1;
+        return 0;
     }
 
     uint32_t reg_idx = eng->num_quhit_regs;
@@ -4853,7 +4999,7 @@ void entangle_all_quhits(HexStateEngine *eng, uint64_t chunk_id)
     double inv_sqrt_d = 1.0 / sqrt((double)dim);
     double omega = 2.0 * M_PI / (double)dim;
 
-    QuhitBasisEntry new_entries[MAX_QUHIT_HILBERT_ENTRIES];
+    static QuhitBasisEntry new_entries[MAX_QUHIT_HILBERT_ENTRIES];
     uint32_t new_nz = 0;
 
     for (uint32_t e = 0; e < nz; e++) {
@@ -5136,7 +5282,7 @@ void apply_dft_quhit(HexStateEngine *eng, uint64_t chunk_id,
      * For each entry, lazily resolve the quhit's current value,
      * then produce D new entries with DFT-rotated amplitudes.
      * The entry self-describes the new state — no metadata needed. */
-    QuhitBasisEntry new_entries[MAX_QUHIT_HILBERT_ENTRIES];
+    static QuhitBasisEntry new_entries[MAX_QUHIT_HILBERT_ENTRIES];
     uint32_t new_nz = 0;
 
     for (uint32_t e = 0; e < nz; e++) {
@@ -5169,7 +5315,7 @@ void apply_unitary_quhit(HexStateEngine *eng, uint64_t chunk_id,
 
     uint32_t nz = eng->quhit_regs[r].num_nonzero;
 
-    QuhitBasisEntry new_entries[MAX_QUHIT_HILBERT_ENTRIES];
+    static QuhitBasisEntry new_entries[MAX_QUHIT_HILBERT_ENTRIES];
     uint32_t new_nz = 0;
 
     for (uint32_t e = 0; e < nz; e++) {
@@ -5258,7 +5404,7 @@ void apply_sum_quhits(HexStateEngine *eng,
     uint32_t dim = eng->quhit_regs[rc].dim;
     uint32_t nz = eng->quhit_regs[rc].num_nonzero;
 
-    QuhitBasisEntry new_entries[MAX_QUHIT_HILBERT_ENTRIES];
+    static QuhitBasisEntry new_entries[MAX_QUHIT_HILBERT_ENTRIES];
     uint32_t new_nz = 0;
 
     for (uint32_t e = 0; e < nz; e++) {
@@ -5313,4 +5459,222 @@ HilbertSnapshot inspect_quhit(HexStateEngine *eng, uint64_t chunk_id,
 
     snap.purity = 1.0;
     return snap;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * DNA GATE — Mode 2: Individual Quhit Register Operations
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * Two variants, mirroring DFT:
+ *
+ *   apply_dna_bulk_quhits:  Transforms bulk amplitudes with the WC complement
+ *                           unitary. ALL quhits transformed simultaneously,
+ *                           no promotion needed. Like entangle_all_quhits
+ *                           but focusing instead of spreading.
+ *
+ *   apply_dna_quhit:        Transforms a single quhit at a specific index,
+ *                           promoting it to addr[]. Like apply_dft_quhit
+ *                           but with the DNA complement unitary.
+ *
+ * The DNA unitary matrix for quhit registers:
+ *   U[i][j] = strong  if j == complement(i)   (WC pairing)
+ *           = weak    otherwise                (mismatch)
+ *   Orthogonalized via Gram-Schmidt to ensure unitarity.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* Build D×D DNA complement unitary for quhit register use.
+ * Returns a heap-allocated D×D Complex matrix (caller must free). */
+static Complex *build_quhit_dna_unitary(uint32_t dim,
+                                         double bond_strength,
+                                         double temperature)
+{
+    Complex *U = calloc((size_t)dim * dim, sizeof(Complex));
+    if (!U) return NULL;
+
+    double kT = 8.617e-5 * temperature;
+    if (kT < 1e-10) kT = 1e-10;
+    double sigma = bond_strength / kT;
+    double complement_amp = 1.0 + sigma;
+    double mismatch_amp   = 1.0 / (1.0 + sigma);
+
+    /* Complement mapping */
+    int comp[MAX_QUHIT_HILBERT_ENTRIES];
+    for (uint32_t k = 0; k < dim && k < MAX_QUHIT_HILBERT_ENTRIES; k++) {
+        if (k < 4) {
+            static const int wc[] = {1, 0, 3, 2};
+            comp[k] = wc[k];
+        } else if (k + 1 < dim && (k % 2) == 0) {
+            comp[k] = k + 1;
+        } else if ((k % 2) == 1) {
+            comp[k] = k - 1;
+        } else {
+            comp[k] = k;
+        }
+    }
+
+    /* Build raw matrix */
+    for (uint32_t i = 0; i < dim; i++) {
+        for (uint32_t j = 0; j < dim; j++) {
+            double amp, phase;
+            if ((int)j == comp[i]) {
+                amp = complement_amp;
+                phase = sigma * 0.1 * (double)i;
+            } else if (i == j) {
+                amp = 0.3 * mismatch_amp;
+                phase = 0.0;
+            } else {
+                amp = mismatch_amp * 0.15;
+                phase = 0.5 * (double)((i + j) % dim);
+            }
+            U[i * dim + j] = cmplx(amp * cos(phase), amp * sin(phase));
+        }
+    }
+
+    /* Gram-Schmidt orthogonalization */
+    for (uint32_t i = 0; i < dim; i++) {
+        for (uint32_t k = 0; k < i; k++) {
+            double dr = 0, di = 0;
+            for (uint32_t j = 0; j < dim; j++) {
+                dr += U[k*dim+j].real * U[i*dim+j].real + U[k*dim+j].imag * U[i*dim+j].imag;
+                di += U[k*dim+j].real * U[i*dim+j].imag - U[k*dim+j].imag * U[i*dim+j].real;
+            }
+            for (uint32_t j = 0; j < dim; j++) {
+                U[i*dim+j].real -= dr * U[k*dim+j].real - di * U[k*dim+j].imag;
+                U[i*dim+j].imag -= dr * U[k*dim+j].imag + di * U[k*dim+j].real;
+            }
+        }
+        double norm = 0;
+        for (uint32_t j = 0; j < dim; j++)
+            norm += U[i*dim+j].real * U[i*dim+j].real + U[i*dim+j].imag * U[i*dim+j].imag;
+        if (norm > 1e-15) {
+            double inv = 1.0 / sqrt(norm);
+            for (uint32_t j = 0; j < dim; j++) {
+                U[i*dim+j].real *= inv;
+                U[i*dim+j].imag *= inv;
+            }
+        }
+    }
+
+    return U;
+}
+
+/* ── apply_dna_bulk_quhits: DNA gate on ALL quhits via bulk values ───
+ *
+ * Transforms the bulk_value amplitudes with the DNA complement unitary.
+ * Every quhit in the register is simultaneously affected because they
+ * all derive their state from the bulk_value via lazy_resolve.
+ *
+ * This is the dual of entangle_all_quhits (which uses DFT).
+ * DFT spreads: |k⟩ → (1/√D) Σ ω^{jk} |j⟩
+ * DNA focuses: |k⟩ → Σ U_DNA[j][k] |j⟩  (peaked at complement)
+ * ─────────────────────────────────────────────────────────────────── */
+void apply_dna_bulk_quhits(HexStateEngine *eng, uint64_t chunk_id,
+                           double bond_strength, double temperature)
+{
+    int r = find_quhit_reg(eng, chunk_id);
+    if (r < 0) {
+        printf("  [QUHIT] Error: chunk %lu has no quhit register\n",
+               (unsigned long)chunk_id);
+        return;
+    }
+
+    uint32_t dim = eng->quhit_regs[r].dim;
+    uint32_t nz  = eng->quhit_regs[r].num_nonzero;
+
+    Complex *U = build_quhit_dna_unitary(dim, bond_strength, temperature);
+    if (!U) return;
+
+    static QuhitBasisEntry new_entries[MAX_QUHIT_HILBERT_ENTRIES];
+    uint32_t new_nz = 0;
+
+    for (uint32_t e = 0; e < nz; e++) {
+        QuhitBasisEntry *cur = &eng->quhit_regs[r].entries[e];
+        uint32_t v = cur->bulk_value;
+
+        /* Apply DNA unitary: |v⟩ → Σ_j U[j][v] |j⟩ */
+        for (uint32_t j = 0; j < dim && new_nz < MAX_QUHIT_HILBERT_ENTRIES; j++) {
+            Complex Ujv = U[j * dim + v];
+
+            QuhitBasisEntry ne = *cur;
+            ne.bulk_value = j;
+            ne.amplitude.real = cur->amplitude.real * Ujv.real - cur->amplitude.imag * Ujv.imag;
+            ne.amplitude.imag = cur->amplitude.real * Ujv.imag + cur->amplitude.imag * Ujv.real;
+
+            accumulate_entry(new_entries, &new_nz, &ne);
+        }
+    }
+
+    memcpy(eng->quhit_regs[r].entries, new_entries,
+           new_nz * sizeof(QuhitBasisEntry));
+    eng->quhit_regs[r].num_nonzero = new_nz;
+    eng->quhit_regs[r].collapsed = 0;
+
+    /* Calculate fidelity for report */
+    double fidelity = 0;
+    for (uint32_t k = 0; k < dim; k++) {
+        int ck = (k < 4) ? ((int[]){1,0,3,2})[k] : (int)k;
+        fidelity += U[k*dim+ck].real * U[k*dim+ck].real +
+                    U[k*dim+ck].imag * U[k*dim+ck].imag;
+    }
+    fidelity /= dim;
+
+    free(U);
+
+    printf("  [QUHIT] ✓ DNA-bulk: %lu quhits, %u entries (F=%.1f%%)\n",
+           (unsigned long)eng->quhit_regs[r].n_quhits,
+           eng->quhit_regs[r].num_nonzero, fidelity * 100);
+}
+
+/* ── apply_dna_quhit: DNA gate on ONE specific quhit ─────────────────
+ *
+ * Like apply_dft_quhit, but with the DNA complement unitary.
+ * Lazily resolves the quhit's current value, then produces D new
+ * entries with DNA-rotated amplitudes. The quhit is promoted to
+ * addr[] with its new individually-tracked value.
+ *
+ * This is the per-quhit analog of apply_dna_bulk_quhits.
+ * Use this when you need a specific quhit to be complement-focused
+ * while leaving the bulk state untouched.
+ * ─────────────────────────────────────────────────────────────────── */
+void apply_dna_quhit(HexStateEngine *eng, uint64_t chunk_id,
+                     uint64_t quhit_idx,
+                     double bond_strength, double temperature)
+{
+    int r = find_quhit_reg(eng, chunk_id);
+    if (r < 0 || quhit_idx >= eng->quhit_regs[r].n_quhits) return;
+
+    uint32_t dim = eng->quhit_regs[r].dim;
+    uint32_t nz  = eng->quhit_regs[r].num_nonzero;
+
+    Complex *U = build_quhit_dna_unitary(dim, bond_strength, temperature);
+    if (!U) return;
+
+    static QuhitBasisEntry new_entries[MAX_QUHIT_HILBERT_ENTRIES];
+    uint32_t new_nz = 0;
+
+    for (uint32_t e = 0; e < nz; e++) {
+        QuhitBasisEntry *cur = &eng->quhit_regs[r].entries[e];
+        uint32_t v = lazy_resolve(cur, quhit_idx,
+                                  eng->quhit_regs[r].bulk_rule, dim);
+
+        /* Apply DNA unitary to this quhit: |v⟩ → Σ_j U[j][v] |j⟩ */
+        for (uint32_t j = 0; j < dim; j++) {
+            Complex Ujv = U[j * dim + v];
+            Complex a;
+            a.real = cur->amplitude.real * Ujv.real - cur->amplitude.imag * Ujv.imag;
+            a.imag = cur->amplitude.real * Ujv.imag + cur->amplitude.imag * Ujv.real;
+
+            QuhitBasisEntry ne = entry_with_value(cur, quhit_idx, j, a);
+            accumulate_entry(new_entries, &new_nz, &ne);
+        }
+    }
+
+    eng->quhit_regs[r].num_nonzero = new_nz;
+    memcpy(eng->quhit_regs[r].entries, new_entries,
+           new_nz * sizeof(QuhitBasisEntry));
+
+    free(U);
+
+    printf("  [QUHIT] ✓ DNA gate on quhit %lu: %u entries\n",
+           (unsigned long)quhit_idx, new_nz);
 }
