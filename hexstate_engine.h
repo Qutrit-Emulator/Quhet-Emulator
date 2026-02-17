@@ -653,4 +653,79 @@ void apply_dna_quhit(HexStateEngine *eng, uint64_t chunk_id,
                      uint64_t quhit_idx,
                      double bond_strength, double temperature);
 
+/* ═══ Lazy State Vector Streaming ═══════════════════════════════════════════
+ *
+ * Stream the full state vector in infinite resource mode without holding
+ * it all in memory. The iterator walks the sparse basis entries one by one,
+ * yielding (bulk_value, amplitude, per-quhit overrides) on each step.
+ *
+ * Usage:
+ *   StateIterator it;
+ *   state_iter_begin(eng, chunk_id, &it);
+ *   while (state_iter_next(&it)) {
+ *       // it.bulk_value  — value shared by all non-addressed quhits
+ *       // it.amplitude   — complex amplitude of this basis state
+ *       // it.probability — |amplitude|²
+ *       // Resolve specific quhit's value in this entry:
+ *       uint32_t v = state_iter_resolve(&it, quhit_idx);
+ *       // Or get just the amplitude for a known basis index:
+ *       Complex a = state_iter_amplitude(&it);
+ *   }
+ *   state_iter_end(&it);
+ *
+ * Properties:
+ *   - O(1) memory: only one entry loaded at a time
+ *   - Non-destructive: does NOT collapse the state
+ *   - Works for both Mode 1 (local state) and Mode 2 (quhit registers)
+ *   - For braided pairs, iterates the joint (D²) state
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    /* ── Public (read these) ── */
+    uint32_t  bulk_value;           /* Value shared by all non-addressed quhits */
+    Complex   amplitude;            /* Complex amplitude of current entry */
+    double    probability;          /* |amplitude|² */
+    uint32_t  entry_index;          /* Current entry index (0-based) */
+    uint32_t  total_entries;        /* Total non-zero entries in the state */
+    uint64_t  n_quhits;            /* Number of quhits in the register */
+    uint32_t  dim;                  /* Local dimension (D) */
+    uint8_t   num_addr;             /* How many individually-addressed quhits in this entry */
+    const QuhitAddrValue *addr;     /* Pointer to per-quhit overrides (read-only) */
+
+    /* ── Private (internal bookkeeping) ── */
+    HexStateEngine *eng;
+    int       reg_idx;              /* Quhit register index (-1 = local/joint mode) */
+    int       mode;                 /* 0=quhit_reg, 1=local_state, 2=joint_state, 3=group */
+    uint64_t  chunk_id;
+    const QuhitBasisEntry *entries; /* Pointer to basis entries (quhit reg mode) */
+    uint8_t   bulk_rule;            /* 0=constant, 1=cyclic */
+    const Complex *local_ptr;       /* For local/joint mode */
+    uint32_t  local_dim;            /* Dimension for local/joint iteration */
+    /* Group state (mode 3) */
+    const HilbertGroup *group;      /* Shared group (NULL if not group mode) */
+    uint32_t  group_member_idx;     /* This chunk's index within the group */
+} StateIterator;
+
+/* Initialize the iterator for a chunk. Returns 0 on success, -1 on error.
+ * Automatically selects the right mode:
+ *   - If chunk has a quhit register → iterates sparse entries
+ *   - If chunk has a joint state (braided) → iterates D² joint amplitudes
+ *   - Otherwise → iterates D local amplitudes */
+int  state_iter_begin(HexStateEngine *eng, uint64_t chunk_id, StateIterator *it);
+
+/* Advance to the next entry. Returns 1 if a new entry is available, 0 if done.
+ * After returning 1, the public fields are populated with the current entry's data. */
+int  state_iter_next(StateIterator *it);
+
+/* Resolve a specific quhit's value within the CURRENT entry.
+ * Uses lazy_resolve: checks addr[] first, falls back to bulk_value.
+ * Only valid while iterator is on a valid entry (after state_iter_next returned 1). */
+uint32_t state_iter_resolve(const StateIterator *it, uint64_t quhit_idx);
+
+/* Get the complex amplitude of the current entry. (Convenience alias — same as it->amplitude.) */
+Complex  state_iter_amplitude(const StateIterator *it);
+
+/* Release any resources associated with the iterator. */
+void state_iter_end(StateIterator *it);
+
 #endif /* HEXSTATE_ENGINE_H */
