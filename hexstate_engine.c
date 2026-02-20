@@ -675,11 +675,159 @@ void apply_cz_gate(HexStateEngine *eng, uint64_t id_a, uint64_t id_b)
     if (id_a >= eng->num_chunks || id_b >= eng->num_chunks) return;
     Chunk *ca = &eng->chunks[id_a];
     Chunk *cb = &eng->chunks[id_b];
-    HilbertGroup *g = ca->hilbert.group;
-    if (!g || g != cb->hilbert.group) return;
+    HilbertGroup *ga = ca->hilbert.group;
+    HilbertGroup *gb = cb->hilbert.group;
 
-    uint32_t idx_a = ca->hilbert.group_index;
-    uint32_t idx_b = cb->hilbert.group_index;
+    /* ── Auto-create group if chunks not yet grouped together ── */
+    if (!ga && !gb) {
+        /* Neither chunk is in a group — create a new 2-member group.
+         * Initialize from their local states (product state). */
+        uint32_t dim = ca->hilbert.q_local_dim;
+        if (dim == 0) dim = 6;
+        uint64_t ids[2] = {id_a, id_b};
+        create_hilbert_group(eng, ids, 2, dim);
+
+        /* Overwrite |0,0⟩ with tensor product of local states */
+        HilbertGroup *g = eng->chunks[id_a].hilbert.group;
+        if (g && g->amplitudes) {
+            memset(g->amplitudes, 0, g->total_dim * sizeof(Complex));
+            Complex *la = ca->hilbert.q_local_state;
+            Complex *lb = cb->hilbert.q_local_state;
+            if (la && lb) {
+                for (uint32_t a = 0; a < dim; a++)
+                    for (uint32_t b = 0; b < dim; b++)
+                        g->amplitudes[a * dim + b] = cmul(la[a], lb[b]);
+            } else {
+                g->amplitudes[0] = cmplx(1.0, 0.0);  /* |0,0⟩ */
+            }
+        }
+        ga = eng->chunks[id_a].hilbert.group;
+        gb = ga;
+    } else if (ga && !gb) {
+        /* A is grouped, B is not — add B to A's group */
+        HilbertGroup *g = ga;
+        uint32_t dim = g->dim;
+        uint32_t old_nm = g->num_members;
+        uint32_t new_nm = old_nm + 1;
+        if (new_nm > MAX_GROUP_MEMBERS) return;
+
+        uint64_t old_td = g->total_dim;
+        uint64_t new_td = old_td * dim;
+
+        /* Materialize any deferred ops before expanding */
+        if (g->num_deferred > 0) materialize_deferred(eng, g);
+
+        Complex *new_amps = sv_calloc_aligned(new_td, sizeof(Complex));
+        Complex *lb = cb->hilbert.q_local_state;
+
+        /* Tensor product: old_amps ⊗ local_b */
+        for (uint64_t flat = 0; flat < old_td; flat++) {
+            if (cnorm2(g->amplitudes[flat]) < 1e-30) continue;
+            for (uint32_t b = 0; b < dim; b++) {
+                Complex local_b = (lb && b < cb->hilbert.q_local_dim)
+                                  ? lb[b] : cmplx(b == 0 ? 1.0 : 0.0, 0.0);
+                new_amps[flat * dim + b] = cmul(g->amplitudes[flat], local_b);
+            }
+        }
+
+        free(g->amplitudes);
+        g->amplitudes = new_amps;
+        g->total_dim = new_td;
+        g->member_ids[old_nm] = id_b;
+        g->num_members = new_nm;
+        cb->hilbert.group = g;
+        cb->hilbert.group_index = old_nm;
+        gb = g;
+    } else if (!ga && gb) {
+        /* B is grouped, A is not — add A to B's group (prepend) */
+        HilbertGroup *g = gb;
+        uint32_t dim = g->dim;
+        uint32_t old_nm = g->num_members;
+        uint32_t new_nm = old_nm + 1;
+        if (new_nm > MAX_GROUP_MEMBERS) return;
+
+        uint64_t old_td = g->total_dim;
+        uint64_t new_td = old_td * dim;
+
+        if (g->num_deferred > 0) materialize_deferred(eng, g);
+
+        Complex *new_amps = sv_calloc_aligned(new_td, sizeof(Complex));
+        Complex *la = ca->hilbert.q_local_state;
+
+        /* Tensor product: local_a ⊗ old_amps */
+        for (uint32_t a = 0; a < dim; a++) {
+            Complex local_a = (la && a < ca->hilbert.q_local_dim)
+                              ? la[a] : cmplx(a == 0 ? 1.0 : 0.0, 0.0);
+            for (uint64_t flat = 0; flat < old_td; flat++) {
+                new_amps[a * old_td + flat] = cmul(local_a, g->amplitudes[flat]);
+            }
+        }
+
+        free(g->amplitudes);
+        g->amplitudes = new_amps;
+        g->total_dim = new_td;
+
+        /* Shift existing members' indices up by 1 */
+        for (uint32_t m = old_nm; m > 0; m--) {
+            g->member_ids[m] = g->member_ids[m-1];
+            eng->chunks[g->member_ids[m]].hilbert.group_index = m;
+        }
+        g->member_ids[0] = id_a;
+        g->num_members = new_nm;
+        ca->hilbert.group = g;
+        ca->hilbert.group_index = 0;
+        ga = g;
+    } else if (ga != gb) {
+        /* Both in different groups — merge (ga absorbs gb) */
+        uint32_t dim = ga->dim;
+        if (ga->num_deferred > 0) materialize_deferred(eng, ga);
+        if (gb->num_deferred > 0) materialize_deferred(eng, gb);
+
+        uint32_t new_nm = ga->num_members + gb->num_members;
+        if (new_nm > MAX_GROUP_MEMBERS) return;
+
+        uint64_t new_td = ga->total_dim * gb->total_dim;
+        Complex *new_amps = sv_calloc_aligned(new_td, sizeof(Complex));
+
+        /* Tensor product: ga ⊗ gb */
+        for (uint64_t fa = 0; fa < ga->total_dim; fa++) {
+            if (cnorm2(ga->amplitudes[fa]) < 1e-30) continue;
+            for (uint64_t fb = 0; fb < gb->total_dim; fb++) {
+                new_amps[fa * gb->total_dim + fb] = cmul(ga->amplitudes[fa],
+                                                          gb->amplitudes[fb]);
+            }
+        }
+
+        /* Move gb's members into ga */
+        for (uint32_t m = 0; m < gb->num_members; m++) {
+            uint32_t new_idx = ga->num_members + m;
+            ga->member_ids[new_idx] = gb->member_ids[m];
+            eng->chunks[gb->member_ids[m]].hilbert.group = ga;
+            eng->chunks[gb->member_ids[m]].hilbert.group_index = new_idx;
+        }
+
+        free(ga->amplitudes);
+        ga->amplitudes = new_amps;
+        ga->total_dim = new_td;
+        ga->num_members = new_nm;
+
+        /* Free old gb (but not its amplitudes — already freed/replaced) */
+        free(gb->amplitudes);
+        for (uint32_t m = 0; m < MAX_GROUP_MEMBERS; m++) {
+            if (gb->lazy_U[m]) {
+                for (uint32_t l = 0; l < gb->lazy_count[m]; l++)
+                    free(gb->lazy_U[m][l]);
+                free(gb->lazy_U[m]);
+            }
+        }
+        free(gb->cz_pairs);
+        free(gb);
+    }
+
+    /* Now both chunks are in the same group — record the CZ pair */
+    HilbertGroup *g = eng->chunks[id_a].hilbert.group;
+    uint32_t idx_a = eng->chunks[id_a].hilbert.group_index;
+    uint32_t idx_b = eng->chunks[id_b].hilbert.group_index;
 
     if (g->num_cz >= g->cz_cap) {
         uint32_t new_cap = g->cz_cap ? g->cz_cap * 2 : 64;
