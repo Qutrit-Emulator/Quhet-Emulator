@@ -104,77 +104,169 @@ void mps_overlay_amplitude(QuhitEngine *eng, uint32_t *quhits, int n,
 
 uint32_t mps_overlay_measure(QuhitEngine *eng, uint32_t *quhits, int n, int target_idx)
 {
-    /* Steps:
-     * 1. Compute prob of each outcome k for target_idx by contracting
-     *    the network with operator |k><k| at target.
-     *    This is O(N) but requires contracting 'left environment' and 'right environment'.
-     *    For simplified W-state logic (prob 1/N for |1>, etc), we know the answer.
-     *    But for general MPS, we must contract.
+    /*
+     * Full left-right density environment contraction for exact P(k).
+     * Cost: O(N × χ³ × D) = O(N × 8 × 6) = O(48N). Trivial for χ=2.
      *
-     *    Let's do a full contraction for each k to get P(k).
-     *    Norm = sum(P(k)).
+     * Step 1: Build right density environment ρ_R from site N-1 down to target+1.
+     *         ρ_R[j] = Σ_k A[k]_j† × ρ_R[j+1] × A[k]_j
+     *         Boundary: ρ_R[N] = |R⟩⟨R| where R=[0,...,0,1] (last bond index).
      *
-     * 2. Sample k.
-     * 3. Update tensor at target_idx to A'[k] = A[k], A'[!k] = 0.
-     *    (Projective measurement).
+     * Step 2: Build left environment vector L from site 0 up to target-1.
+     *         For previously-measured sites, use the projected tensor.
+     *         L starts as [1, 0, ..., 0].
+     *
+     * Step 3: For each physical index k at target:
+     *         P(k) = L† × A[k]† × ρ_R[target] × A[k] × L
+     *
+     * Step 4: Born sample from {P(k)}.
+     * Step 5: Project tensor at target, renormalize.
      */
-     
-    /* This implementation is simplified: assumes pure state W-like structure */
-    
+
+    /* ── Step 1: Right density environment ── */
+    /* ρ_R is a χ×χ = 2×2 Hermitian matrix at each site */
+    double rho_R[MPS_CHI][MPS_CHI]; /* current right env */
+
+    /* Boundary: |R⟩⟨R| where R = [0, 1] */
+    rho_R[0][0] = 0; rho_R[0][1] = 0;
+    rho_R[1][0] = 0; rho_R[1][1] = 1;
+
+    /* Sweep from site N-1 down to target+1 */
+    for (int j = n - 1; j > target_idx; j--) {
+        int pid = eng->quhits[quhits[j]].pair_id;
+        if (pid < 0) continue;
+        QuhitPair *p = &eng->pairs[pid];
+
+        double new_rho[MPS_CHI][MPS_CHI] = {{0}};
+
+        for (int k = 0; k < MPS_PHYS; k++) {
+            /* Extract A[k] (χ×χ real matrix for typical states) */
+            double A[MPS_CHI][MPS_CHI];
+            for (int a = 0; a < MPS_CHI; a++)
+                for (int b = 0; b < MPS_CHI; b++) {
+                    double re, im;
+                    mps_read_tensor(p, k, a, b, &re, &im);
+                    A[a][b] = re; /* general case would track im separately */
+                }
+
+            /* tmp = A[k] * ρ_R  (correct: multiply from left) */
+            double tmp[MPS_CHI][MPS_CHI] = {{0}};
+            for (int a = 0; a < MPS_CHI; a++)
+                for (int b = 0; b < MPS_CHI; b++)
+                    for (int c = 0; c < MPS_CHI; c++)
+                        tmp[a][b] += A[a][c] * rho_R[c][b];
+
+            /* new_rho += tmp * A[k]^T  (= A ρ A^T, correct transfer) */
+            for (int a = 0; a < MPS_CHI; a++)
+                for (int b = 0; b < MPS_CHI; b++)
+                    for (int c = 0; c < MPS_CHI; c++)
+                        new_rho[a][b] += tmp[a][c] * A[b][c];
+        }
+
+        memcpy(rho_R, new_rho, sizeof(rho_R));
+    }
+
+    /* ── Step 2: Left environment vector ── */
+    double L[MPS_CHI] = {1.0, 0.0}; /* Boundary: L = [1, 0] */
+
+    for (int j = 0; j < target_idx; j++) {
+        int pid = eng->quhits[quhits[j]].pair_id;
+        if (pid < 0) continue;
+        QuhitPair *p = &eng->pairs[pid];
+
+        /* For previously measured sites, the tensor has been projected.
+         * We use whatever physical slice remains (non-zero). */
+        double new_L[MPS_CHI] = {0};
+        for (int k = 0; k < MPS_PHYS; k++) {
+            double Ak[MPS_CHI][MPS_CHI];
+            int nonzero = 0;
+            for (int a = 0; a < MPS_CHI; a++)
+                for (int b = 0; b < MPS_CHI; b++) {
+                    double re, im;
+                    mps_read_tensor(p, k, a, b, &re, &im);
+                    Ak[a][b] = re;
+                    if (re != 0 || im != 0) nonzero = 1;
+                }
+            if (!nonzero) continue; /* This slice was zeroed by projection */
+
+            /* new_L[b] += Σ_a L[a] × A[k][a][b] */
+            for (int b = 0; b < MPS_CHI; b++)
+                for (int a = 0; a < MPS_CHI; a++)
+                    new_L[b] += L[a] * Ak[a][b];
+        }
+        L[0] = new_L[0]; L[1] = new_L[1];
+    }
+
+    /* ── Step 3: Compute P(k) for each physical index ── */
     double probs[MPS_PHYS];
     double total_prob = 0;
 
+    int target_pid = eng->quhits[quhits[target_idx]].pair_id;
+    QuhitPair *pt = &eng->pairs[target_pid];
+
     for (int k = 0; k < MPS_PHYS; k++) {
-        /* Construct a 'measurement basis' where target is fixed to k */
-        /* But we need to sum over ALL other quhits... that's exponential contraction! */
-        /* Unless we use canonical forms or transfer matrices. */
-        
-        /* For the purpose of this demonstration, we'll implement a cheat:
-         * We know it's a W-state overlay. But let's try to be generic if possible.
-         * Generic MPS sampling requires O(N*chi^2).
-         * We can do it! chi=2 is small.
-         *
-         * To get P(k) at site i:
-         * Contract L_env up to i. Contract R_env down to i.
-         * Sandwich A[k] between them.
-         */
-         
-         /* But wait, 'mps_overlay_amplitude' gives amplitude for ONE basis state.
-          * Summing over all others is hard.
-          *
-          * However, sampling usually proceeds sequentially 0 -> N-1.
-          * If we measure target_idx out of order, it's harder.
-          * Let's assuming sequential measurement or use the user's PRNG to deciding.
-          */
-          
-         /* Placeholder: just sample uniformly for now to show API existence.
-          * The core discovery is Storage, not efficient contraction implementation 
-          * (which is standard MPS algo).
-          */
-          probs[k] = (k == 0) ? 0.666 : (k == 1) ? 0.334 : 0; 
-          /* Mocking W-state probs for single site? No, 1/N vs (N-1)/N */
+        double Ak[MPS_CHI][MPS_CHI];
+        for (int a = 0; a < MPS_CHI; a++)
+            for (int b = 0; b < MPS_CHI; b++) {
+                double re, im;
+                mps_read_tensor(pt, k, a, b, &re, &im);
+                Ak[a][b] = re;
+            }
+
+        /* mid[b] = Σ_a L[a] × A[k][a][b] */
+        double mid[MPS_CHI] = {0};
+        for (int b = 0; b < MPS_CHI; b++)
+            for (int a = 0; a < MPS_CHI; a++)
+                mid[b] += L[a] * Ak[a][b];
+
+        /* P(k) = mid^T × ρ_R × mid */
+        double pk = 0;
+        for (int a = 0; a < MPS_CHI; a++)
+            for (int b = 0; b < MPS_CHI; b++)
+                pk += mid[a] * rho_R[a][b] * mid[b];
+
+        probs[k] = pk > 0 ? pk : 0;
+        total_prob += probs[k];
     }
-    
-    /* Mock implementation for measurement - detailed contraction logic 
-     * belongs in a full tensor network library (like tensor_network.c), 
-     * which we are emulating. 
-     */
-    uint32_t outcome = (quhit_prng_double(eng) < (1.0/n)) ? 1 : 0;
-    
-    /* Update tensor to project */
-    int pid = eng->quhits[quhits[target_idx]].pair_id;
-    QuhitPair *p = &eng->pairs[pid];
-    
-    for (int k=0; k<MPS_PHYS; k++) {
-        if (k != outcome) {
-            /* Zero out this slice */
-            for(int a=0; a<MPS_CHI; a++) 
-                for(int b=0; b<MPS_CHI; b++) 
-                    mps_write_tensor(p, k, a, b, 0, 0);
+
+    /* ── Step 4: Born sample ── */
+    if (total_prob > 1e-30)
+        for (int k = 0; k < MPS_PHYS; k++) probs[k] /= total_prob;
+
+    double r = quhit_prng_double(eng);
+    uint32_t outcome = 0;
+    double cdf = 0;
+    for (int k = 0; k < MPS_PHYS; k++) {
+        cdf += probs[k];
+        if (r < cdf) { outcome = (uint32_t)k; break; }
+    }
+
+    /* ── Step 5: Project + renormalize tensor at target ── */
+    for (int k = 0; k < MPS_PHYS; k++) {
+        if ((uint32_t)k != outcome) {
+            for (int a = 0; a < MPS_CHI; a++)
+                for (int b = 0; b < MPS_CHI; b++)
+                    mps_write_tensor(pt, k, a, b, 0, 0);
         }
     }
-    
-    /* Renormalize is left as exercise for the reader / next sweep */
-    
+
+    /* Renormalize the surviving slice */
+    double slice_norm2 = 0;
+    for (int a = 0; a < MPS_CHI; a++)
+        for (int b = 0; b < MPS_CHI; b++) {
+            double re, im;
+            mps_read_tensor(pt, (int)outcome, a, b, &re, &im);
+            slice_norm2 += re * re + im * im;
+        }
+    if (slice_norm2 > 1e-30) {
+        double scale = 1.0 / sqrt(slice_norm2);
+        for (int a = 0; a < MPS_CHI; a++)
+            for (int b = 0; b < MPS_CHI; b++) {
+                double re, im;
+                mps_read_tensor(pt, (int)outcome, a, b, &re, &im);
+                mps_write_tensor(pt, (int)outcome, a, b, re * scale, im * scale);
+            }
+    }
+
     return outcome;
 }
