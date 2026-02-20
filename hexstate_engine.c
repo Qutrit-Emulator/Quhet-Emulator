@@ -15,6 +15,7 @@
 #include "superposition.h"
 #include "statevector.h"
 #include "entanglement.h"
+#include "quhit_management.h"
 
 #include <stdio.h>
 #include <stdlib.h>
