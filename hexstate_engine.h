@@ -494,9 +494,6 @@ void apply_dft(HexStateEngine *eng, uint64_t chunk_id, uint32_t dim);
 #define MAX_INSPECT_ENTRIES 256
 
 #define MAX_SNAP_MEMBERS 16   /* Max members to track in snapshot */
-#define MAX_SNAP_DIM     64   /* Max dimension for snapshot rho/marginals
-                               * (separate from NUM_BASIS_STATES which
-                               *  can be large for XEB benchmarking) */
 
 /* A single entry in the state decomposition */
 typedef struct {
@@ -507,7 +504,9 @@ typedef struct {
     double    phase_rad;                 /* arg(α) in radians */
 } StateEntry;
 
-/* Complete snapshot of a Hilbert space — read without collapse */
+/* Complete snapshot of a Hilbert space — read without collapse.
+ * All dimension-dependent arrays are dynamically allocated to the
+ * actual dim, so we can inspect arbitrarily large registers. */
 typedef struct {
     /* Identity */
     uint64_t  chunk_id;            /* Which register was inspected */
@@ -526,17 +525,38 @@ typedef struct {
     int       is_entangled;        /* 1 if non-zero entropy with partners */
     int       is_collapsed;        /* 1 if measurement has occurred */
 
-    /* Marginal probabilities for the inspected register */
-    double    marginal_probs[MAX_SNAP_DIM]; /* P(k) for k=0..D-1 */
-
-    /* Reduced density matrix for inspected register: dim × dim complex */
-    Complex   rho[MAX_SNAP_DIM * MAX_SNAP_DIM];
+    /* Dynamically allocated arrays (sized to dim) */
+    double   *marginal_probs;      /* P(k) for k=0..dim-1  [dim doubles] */
+    Complex  *rho;                 /* Reduced ρ: dim×dim    [dim*dim Complex] */
 } HilbertSnapshot;
+
+/* Allocate a snapshot with dynamic arrays sized for the given dimension.
+ * Caller must call hilbert_snapshot_free() when done. */
+static inline HilbertSnapshot *hilbert_snapshot_alloc(uint32_t dim)
+{
+    HilbertSnapshot *s = calloc(1, sizeof(HilbertSnapshot));
+    s->dim = dim;
+    if (dim > 0) {
+        s->marginal_probs = calloc(dim, sizeof(double));
+        s->rho = calloc((size_t)dim * dim, sizeof(Complex));
+    }
+    return s;
+}
+
+/* Free a dynamically allocated snapshot. */
+static inline void hilbert_snapshot_free(HilbertSnapshot *s)
+{
+    if (!s) return;
+    free(s->marginal_probs);
+    free(s->rho);
+    free(s);
+}
 
 /* Non-destructive readout: extract full state without collapse.
  * This is what quantum mechanics says you CANNOT DO.
- * We do it anyway because the Hilbert space is memory. */
-HilbertSnapshot inspect_hilbert(HexStateEngine *eng, uint64_t chunk_id);
+ * We do it anyway because the Hilbert space is memory.
+ * snap must be pre-allocated (use hilbert_snapshot_alloc). */
+void inspect_hilbert(HexStateEngine *eng, uint64_t chunk_id, HilbertSnapshot *snap);
 
 /* Print formatted inspection results */
 void inspect_print(HilbertSnapshot *snap);
@@ -658,8 +678,8 @@ void apply_sum_quhits(HexStateEngine *eng,
 int find_quhit_reg(HexStateEngine *eng, uint64_t chunk_id);
 
 /* Non-destructive inspection of a specific quhit's Hilbert space. */
-HilbertSnapshot inspect_quhit(HexStateEngine *eng, uint64_t chunk_id,
-                              uint64_t quhit_idx);
+void inspect_quhit(HexStateEngine *eng, uint64_t chunk_id,
+                              uint64_t quhit_idx, HilbertSnapshot *snap);
 
 /* ── DNA Gate (Mode 2: Individual Quhit Registers) ───────────────────
  *
