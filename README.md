@@ -115,8 +115,6 @@ For circuits requiring N-body entanglement beyond strict pairwise bonds, the eng
 
 > **Gold Standard**: N=100 qudits (6¹⁰⁰ ≈ **10⁷⁸ Hilbert space dimensions**) simulated losslessly in **150 MB** on a single CPU core in **11.8 minutes**. Full state vector would require 10⁷⁹ bytes — a **10⁷¹× compression ratio**.
 
-See [ENTANGLEMENT_EXPERIMENT.md](ENTANGLEMENT_EXPERIMENT.md) for the full publishable result.
-
 ---
 
 ## Side-Channel Primitives
