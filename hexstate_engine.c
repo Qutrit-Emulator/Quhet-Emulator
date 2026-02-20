@@ -2855,8 +2855,10 @@ int execute_instruction(HexStateEngine *eng, Instruction instr)
 
     case OP_INSPECT: {
         printf("  [INSPECT] Non-destructive Hilbert space readout for chunk %lu\n", target);
-        HilbertSnapshot snap = inspect_hilbert(eng, target);
-        inspect_print(&snap);
+        HilbertSnapshot *snap = hilbert_snapshot_alloc(0);
+        inspect_hilbert(eng, target, snap);
+        inspect_print(snap);
+        hilbert_snapshot_free(snap);
         break;
     }
 
@@ -3721,13 +3723,19 @@ static void eigen_hermitian_jacobi(Complex *mat, uint32_t D, double *eigenvalues
     free(M);
 }
 
-HilbertSnapshot inspect_hilbert(HexStateEngine *eng, uint64_t chunk_id)
+void inspect_hilbert(HexStateEngine *eng, uint64_t chunk_id, HilbertSnapshot *snap)
 {
-    HilbertSnapshot snap;
-    memset(&snap, 0, sizeof(snap));
-    snap.chunk_id = chunk_id;
+    /* Zero fixed fields (but don't touch pointers that may be pre-allocated) */
+    double  *saved_mp  = snap->marginal_probs;
+    Complex *saved_rho = snap->rho;
+    uint32_t saved_dim = snap->dim;
+    memset(snap, 0, sizeof(*snap));
+    snap->marginal_probs = saved_mp;
+    snap->rho            = saved_rho;
+    snap->dim            = saved_dim;
+    snap->chunk_id       = chunk_id;
 
-    if (chunk_id >= eng->num_chunks) return snap;
+    if (chunk_id >= eng->num_chunks) return;
     Chunk *c = &eng->chunks[chunk_id];
 
     /* ── Case 1: Register is in a shared Hilbert group ── */
@@ -3737,11 +3745,17 @@ HilbertSnapshot inspect_hilbert(HexStateEngine *eng, uint64_t chunk_id)
         uint32_t dim = g->dim;
         uint32_t nm = g->num_members;
 
-        snap.dim = dim;
-        snap.num_members = nm;
-        snap.is_collapsed = g->collapsed;
+        snap->dim = dim;
+        snap->num_members = nm;
+        snap->is_collapsed = g->collapsed;
         for (uint32_t m = 0; m < nm && m < MAX_SNAP_MEMBERS; m++)
-            snap.member_ids[m] = g->member_ids[m];
+            snap->member_ids[m] = g->member_ids[m];
+
+        /* (Re)allocate dynamic arrays to match actual dim */
+        free(snap->marginal_probs);
+        free(snap->rho);
+        snap->marginal_probs = calloc(dim, sizeof(double));
+        snap->rho = calloc((size_t)dim * dim, sizeof(Complex));
 
         printf("  🔍 [INSPECT] Reading Hilbert space for chunk %lu "
                "(member %u/%u, D=%u, total_dim=%lu)\n",
@@ -3754,131 +3768,131 @@ HilbertSnapshot inspect_hilbert(HexStateEngine *eng, uint64_t chunk_id)
             Complex amp = g->amplitudes[flat];
             if (cnorm2(amp) < 1e-28) continue;
             for (uint32_t m = 0; m < nm && m < MAX_SNAP_MEMBERS; m++)
-                snap.entries[n].indices[m] = hilbert_extract_index(g, flat, m);
-            snap.entries[n].amp_real = amp.real;
-            snap.entries[n].amp_imag = amp.imag;
-            snap.entries[n].probability = cnorm2(amp);
-            snap.entries[n].phase_rad = atan2(amp.imag, amp.real);
+                snap->entries[n].indices[m] = hilbert_extract_index(g, flat, m);
+            snap->entries[n].amp_real = amp.real;
+            snap->entries[n].amp_imag = amp.imag;
+            snap->entries[n].probability = cnorm2(amp);
+            snap->entries[n].phase_rad = atan2(amp.imag, amp.real);
             n++;
         }
-        snap.num_entries = n;
+        snap->num_entries = n;
 
         /* ── Total probability ── */
-        snap.total_probability = 0.0;
+        snap->total_probability = 0.0;
         for (uint32_t e = 0; e < n; e++)
-            snap.total_probability += snap.entries[e].probability;
+            snap->total_probability += snap->entries[e].probability;
 
         /* ── Marginal probabilities for this register ── */
         uint64_t my_stride = 1;
         for (uint32_t i = my_idx + 1; i < nm; i++) my_stride *= dim;
         for (uint64_t flat = 0; flat < g->total_dim; flat++) {
             uint32_t my_val = (uint32_t)((flat / my_stride) % dim);
-            if (my_val < MAX_SNAP_DIM)
-                snap.marginal_probs[my_val] += cnorm2(g->amplitudes[flat]);
+            if (my_val < dim)
+                snap->marginal_probs[my_val] += cnorm2(g->amplitudes[flat]);
         }
 
         /* ── Reduced density matrix via partial trace (dense) ──
-         * ρ_A[j][k] = Σ_{β} ⟨j,β|Ψ⟩⟨Ψ|k,β⟩
-         * For each pair of flat indices that differ ONLY in member my_idx,
-         * accumulate: ρ[j][k] += α[flat_j] × conj(α[flat_k]) */
+         * ρ_A[j][k] = Σ_{β} ⟨j,β|Ψ⟩⟨Ψ|k,β⟩ */
         for (uint64_t flat1 = 0; flat1 < g->total_dim; flat1++) {
             Complex a1 = g->amplitudes[flat1];
             if (cnorm2(a1) < 1e-28) continue;
             uint32_t j = (uint32_t)((flat1 / my_stride) % dim);
             uint64_t base1 = flat1 - (uint64_t)j * my_stride;
 
-            for (uint32_t k = 0; k < dim && k < MAX_SNAP_DIM; k++) {
+            for (uint32_t k = 0; k < dim; k++) {
                 uint64_t flat2 = base1 + (uint64_t)k * my_stride;
                 Complex a2 = g->amplitudes[flat2];
                 if (cnorm2(a2) < 1e-28) continue;
 
-                if (j < MAX_SNAP_DIM && k < MAX_SNAP_DIM) {
-                    snap.rho[j * dim + k].real += a1.real * a2.real + a1.imag * a2.imag;
-                    snap.rho[j * dim + k].imag += a1.imag * a2.real - a1.real * a2.imag;
-                }
+                snap->rho[j * dim + k].real += a1.real * a2.real + a1.imag * a2.imag;
+                snap->rho[j * dim + k].imag += a1.imag * a2.real - a1.real * a2.imag;
             }
         }
 
         /* ── Purity: Tr(ρ²) ── */
-        snap.purity = 0.0;
-        for (uint32_t j = 0; j < dim && j < MAX_SNAP_DIM; j++) {
-            for (uint32_t k = 0; k < dim && k < MAX_SNAP_DIM; k++) {
-                Complex rho_jk = snap.rho[j * dim + k];
-                Complex rho_kj = snap.rho[k * dim + j];
-                snap.purity += rho_jk.real * rho_kj.real - rho_jk.imag * rho_kj.imag;
+        snap->purity = 0.0;
+        for (uint32_t j = 0; j < dim; j++) {
+            for (uint32_t k = 0; k < dim; k++) {
+                Complex rho_jk = snap->rho[j * dim + k];
+                Complex rho_kj = snap->rho[k * dim + j];
+                snap->purity += rho_jk.real * rho_kj.real - rho_jk.imag * rho_kj.imag;
             }
         }
 
-        /* ── Von Neumann entropy: S = -Tr(ρ log₂ ρ) ──
-         * Compute eigenvalues of the reduced density matrix */
-        if (dim <= MAX_SNAP_DIM) {
-            double eigenvalues[MAX_SNAP_DIM] = {0};
+        /* ── Von Neumann entropy: S = -Tr(ρ log₂ ρ) ── */
+        {
+            double *eigenvalues = calloc(dim, sizeof(double));
 
             if (dim == 2) {
-                /* Fast path for dim=2 */
                 eigen2x2_hermitian(
-                    snap.rho[0].real,
-                    snap.rho[1].real, snap.rho[1].imag,
-                    snap.rho[dim + 1].real,
+                    snap->rho[0].real,
+                    snap->rho[1].real, snap->rho[1].imag,
+                    snap->rho[dim + 1].real,
                     &eigenvalues[0], &eigenvalues[1]);
             } else {
-                /* General Jacobi */
-                Complex rho_copy[MAX_SNAP_DIM * MAX_SNAP_DIM];
-                memcpy(rho_copy, snap.rho, sizeof(rho_copy));
+                Complex *rho_copy = malloc((size_t)dim * dim * sizeof(Complex));
+                memcpy(rho_copy, snap->rho, (size_t)dim * dim * sizeof(Complex));
                 eigen_hermitian_jacobi(rho_copy, dim, eigenvalues);
+                free(rho_copy);
             }
 
-            snap.entropy = 0.0;
+            snap->entropy = 0.0;
             for (uint32_t i = 0; i < dim; i++) {
                 double lam = eigenvalues[i];
                 if (lam > 1e-15)
-                    snap.entropy -= lam * log2(lam);
+                    snap->entropy -= lam * log2(lam);
             }
+            free(eigenvalues);
         }
 
-        snap.is_entangled = (snap.entropy > 0.01);
+        snap->is_entangled = (snap->entropy > 0.01);
 
     /* ── Case 2: Register has shadow state (local, not in group) ── */
     } else if (c->hilbert.shadow_state) {
-        snap.dim = (c->hilbert.q_local_dim > 0) ? c->hilbert.q_local_dim : 6;
-        snap.num_members = 1;
-        snap.member_ids[0] = chunk_id;
-        snap.is_collapsed = (c->hilbert.q_flags & 0x02) ? 1 : 0;
+        uint32_t dim = (c->hilbert.q_local_dim > 0) ? c->hilbert.q_local_dim : 6;
+        snap->dim = dim;
+        snap->num_members = 1;
+        snap->member_ids[0] = chunk_id;
+        snap->is_collapsed = (c->hilbert.q_flags & 0x02) ? 1 : 0;
+
+        /* (Re)allocate dynamic arrays */
+        free(snap->marginal_probs);
+        free(snap->rho);
+        snap->marginal_probs = calloc(dim, sizeof(double));
+        snap->rho = calloc((size_t)dim * dim, sizeof(Complex));
 
         uint32_t ns = (uint32_t)c->num_states;
         if (ns > MAX_INSPECT_ENTRIES) ns = MAX_INSPECT_ENTRIES;
-        snap.num_entries = ns;
+        snap->num_entries = ns;
 
         printf("  🔍 [INSPECT] Reading local shadow state for chunk %lu "
                "(%u states)\n", chunk_id, ns);
 
         for (uint32_t i = 0; i < ns; i++) {
-            snap.entries[i].indices[0] = i;
+            snap->entries[i].indices[0] = i;
             Complex amp = c->hilbert.shadow_state[i];
-            snap.entries[i].amp_real = amp.real;
-            snap.entries[i].amp_imag = amp.imag;
-            snap.entries[i].probability = amp.real * amp.real + amp.imag * amp.imag;
-            snap.entries[i].phase_rad = atan2(amp.imag, amp.real);
-            snap.total_probability += snap.entries[i].probability;
-            if (i < MAX_SNAP_DIM)
-                snap.marginal_probs[i] = snap.entries[i].probability;
+            snap->entries[i].amp_real = amp.real;
+            snap->entries[i].amp_imag = amp.imag;
+            snap->entries[i].probability = amp.real * amp.real + amp.imag * amp.imag;
+            snap->entries[i].phase_rad = atan2(amp.imag, amp.real);
+            snap->total_probability += snap->entries[i].probability;
+            if (i < dim)
+                snap->marginal_probs[i] = snap->entries[i].probability;
         }
 
         /* Local state: ρ = |ψ⟩⟨ψ|, always pure */
-        snap.purity = 1.0;
-        snap.entropy = 0.0;
-        snap.is_entangled = 0;
+        snap->purity = 1.0;
+        snap->entropy = 0.0;
+        snap->is_entangled = 0;
 
     /* ── Case 3: Infinite chunk (no shadow, no group) ── */
     } else {
         printf("  🔍 [INSPECT] Chunk %lu is infinite (no shadow cache). "
                "Magic Pointer: 0x%016lX\n",
                chunk_id, c->hilbert.magic_ptr);
-        snap.dim = 6;
-        snap.num_members = 0;
+        snap->dim = 6;
+        snap->num_members = 0;
     }
-
-    return snap;
 }
 
 void inspect_print(HilbertSnapshot *snap)
@@ -3918,7 +3932,7 @@ void inspect_print(HilbertSnapshot *snap)
 
     /* Marginal probabilities */
     printf("\n  ── Marginal Probabilities (this register) ──\n    ");
-    for (uint32_t k = 0; k < snap->dim && k < MAX_SNAP_DIM; k++)
+    for (uint32_t k = 0; k < snap->dim; k++)
         printf("P(|%u⟩)=%.4f  ", k, snap->marginal_probs[k]);
     printf("\n");
 
@@ -3964,8 +3978,11 @@ void inspect_print(HilbertSnapshot *snap)
 
 double hilbert_entanglement_entropy(HexStateEngine *eng, uint64_t chunk_id)
 {
-    HilbertSnapshot snap = inspect_hilbert(eng, chunk_id);
-    return snap.entropy;
+    HilbertSnapshot *snap = hilbert_snapshot_alloc(0);
+    inspect_hilbert(eng, chunk_id, snap);
+    double entropy = snap->entropy;
+    hilbert_snapshot_free(snap);
+    return entropy;
 }
 
 
@@ -5240,41 +5257,50 @@ void apply_sum_quhits(HexStateEngine *eng,
     memcpy(eng->quhit_regs[rc].entries, new_entries, new_nz * sizeof(QuhitBasisEntry));
 }
 
-HilbertSnapshot inspect_quhit(HexStateEngine *eng, uint64_t chunk_id,
-                              uint64_t quhit_idx)
+void inspect_quhit(HexStateEngine *eng, uint64_t chunk_id,
+                              uint64_t quhit_idx, HilbertSnapshot *snap)
 {
-    HilbertSnapshot snap;
-    memset(&snap, 0, sizeof(snap));
+    /* Preserve existing dynamic pointers across memset */
+    double  *saved_mp  = snap->marginal_probs;
+    Complex *saved_rho = snap->rho;
+    memset(snap, 0, sizeof(*snap));
+    snap->marginal_probs = saved_mp;
+    snap->rho            = saved_rho;
 
     int r = find_quhit_reg(eng, chunk_id);
-    if (r < 0 || quhit_idx >= eng->quhit_regs[r].n_quhits) return snap;
+    if (r < 0 || quhit_idx >= eng->quhit_regs[r].n_quhits) return;
 
     uint32_t dim = eng->quhit_regs[r].dim;
 
-    snap.num_members = eng->quhit_regs[r].n_quhits;
-    snap.num_entries = eng->quhit_regs[r].num_nonzero;
-    snap.dim = dim;
-    snap.is_collapsed = eng->quhit_regs[r].collapsed;
-    snap.is_entangled = (eng->quhit_regs[r].num_nonzero > 1) ? 1 : 0;
-    snap.total_probability = 0.0;
+    snap->num_members = eng->quhit_regs[r].n_quhits;
+    snap->num_entries = eng->quhit_regs[r].num_nonzero;
+    snap->dim = dim;
+    snap->is_collapsed = eng->quhit_regs[r].collapsed;
+    snap->is_entangled = (eng->quhit_regs[r].num_nonzero > 1) ? 1 : 0;
+    snap->total_probability = 0.0;
+
+    /* (Re)allocate dynamic arrays to match dim */
+    free(snap->marginal_probs);
+    free(snap->rho);
+    snap->marginal_probs = calloc(dim, sizeof(double));
+    snap->rho = calloc((size_t)dim * dim, sizeof(Complex));
 
     /* Lazily resolve this quhit from each self-describing entry */
     for (uint32_t e = 0; e < eng->quhit_regs[r].num_nonzero &&
                           e < MAX_INSPECT_ENTRIES; e++) {
         QuhitBasisEntry *ent = &eng->quhit_regs[r].entries[e];
-        snap.entries[e].amp_real = ent->amplitude.real;
-        snap.entries[e].amp_imag = ent->amplitude.imag;
+        snap->entries[e].amp_real = ent->amplitude.real;
+        snap->entries[e].amp_imag = ent->amplitude.imag;
         double p = ent->amplitude.real * ent->amplitude.real +
                    ent->amplitude.imag * ent->amplitude.imag;
-        snap.entries[e].probability = p;
-        snap.total_probability += p;
+        snap->entries[e].probability = p;
+        snap->total_probability += p;
 
         uint32_t v = lazy_resolve(ent, quhit_idx, eng->quhit_regs[r].bulk_rule, eng->quhit_regs[r].dim);
-        if (v < MAX_SNAP_DIM) snap.marginal_probs[v] += p;
+        if (v < dim) snap->marginal_probs[v] += p;
     }
 
-    snap.purity = 1.0;
-    return snap;
+    snap->purity = 1.0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
