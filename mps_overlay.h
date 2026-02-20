@@ -19,7 +19,7 @@
  * CONSTANTS
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
-#define MPS_CHI  6
+#define MPS_CHI  128
 #define MPS_PHYS 6
 
 /* Total entries per tensor: D × χ² = 216 complex numbers */

@@ -257,13 +257,17 @@ void mps_gate_1site(QuhitEngine *eng, uint32_t *quhits, int n,
 {
     (void)eng; (void)quhits; (void)n;
 
-    double old_re[MPS_PHYS][MPS_CHI][MPS_CHI];
-    double old_im[MPS_PHYS][MPS_CHI][MPS_CHI];
+    /* Heap-allocate: at χ=128, each is 6×128×128 × 8 = 768 KB */
+    size_t tsz = (size_t)MPS_PHYS * MPS_CHI * MPS_CHI;
+    double *old_re = (double *)malloc(tsz * sizeof(double));
+    double *old_im = (double *)malloc(tsz * sizeof(double));
 
     for (int k = 0; k < MPS_PHYS; k++)
         for (int a = 0; a < MPS_CHI; a++)
-            for (int b = 0; b < MPS_CHI; b++)
-                mps_read_tensor(site, k, a, b, &old_re[k][a][b], &old_im[k][a][b]);
+            for (int b = 0; b < MPS_CHI; b++) {
+                int idx = k * MPS_CHI * MPS_CHI + a * MPS_CHI + b;
+                mps_read_tensor(site, k, a, b, &old_re[idx], &old_im[idx]);
+            }
 
     for (int kp = 0; kp < MPS_PHYS; kp++)
         for (int a = 0; a < MPS_CHI; a++)
@@ -272,21 +276,29 @@ void mps_gate_1site(QuhitEngine *eng, uint32_t *quhits, int n,
                 for (int k = 0; k < MPS_PHYS; k++) {
                     double ur = U_re[kp * MPS_PHYS + k];
                     double ui = U_im[kp * MPS_PHYS + k];
-                    sr += ur * old_re[k][a][b] - ui * old_im[k][a][b];
-                    si += ur * old_im[k][a][b] + ui * old_re[k][a][b];
+                    int idx = k * MPS_CHI * MPS_CHI + a * MPS_CHI + b;
+                    sr += ur * old_re[idx] - ui * old_im[idx];
+                    si += ur * old_im[idx] + ui * old_re[idx];
                 }
                 mps_write_tensor(site, kp, a, b, sr, si);
             }
+
+    free(old_re);
+    free(old_im);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * TWO-SITE GATE WITH SVD
  *
- * With χ=D=6, DCHI=36.  M is 36×36. Jacobi SVD keeps top-χ=6 singular values.
- * Since χ=D, this is EXACT — no truncation loss.
+ * With χ=128, D=6, DCHI=768. M is 768×768. Jacobi SVD keeps top-χ=128
+ * singular values. All large arrays are heap-allocated.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
-#define DCHI (MPS_PHYS * MPS_CHI) /* 36 */
+#define DCHI (MPS_PHYS * MPS_CHI) /* D × χ */
+
+/* Helper macros for flat 4D array: Th[k][l][a][g] */
+#define TH_IDX(k,l,a,g) ((k)*MPS_PHYS*MPS_CHI*MPS_CHI + (l)*MPS_CHI*MPS_CHI + (a)*MPS_CHI + (g))
+#define AI_IDX(k,a,b)   ((k)*MPS_CHI*MPS_CHI + (a)*MPS_CHI + (b))
 
 void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                     int site, const double *G_re, const double *G_im)
@@ -294,39 +306,49 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     (void)eng; (void)quhits; (void)n;
     int si = site, sj = site + 1;
 
-    /* Step 1: Read tensors */
-    double Ai_re[MPS_PHYS][MPS_CHI][MPS_CHI], Ai_im[MPS_PHYS][MPS_CHI][MPS_CHI];
-    double Aj_re[MPS_PHYS][MPS_CHI][MPS_CHI], Aj_im[MPS_PHYS][MPS_CHI][MPS_CHI];
+    size_t ai_sz = (size_t)MPS_PHYS * MPS_CHI * MPS_CHI;
+    size_t th_sz = (size_t)MPS_PHYS * MPS_PHYS * MPS_CHI * MPS_CHI;
+    size_t m_sz  = (size_t)DCHI * DCHI;
+
+    /* Step 1: Read tensors (heap) */
+    double *Ai_re = (double *)malloc(ai_sz * sizeof(double));
+    double *Ai_im = (double *)malloc(ai_sz * sizeof(double));
+    double *Aj_re = (double *)malloc(ai_sz * sizeof(double));
+    double *Aj_im = (double *)malloc(ai_sz * sizeof(double));
 
     for (int k = 0; k < MPS_PHYS; k++)
         for (int a = 0; a < MPS_CHI; a++)
             for (int b = 0; b < MPS_CHI; b++) {
-                mps_read_tensor(si, k, a, b, &Ai_re[k][a][b], &Ai_im[k][a][b]);
-                mps_read_tensor(sj, k, a, b, &Aj_re[k][a][b], &Aj_im[k][a][b]);
+                mps_read_tensor(si, k, a, b,
+                    &Ai_re[AI_IDX(k,a,b)], &Ai_im[AI_IDX(k,a,b)]);
+                mps_read_tensor(sj, k, a, b,
+                    &Aj_re[AI_IDX(k,a,b)], &Aj_im[AI_IDX(k,a,b)]);
             }
 
     /* Step 2: Contract Θ[k,l,α,γ] = Σ_β Ai[k][α][β] × Aj[l][β][γ] */
-    double Th_re[MPS_PHYS][MPS_PHYS][MPS_CHI][MPS_CHI];
-    double Th_im[MPS_PHYS][MPS_PHYS][MPS_CHI][MPS_CHI];
-    memset(Th_re, 0, sizeof(Th_re));
-    memset(Th_im, 0, sizeof(Th_im));
+    double *Th_re = (double *)calloc(th_sz, sizeof(double));
+    double *Th_im = (double *)calloc(th_sz, sizeof(double));
 
     for (int k = 0; k < MPS_PHYS; k++)
         for (int l = 0; l < MPS_PHYS; l++)
             for (int a = 0; a < MPS_CHI; a++)
                 for (int g = 0; g < MPS_CHI; g++)
                     for (int b = 0; b < MPS_CHI; b++) {
-                        double ar = Ai_re[k][a][b], ai = Ai_im[k][a][b];
-                        double br = Aj_re[l][b][g], bi = Aj_im[l][b][g];
-                        Th_re[k][l][a][g] += ar*br - ai*bi;
-                        Th_im[k][l][a][g] += ar*bi + ai*br;
+                        double ar = Ai_re[AI_IDX(k,a,b)];
+                        double ai = Ai_im[AI_IDX(k,a,b)];
+                        double br = Aj_re[AI_IDX(l,b,g)];
+                        double bi = Aj_im[AI_IDX(l,b,g)];
+                        Th_re[TH_IDX(k,l,a,g)] += ar*br - ai*bi;
+                        Th_im[TH_IDX(k,l,a,g)] += ar*bi + ai*br;
                     }
 
+    /* Free Ai, Aj — no longer needed */
+    free(Ai_re); free(Ai_im);
+    free(Aj_re); free(Aj_im);
+
     /* Step 3: Apply gate */
-    double Tp_re[MPS_PHYS][MPS_PHYS][MPS_CHI][MPS_CHI];
-    double Tp_im[MPS_PHYS][MPS_PHYS][MPS_CHI][MPS_CHI];
-    memset(Tp_re, 0, sizeof(Tp_re));
-    memset(Tp_im, 0, sizeof(Tp_im));
+    double *Tp_re = (double *)calloc(th_sz, sizeof(double));
+    double *Tp_im = (double *)calloc(th_sz, sizeof(double));
 
     int D2 = MPS_PHYS * MPS_PHYS;
     for (int kp = 0; kp < MPS_PHYS; kp++)
@@ -337,18 +359,22 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                     int col = k * MPS_PHYS + l;
                     double gr = G_re[row * D2 + col];
                     double gi = G_im[row * D2 + col];
+                    if (fabs(gr) < 1e-30 && fabs(gi) < 1e-30) continue;
                     for (int a = 0; a < MPS_CHI; a++)
                         for (int g = 0; g < MPS_CHI; g++) {
-                            double tr = Th_re[k][l][a][g];
-                            double ti = Th_im[k][l][a][g];
-                            Tp_re[kp][lp][a][g] += gr*tr - gi*ti;
-                            Tp_im[kp][lp][a][g] += gr*ti + gi*tr;
+                            double tr = Th_re[TH_IDX(k,l,a,g)];
+                            double ti = Th_im[TH_IDX(k,l,a,g)];
+                            Tp_re[TH_IDX(kp,lp,a,g)] += gr*tr - gi*ti;
+                            Tp_im[TH_IDX(kp,lp,a,g)] += gr*ti + gi*tr;
                         }
                 }
         }
 
-    /* Step 4: Reshape to M[DCHI][DCHI] (36×36) */
-    double M_re[DCHI][DCHI], M_im[DCHI][DCHI];
+    free(Th_re); free(Th_im);
+
+    /* Step 4: Reshape to M[DCHI][DCHI] */
+    double *M_re = (double *)malloc(m_sz * sizeof(double));
+    double *M_im = (double *)malloc(m_sz * sizeof(double));
 
     for (int kp = 0; kp < MPS_PHYS; kp++)
         for (int a = 0; a < MPS_CHI; a++) {
@@ -356,12 +382,14 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
             for (int lp = 0; lp < MPS_PHYS; lp++)
                 for (int g = 0; g < MPS_CHI; g++) {
                     int c = lp * MPS_CHI + g;
-                    M_re[r][c] = Tp_re[kp][lp][a][g];
-                    M_im[r][c] = Tp_im[kp][lp][a][g];
+                    M_re[r * DCHI + c] = Tp_re[TH_IDX(kp,lp,a,g)];
+                    M_im[r * DCHI + c] = Tp_im[TH_IDX(kp,lp,a,g)];
                 }
         }
 
-    /* Step 5: SVD via eigendecomposition of M†M (36×36 complex Hermitian)
+    free(Tp_re); free(Tp_im);
+
+    /* Step 5: SVD via eigendecomposition of M†M (DCHI×DCHI complex Hermitian)
      *
      * M†M is complex Hermitian, NOT real symmetric.
      *   (M†M)_re[j][k] = Σ_r M_re[r][j]*M_re[r][k] + M_im[r][j]*M_im[r][k]
@@ -373,64 +401,61 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
      *   3. Accumulate complex eigenvectors in V = V_re + i·V_im
      */
 
-    /* Heap-allocate all 36×36 arrays (4 × ~10KB = ~40KB) */
-    double (*Hr)[DCHI] = (double (*)[DCHI])calloc(DCHI, sizeof(double[DCHI]));
-    double (*Hi)[DCHI] = (double (*)[DCHI])calloc(DCHI, sizeof(double[DCHI]));
-    double (*Vr)[DCHI] = (double (*)[DCHI])calloc(DCHI, sizeof(double[DCHI]));
-    double (*Vi)[DCHI] = (double (*)[DCHI])calloc(DCHI, sizeof(double[DCHI]));
+    /* Heap-allocate SVD work arrays */
+    double *Hr = (double *)calloc(m_sz, sizeof(double));
+    double *Hi_a = (double *)calloc(m_sz, sizeof(double));
+    double *Vr = (double *)calloc(m_sz, sizeof(double));
+    double *Vi_a = (double *)calloc(m_sz, sizeof(double));
 
     /* H = M†M (complex Hermitian) */
     for (int i = 0; i < DCHI; i++)
         for (int j = 0; j < DCHI; j++) {
             double sr = 0, si2 = 0;
             for (int r = 0; r < DCHI; r++) {
-                sr  += M_re[r][i]*M_re[r][j] + M_im[r][i]*M_im[r][j];
-                si2 += M_re[r][i]*M_im[r][j] - M_im[r][i]*M_re[r][j];
+                sr  += M_re[r*DCHI+i]*M_re[r*DCHI+j] + M_im[r*DCHI+i]*M_im[r*DCHI+j];
+                si2 += M_re[r*DCHI+i]*M_im[r*DCHI+j] - M_im[r*DCHI+i]*M_re[r*DCHI+j];
             }
-            Hr[i][j] = sr;
-            Hi[i][j] = si2;
+            Hr[i*DCHI+j] = sr;
+            Hi_a[i*DCHI+j] = si2;
         }
 
     /* V = I (complex) */
-    for (int i = 0; i < DCHI; i++) Vr[i][i] = 1.0;
+    for (int i = 0; i < DCHI; i++) Vr[i*DCHI+i] = 1.0;
 
     /* Complex Hermitian Jacobi sweeps */
     for (int sweep = 0; sweep < 200; sweep++) {
         double off = 0;
         for (int i = 0; i < DCHI; i++)
             for (int j = i + 1; j < DCHI; j++)
-                off += Hr[i][j]*Hr[i][j] + Hi[i][j]*Hi[i][j];
+                off += Hr[i*DCHI+j]*Hr[i*DCHI+j] + Hi_a[i*DCHI+j]*Hi_a[i*DCHI+j];
         if (off < 1e-28) break;
 
         for (int p = 0; p < DCHI; p++)
             for (int q = p + 1; q < DCHI; q++) {
-                double hpq_r = Hr[p][q], hpq_i = Hi[p][q];
+                double hpq_r = Hr[p*DCHI+q], hpq_i = Hi_a[p*DCHI+q];
                 double mag = sqrt(hpq_r*hpq_r + hpq_i*hpq_i);
                 if (mag < 1e-15) continue;
 
-                /* Phase rotation: multiply col q by e^{-iφ}, row q by e^{+iφ}
-                 * to make H[p][q] purely real = mag */
-                double eR = hpq_r / mag, eI = -hpq_i / mag; /* e^{-iφ} */
+                double eR = hpq_r / mag, eI = -hpq_i / mag;
 
                 for (int i = 0; i < DCHI; i++) {
-                    double xr = Hr[i][q], xi = Hi[i][q];
-                    Hr[i][q] = xr*eR - xi*eI;
-                    Hi[i][q] = xr*eI + xi*eR;
+                    double xr = Hr[i*DCHI+q], xi = Hi_a[i*DCHI+q];
+                    Hr[i*DCHI+q] = xr*eR - xi*eI;
+                    Hi_a[i*DCHI+q] = xr*eI + xi*eR;
                 }
                 for (int j = 0; j < DCHI; j++) {
-                    double xr = Hr[q][j], xi = Hi[q][j];
-                    Hr[q][j] =  xr*eR + xi*eI;
-                    Hi[q][j] = -xr*eI + xi*eR;
+                    double xr = Hr[q*DCHI+j], xi = Hi_a[q*DCHI+j];
+                    Hr[q*DCHI+j] =  xr*eR + xi*eI;
+                    Hi_a[q*DCHI+j] = -xr*eI + xi*eR;
                 }
                 for (int i = 0; i < DCHI; i++) {
-                    double xr = Vr[i][q], xi = Vi[i][q];
-                    Vr[i][q] = xr*eR - xi*eI;
-                    Vi[i][q] = xr*eI + xi*eR;
+                    double xr = Vr[i*DCHI+q], xi = Vi_a[i*DCHI+q];
+                    Vr[i*DCHI+q] = xr*eR - xi*eI;
+                    Vi_a[i*DCHI+q] = xr*eI + xi*eR;
                 }
 
-                /* Standard real Givens to zero H[p][q] (now real ≈ mag) */
-                double hpp = Hr[p][p], hqq = Hr[q][q];
-                double hpq_real = Hr[p][q];
+                double hpp = Hr[p*DCHI+p], hqq = Hr[q*DCHI+q];
+                double hpq_real = Hr[p*DCHI+q];
 
                 double tau = (hqq - hpp) / (2.0 * hpq_real);
                 double t;
@@ -442,76 +467,81 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                 double c = 1.0 / sqrt(1.0 + t*t);
                 double s = t * c;
 
-                /* Rotate rows p, q */
                 for (int j = 0; j < DCHI; j++) {
-                    double rp = Hr[p][j], ip = Hi[p][j];
-                    double rq = Hr[q][j], iq = Hi[q][j];
-                    Hr[p][j] = c*rp - s*rq;  Hi[p][j] = c*ip - s*iq;
-                    Hr[q][j] = s*rp + c*rq;  Hi[q][j] = s*ip + c*iq;
+                    double rp = Hr[p*DCHI+j], ip = Hi_a[p*DCHI+j];
+                    double rq = Hr[q*DCHI+j], iq = Hi_a[q*DCHI+j];
+                    Hr[p*DCHI+j] = c*rp - s*rq;  Hi_a[p*DCHI+j] = c*ip - s*iq;
+                    Hr[q*DCHI+j] = s*rp + c*rq;  Hi_a[q*DCHI+j] = s*ip + c*iq;
                 }
-                /* Rotate cols p, q */
                 for (int i = 0; i < DCHI; i++) {
-                    double rp = Hr[i][p], ip = Hi[i][p];
-                    double rq = Hr[i][q], iq = Hi[i][q];
-                    Hr[i][p] = c*rp - s*rq;  Hi[i][p] = c*ip - s*iq;
-                    Hr[i][q] = s*rp + c*rq;  Hi[i][q] = s*ip + c*iq;
+                    double rp = Hr[i*DCHI+p], ip = Hi_a[i*DCHI+p];
+                    double rq = Hr[i*DCHI+q], iq = Hi_a[i*DCHI+q];
+                    Hr[i*DCHI+p] = c*rp - s*rq;  Hi_a[i*DCHI+p] = c*ip - s*iq;
+                    Hr[i*DCHI+q] = s*rp + c*rq;  Hi_a[i*DCHI+q] = s*ip + c*iq;
                 }
-                /* Rotate V cols p, q */
                 for (int i = 0; i < DCHI; i++) {
-                    double rp = Vr[i][p], ip = Vi[i][p];
-                    double rq = Vr[i][q], iq = Vi[i][q];
-                    Vr[i][p] = c*rp - s*rq;  Vi[i][p] = c*ip - s*iq;
-                    Vr[i][q] = s*rp + c*rq;  Vi[i][q] = s*ip + c*iq;
+                    double rp = Vr[i*DCHI+p], ip = Vi_a[i*DCHI+p];
+                    double rq = Vr[i*DCHI+q], iq = Vi_a[i*DCHI+q];
+                    Vr[i*DCHI+p] = c*rp - s*rq;  Vi_a[i*DCHI+p] = c*ip - s*iq;
+                    Vr[i*DCHI+q] = s*rp + c*rq;  Vi_a[i*DCHI+q] = s*ip + c*iq;
                 }
             }
     }
 
     /* Find top-χ eigenvalue indices (selection sort by Hr[i][i] descending) */
-    int top[MPS_CHI];
+    int *top = (int *)malloc(MPS_CHI * sizeof(int));
     {
-        int used[DCHI];
-        memset(used, 0, sizeof(used));
+        int *used = (int *)calloc(DCHI, sizeof(int));
         for (int t = 0; t < MPS_CHI; t++) {
             int best = -1;
             double best_val = -1e30;
             for (int i = 0; i < DCHI; i++) {
-                if (!used[i] && Hr[i][i] > best_val) {
-                    best_val = Hr[i][i]; best = i;
+                if (!used[i] && Hr[i*DCHI+i] > best_val) {
+                    best_val = Hr[i*DCHI+i]; best = i;
                 }
             }
             top[t] = best;
             if (best >= 0) used[best] = 1;
         }
+        free(used);
     }
 
     /* Extract singular values and complex right singular vectors */
-    double sig[MPS_CHI];
-    double vc_re[MPS_CHI][DCHI], vc_im[MPS_CHI][DCHI];
+    double *sig = (double *)malloc(MPS_CHI * sizeof(double));
+    size_t vc_sz = (size_t)MPS_CHI * DCHI;
+    double *vc_re = (double *)calloc(vc_sz, sizeof(double));
+    double *vc_im = (double *)calloc(vc_sz, sizeof(double));
+
     for (int t = 0; t < MPS_CHI; t++) {
-        sig[t] = (top[t] >= 0) ? sqrt(fabs(Hr[top[t]][top[t]])) : 0;
+        sig[t] = (top[t] >= 0) ? sqrt(fabs(Hr[top[t]*DCHI+top[t]])) : 0;
         for (int i = 0; i < DCHI; i++) {
-            vc_re[t][i] = (top[t] >= 0) ? Vr[i][top[t]] : 0;
-            vc_im[t][i] = (top[t] >= 0) ? Vi[i][top[t]] : 0;
+            vc_re[t*DCHI+i] = (top[t] >= 0) ? Vr[i*DCHI+top[t]] : 0;
+            vc_im[t*DCHI+i] = (top[t] >= 0) ? Vi_a[i*DCHI+top[t]] : 0;
         }
     }
 
+    free(Hr); free(Hi_a);
+    free(Vr); free(Vi_a);
+    free(top);
+
     /* U columns: u_t = M × v_t / σ_t  (complex M × complex v) */
-    double u_re[MPS_CHI][DCHI], u_im[MPS_CHI][DCHI];
-    memset(u_re, 0, sizeof(u_re));
-    memset(u_im, 0, sizeof(u_im));
+    double *u_re = (double *)calloc(vc_sz, sizeof(double));
+    double *u_im = (double *)calloc(vc_sz, sizeof(double));
     for (int t = 0; t < MPS_CHI; t++) {
         if (sig[t] > 1e-30) {
             for (int i = 0; i < DCHI; i++) {
                 double sr = 0, si2 = 0;
                 for (int j = 0; j < DCHI; j++) {
-                    sr  += M_re[i][j]*vc_re[t][j] - M_im[i][j]*vc_im[t][j];
-                    si2 += M_re[i][j]*vc_im[t][j] + M_im[i][j]*vc_re[t][j];
+                    sr  += M_re[i*DCHI+j]*vc_re[t*DCHI+j] - M_im[i*DCHI+j]*vc_im[t*DCHI+j];
+                    si2 += M_re[i*DCHI+j]*vc_im[t*DCHI+j] + M_im[i*DCHI+j]*vc_re[t*DCHI+j];
                 }
-                u_re[t][i] = sr / sig[t];
-                u_im[t][i] = si2 / sig[t];
+                u_re[t*DCHI+i] = sr / sig[t];
+                u_im[t*DCHI+i] = si2 / sig[t];
             }
         }
     }
+
+    free(M_re); free(M_im);
 
     /* ── LOCAL O(1) RENORMALIZATION ──────────────────────────────
      * In mixed-canonical form, kept_norm_sq = Σ σ_t² IS the exact
@@ -544,43 +574,42 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     mps_zero_site(sj);
 
     if (mps_sweep_right) {
-        /* ── L→R: A_i = U (left-canonical), A_j = σ·V (gauge) ── */
         for (int kp = 0; kp < MPS_PHYS; kp++)
             for (int a = 0; a < MPS_CHI; a++) {
                 int r = kp * MPS_CHI + a;
                 for (int bp = 0; bp < MPS_CHI; bp++)
                     mps_write_tensor(si, kp, a, bp,
-                                     u_re[bp][r], u_im[bp][r]);
+                                     u_re[bp*DCHI+r], u_im[bp*DCHI+r]);
             }
         for (int lp = 0; lp < MPS_PHYS; lp++)
             for (int g = 0; g < MPS_CHI; g++) {
                 int cc = lp * MPS_CHI + g;
                 for (int bp = 0; bp < MPS_CHI; bp++)
                     mps_write_tensor(sj, lp, bp, g,
-                                     sig[bp]*vc_re[bp][cc],
-                                     sig[bp]*vc_im[bp][cc]);
+                                     sig[bp]*vc_re[bp*DCHI+cc],
+                                     sig[bp]*vc_im[bp*DCHI+cc]);
             }
     } else {
-        /* ── R→L: A_i = U·σ (gauge), A_j = V (right-canonical) ── */
         for (int kp = 0; kp < MPS_PHYS; kp++)
             for (int a = 0; a < MPS_CHI; a++) {
                 int r = kp * MPS_CHI + a;
                 for (int bp = 0; bp < MPS_CHI; bp++)
                     mps_write_tensor(si, kp, a, bp,
-                                     u_re[bp][r] * sig[bp],
-                                     u_im[bp][r] * sig[bp]);
+                                     u_re[bp*DCHI+r] * sig[bp],
+                                     u_im[bp*DCHI+r] * sig[bp]);
             }
         for (int lp = 0; lp < MPS_PHYS; lp++)
             for (int g = 0; g < MPS_CHI; g++) {
                 int cc = lp * MPS_CHI + g;
                 for (int bp = 0; bp < MPS_CHI; bp++)
                     mps_write_tensor(sj, lp, bp, g,
-                                     vc_re[bp][cc], vc_im[bp][cc]);
+                                     vc_re[bp*DCHI+cc], vc_im[bp*DCHI+cc]);
             }
     }
 
-    free(Hr); free(Hi);
-    free(Vr); free(Vi);
+    free(sig);
+    free(vc_re); free(vc_im);
+    free(u_re); free(u_im);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -1041,5 +1070,6 @@ void mps_lazy_zero_site(MpsLazyChain *lc, int site)
 {
     lc->site_allocated[site] = 1;
     mps_zero_site(site);
+    mps_write_tensor(site, 0, 0, 0, 1.0, 0.0);  /* |0⟩ product state */
 }
 
