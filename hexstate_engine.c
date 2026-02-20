@@ -14,6 +14,7 @@
 #include "born_rule.h"
 #include "superposition.h"
 #include "statevector.h"
+#include "entanglement.h"
 
 #include <stdio.h>
 #include <stdlib.h>
