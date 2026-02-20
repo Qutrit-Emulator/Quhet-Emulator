@@ -494,6 +494,9 @@ void apply_dft(HexStateEngine *eng, uint64_t chunk_id, uint32_t dim);
 #define MAX_INSPECT_ENTRIES 256
 
 #define MAX_SNAP_MEMBERS 16   /* Max members to track in snapshot */
+#define MAX_SNAP_DIM     64   /* Max dimension for snapshot rho/marginals
+                               * (separate from NUM_BASIS_STATES which
+                               *  can be large for XEB benchmarking) */
 
 /* A single entry in the state decomposition */
 typedef struct {
@@ -524,10 +527,10 @@ typedef struct {
     int       is_collapsed;        /* 1 if measurement has occurred */
 
     /* Marginal probabilities for the inspected register */
-    double    marginal_probs[NUM_BASIS_STATES]; /* P(k) for k=0..D-1 */
+    double    marginal_probs[MAX_SNAP_DIM]; /* P(k) for k=0..D-1 */
 
     /* Reduced density matrix for inspected register: dim × dim complex */
-    Complex   rho[NUM_BASIS_STATES * NUM_BASIS_STATES];
+    Complex   rho[MAX_SNAP_DIM * MAX_SNAP_DIM];
 } HilbertSnapshot;
 
 /* Non-destructive readout: extract full state without collapse.
