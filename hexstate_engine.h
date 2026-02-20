@@ -104,11 +104,11 @@ typedef struct HilbertGroup {
     uint32_t  dim;              /* Per-register dimension (6) */
     uint32_t  num_members;      /* How many registers share this state */
     uint64_t  member_ids[MAX_GROUP_MEMBERS]; /* Chunk IDs in order */
-    /* Sparse state: only store nonzero amplitudes */
-    uint32_t  num_nonzero;      /* Number of nonzero amplitude entries */
-    uint32_t  sparse_cap;       /* Allocated capacity */
-    uint32_t *basis_indices;    /* Flattened: num_nonzero × num_members indices */
-    Complex  *amplitudes;       /* num_nonzero amplitudes */
+    /* Dense state: flat Complex[D^num_members] array.
+     * Index = Σ_m (index_m × D^(num_members-1-m))
+     * This is reality's storage model: no sparsity, every amplitude present. */
+    uint64_t  total_dim;        /* D^num_members */
+    Complex  *amplitudes;       /* Dense: total_dim amplitudes */
     uint8_t   collapsed;        /* 1 if a measurement has collapsed this group */
 
     /* ═══ Lazy Local Unitaries ═══
@@ -118,7 +118,8 @@ typedef struct HilbertGroup {
      * where L = number of ops. This is a factor of D faster than composition.
      *
      * State is implicitly:
-     *   |Ψ⟩ = [Π CZ] · Σ_k α_k · ⊗_m (U_L · ... · U_1 |index_{m,k}⟩) */
+     *   |Ψ⟩ = [Π CZ] · Σ α[flat] · |i_0, i_1, ..., i_{N-1}⟩
+     *   where flat = i_0·D^(N-1) + i_1·D^(N-2) + ... + i_{N-1} */
     Complex  **lazy_U[MAX_GROUP_MEMBERS]; /* Array of D×D matrix pointers per member */
     uint32_t  lazy_count[MAX_GROUP_MEMBERS]; /* Number of ops per member */
     uint32_t  lazy_cap[MAX_GROUP_MEMBERS];   /* Capacity per member */
@@ -136,6 +137,29 @@ typedef struct HilbertGroup {
     uint32_t  num_cz;           /* Number of CZ pairs stored */
     uint32_t  cz_cap;           /* Allocated capacity for pairs */
 } HilbertGroup;
+
+/* ─── Dense indexing helpers ───
+ * Extract the k-th member's basis index from a flat index.
+ * flat = i_0·D^(N-1) + i_1·D^(N-2) + ... + i_{N-1}
+ * index_k = (flat / D^(N-1-k)) % D */
+static inline uint32_t hilbert_extract_index(const HilbertGroup *g,
+                                              uint64_t flat, uint32_t member) {
+    uint32_t D = g->dim;
+    uint32_t nm = g->num_members;
+    uint64_t stride = 1;
+    for (uint32_t i = member + 1; i < nm; i++) stride *= D;
+    return (uint32_t)((flat / stride) % D);
+}
+
+/* Build flat index from array of per-member indices */
+static inline uint64_t hilbert_flat_index(const HilbertGroup *g,
+                                           const uint32_t *indices) {
+    uint64_t flat = 0;
+    uint32_t D = g->dim;
+    for (uint32_t m = 0; m < g->num_members; m++)
+        flat = flat * D + indices[m];
+    return flat;
+}
 
 /* Hilbert Space Reference (Magic Pointer) */
 typedef struct {
