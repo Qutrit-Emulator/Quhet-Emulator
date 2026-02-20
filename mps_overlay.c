@@ -106,9 +106,11 @@ void mps_overlay_amplitude(QuhitEngine *eng, uint32_t *quhits, int n,
         memcpy(v_im, next_im, sizeof(v_im));
     }
 
-    /* Project onto R = e_0 */
-    *out_re = v_re[0];
-    *out_im = v_im[0];
+    /* Project onto R = Σ e_i (sum all boundary channels) */
+    double sr = 0, si = 0;
+    for (int i = 0; i < MPS_CHI; i++) { sr += v_re[i]; si += v_im[i]; }
+    *out_re = sr;
+    *out_im = si;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -446,6 +448,27 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
             v_cols[t][i] = (top[t] >= 0) ? V[i][top[t]] : 0;
     }
 
+    /* ── RENORMALIZE after truncation ──────────────────────────────
+     * The engine's quhit_disentangle preserves norm by renormalizing
+     * marginals. We do the same: rescale kept σ's so their total
+     * matches the full Frobenius norm (= Σ all eigenvalues of H).
+     *
+     * Without this, truncated σ's (σ₇..σ₃₆) leak norm away,
+     * causing exponential decay in multi-site random circuits.
+     * ─────────────────────────────────────────────────────────── */
+    {
+        double full_norm_sq = 0;
+        for (int i = 0; i < DCHI; i++) full_norm_sq += fabs(H[i][i]);
+
+        double kept_norm_sq = 0;
+        for (int t = 0; t < MPS_CHI; t++) kept_norm_sq += sig[t] * sig[t];
+
+        if (kept_norm_sq > 1e-30 && full_norm_sq > kept_norm_sq * 1.0000001) {
+            double scale = sqrt(full_norm_sq / kept_norm_sq);
+            for (int t = 0; t < MPS_CHI; t++) sig[t] *= scale;
+        }
+    }
+
     /* U columns: u_t = M × v_t / σ_t */
     double u_re[MPS_CHI][DCHI], u_im[MPS_CHI][DCHI];
     memset(u_re, 0, sizeof(u_re));
@@ -485,6 +508,62 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
 
     free(H);
     free(V);
+
+    /* ── GLOBAL RENORMALIZATION ────────────────────────────────────
+     * After SVD truncation, compute ||ψ||² = Tr(transfer matrix)
+     * and rescale site si to restore unitarity.
+     * This mirrors the engine's quhit_disentangle → renormalize.
+     * Cost: O(n·χ²·D) per gate, standard in DMRG/TEBD.
+     * ──────────────────────────────────────────────────────────── */
+    {
+        /* Compute global norm via transfer matrix contraction */
+        double rho_re[MPS_CHI][MPS_CHI] = {{0}};
+        double rho_im[MPS_CHI][MPS_CHI] = {{0}};
+        rho_re[0][0] = 1.0;
+
+        for (int site2 = 0; site2 < n; site2++) {
+            double nr[MPS_CHI][MPS_CHI] = {{0}};
+            double ni2[MPS_CHI][MPS_CHI] = {{0}};
+            for (int k = 0; k < MPS_PHYS; k++) {
+                double Ak_re[MPS_CHI][MPS_CHI], Ak_im[MPS_CHI][MPS_CHI];
+                for (int a = 0; a < MPS_CHI; a++)
+                    for (int b = 0; b < MPS_CHI; b++)
+                        mps_read_tensor(site2, k, a, b, &Ak_re[a][b], &Ak_im[a][b]);
+                double tr2[MPS_CHI][MPS_CHI] = {{0}};
+                double ti2[MPS_CHI][MPS_CHI] = {{0}};
+                for (int a = 0; a < MPS_CHI; a++)
+                    for (int bp = 0; bp < MPS_CHI; bp++)
+                        for (int ap = 0; ap < MPS_CHI; ap++) {
+                            tr2[a][bp] += rho_re[a][ap]*Ak_re[ap][bp] - rho_im[a][ap]*Ak_im[ap][bp];
+                            ti2[a][bp] += rho_re[a][ap]*Ak_im[ap][bp] + rho_im[a][ap]*Ak_re[ap][bp];
+                        }
+                for (int b = 0; b < MPS_CHI; b++)
+                    for (int bp = 0; bp < MPS_CHI; bp++)
+                        for (int a = 0; a < MPS_CHI; a++) {
+                            double ar2 = Ak_re[a][b], ai2 = -Ak_im[a][b];
+                            nr[b][bp] += ar2*tr2[a][bp] - ai2*ti2[a][bp];
+                            ni2[b][bp] += ar2*ti2[a][bp] + ai2*tr2[a][bp];
+                        }
+            }
+            memcpy(rho_re, nr, sizeof(rho_re));
+            memcpy(rho_im, ni2, sizeof(rho_im));
+        }
+
+        double norm = 0;
+        for (int i = 0; i < MPS_CHI; i++) norm += rho_re[i][i];
+
+        /* Rescale site si if norm significantly differs from 1 */
+        if (norm > 1e-30 && fabs(norm - 1.0) > 1e-12) {
+            double scale = 1.0 / sqrt(norm);
+            for (int k = 0; k < MPS_PHYS; k++)
+                for (int a = 0; a < MPS_CHI; a++)
+                    for (int b = 0; b < MPS_CHI; b++) {
+                        double tr, ti;
+                        mps_read_tensor(si, k, a, b, &tr, &ti);
+                        mps_write_tensor(si, k, a, b, tr * scale, ti * scale);
+                    }
+        }
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -589,5 +668,8 @@ double mps_overlay_norm(QuhitEngine *eng, uint32_t *quhits, int n)
         memcpy(rho_im, ni_arr, sizeof(rho_im));
     }
 
-    return rho_re[0][0]; /* Project onto R = e_0 */
+    /* Full trace: Tr(ρ) sums all boundary channels */
+    double trace = 0;
+    for (int i = 0; i < MPS_CHI; i++) trace += rho_re[i][i];
+    return trace;
 }
