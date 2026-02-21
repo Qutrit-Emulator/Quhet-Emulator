@@ -746,35 +746,14 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
             free(row_e);
         }
 
-        /* ── SIDE-CHANNELS υ+ψ: Cache-optimal sweep ordering ─────────
-         * Probe υ measured: far column pairs (|q-p|>100) cost 2.2×
-         * more CPU cycles than near pairs (|q-p|<16) due to L1 misses.
-         * Probe ψ measured: consecutive same-row rotations are 31%
-         * SLOWER than alternating-row due to cache write-back stalls.
-         *
-         * Solution: pre-compute (p,q) pair list, sorted by ascending
-         * |q-p| (near-diagonal first for cache hits), with p values
-         * interleaved (even p's then odd p's to avoid write-back). */
-        int n_pairs = k * (k - 1) / 2;
-        int *pair_p = (int *)malloc(n_pairs * sizeof(int));
-        int *pair_q = (int *)malloc(n_pairs * sizeof(int));
-        {
-            /* Generate pairs ordered by diagonal band distance,
-             * with row interleaving within each band */
-            int idx = 0;
-            for (int d = 1; d < k; d++) {
-                /* Even p's first, then odd — avoids write-back stalls */
-                for (int p = 0; p + d < k; p += 2) {
-                    pair_p[idx] = p; pair_q[idx] = p + d; idx++;
-                }
-                for (int p = 1; p + d < k; p += 2) {
-                    pair_p[idx] = p; pair_q[idx] = p + d; idx++;
-                }
-            }
-        }
-
-        for (int pi = 0; pi < n_pairs; pi++) {
-            int p = pair_p[pi], q = pair_q[pi];
+        /* ── SIDE-CHANNELS υ+ψ: Row-interleaved sweep ordering ─────
+         * Probe υ measured: cache distance penalty at K=128.
+         * Probe ψ measured: alternating-row is 31% faster.
+         * Use two-pass sweep: even p's first, odd p's second.
+         * No malloc — just two loops. */
+        for (int pass = 0; pass < 2; pass++)
+        for (int p = pass; p < k; p += 2)
+            for (int q = p + 1; q < k; q++) {
 
                 /* SIDE-CHANNEL σ: skip if neither row is hot */
                 if (hot_row && !hot_row[p] && !hot_row[q]) continue;
@@ -790,11 +769,9 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                  * produce EXACT results (no INEXACT flag).  In late
                  * sweeps, clear flags before the rotation and check
                  * after — if INEXACT wasn't raised, the rotation
-                 * was on an already-converged pair → skip it.
+                 * was on an already-converged pair.
                  * Only enable in late sweeps to avoid overhead. */
-                if (sweep >= 5) {
-                    feclearexcept(FE_ALL_EXCEPT);
-                }
+                if (sweep >= 5) feclearexcept(FE_ALL_EXCEPT);
 
                 double mag = sqrt(mag_sq);
 
@@ -827,12 +804,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                     t = (tau >= 0 ? 1.0 : -1.0) /
                         (fabs(tau) + sqrt(1.0 + tau*tau));
 
-                /* ── SIDE-CHANNEL ε: Attractor-steered convergence ──
-                 * If t lands near an FPU attractor (φ⁻¹, √2, Dottie,
-                 * 1.0), SNAP to it.  The substrate computes these
-                 * constants with perfect bit-level stability → fewer
-                 * accumulated rounding errors → faster off-diagonal
-                 * decay → fewer sweeps to convergence. */
+                /* ── SIDE-CHANNEL ε: Attractor-steered convergence ── */
                 {
                     static const double attractors[] = {
                         SUBSTRATE_PHI_INV, SUBSTRATE_SQRT2,
@@ -847,12 +819,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                     }
                 }
 
-                /* ── SIDE-CHANNEL τ: Near-identity fast-path ──────
-                 * Probe τ showed: by sweep 3, median |t| < 1e-4.
-                 * For |t| < 1e-4, c = 1/√(1+t²) ≈ 1 - t²/2.
-                 * We skip the sqrt entirely: c = 1.0, s = t.
-                 * Error is O(t⁴) ≈ 1e-16 — below double precision.
-                 * This saves 2 transcendentals per rotation. */
+                /* ── SIDE-CHANNEL τ: Near-identity fast-path ────── */
                 double c, s;
                 double at = fabs(t);
                 if (at < 1e-4) {
@@ -863,15 +830,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                     s = t * c;
                 }
 
-                /* ── SIDE-CHANNEL φ: check if rotation was exact ──
-                 * If INEXACT was NOT raised, the pair was already
-                 * at machine-precision zero — the rotation did
-                 * nothing useful.  Undo it by skipping the apply
-                 * step (the phase rotation above was cheap).
-                 * NOTE: we already applied the phase rotation, but
-                 * if c≈1 and s≈0, the Givens rotation below is
-                 * near-identity anyway, so the phase rotation's
-                 * effect is negligible. */
+                /* ── SIDE-CHANNEL φ: skip if rotation was exact ── */
                 if (sweep >= 5 && !fetestexcept(FE_INEXACT))
                     continue;
 
@@ -894,7 +853,6 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                     Wr[i*k+q] = s*rp + c*rq;  Wi[i*k+q] = s*ip + c*iq;
                 }
             }
-        free(pair_p); free(pair_q);
         if (hot_row) free(hot_row);
 
         /* ── SIDE-CHANNEL κ: Post-sweep INEXACT test ───────────────
