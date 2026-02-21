@@ -170,23 +170,119 @@ static double compute_entropy(int cut, int n)
         rho_re = rho2_re; rho_im = rho2_im;
     }
 
-    /* Eigenvalues of ρ — we compute tr(ρ^k) via power iteration proxy.
-     * For a simple approach: diagonalize via repeated squaring for
-     * eigenvalue spectrum, then compute -Σ λ log₂ λ.
-     * Here: use the diagonal of ρ as an approximation (valid when ρ is
-     * close to diagonal, which it is after many random gates). */
+    /* Eigenvalues of ρ via Jacobi eigenvalue algorithm.
+     * ρ is Hermitian positive semidefinite, so eigenvalues are real ≥ 0.
+     * We diagonalize via cyclic Jacobi rotations on the real part
+     * (imaginary part of diagonal vanishes for valid density matrices). */
+
+    /* Normalize trace to 1 */
     double trace = 0;
     for (int a = 0; a < chi; a++)
         trace += rho_re[a * chi + a];
 
-    double entropy = 0;
-    if (trace > 1e-30) {
-        for (int a = 0; a < chi; a++) {
-            double lambda = rho_re[a * chi + a] / trace;
-            if (lambda > 1e-30)
-                entropy -= lambda * log2(lambda);
-        }
+    if (trace < 1e-30) {
+        free(rho_re); free(rho_im);
+        return 0.0;
     }
+
+    double inv_tr = 1.0 / trace;
+    for (int i = 0; i < chi2; i++) {
+        rho_re[i] *= inv_tr;
+        rho_im[i] *= inv_tr;
+    }
+
+    /* Jacobi eigenvalue iteration on Hermitian matrix.
+     * For each off-diagonal pair (p,q), apply a Givens rotation to
+     * zero it out. Repeat until convergence. */
+    double *M_re = (double *)malloc(chi2 * sizeof(double));
+    double *M_im = (double *)malloc(chi2 * sizeof(double));
+    memcpy(M_re, rho_re, chi2 * sizeof(double));
+    memcpy(M_im, rho_im, chi2 * sizeof(double));
+
+    int max_sweeps = 100;
+    for (int sweep = 0; sweep < max_sweeps; sweep++) {
+        double off_norm = 0;
+        for (int p = 0; p < chi; p++)
+            for (int q = p + 1; q < chi; q++) {
+                double re_pq = M_re[p * chi + q];
+                double im_pq = M_im[p * chi + q];
+                off_norm += re_pq * re_pq + im_pq * im_pq;
+            }
+        if (off_norm < 1e-24) break;
+
+        for (int p = 0; p < chi; p++)
+            for (int q = p + 1; q < chi; q++) {
+                double re_pq = M_re[p * chi + q];
+                double im_pq = M_im[p * chi + q];
+                double mag2 = re_pq * re_pq + im_pq * im_pq;
+                if (mag2 < 1e-30) continue;
+
+                /* 2×2 Hermitian submatrix eigenvalue problem */
+                double app = M_re[p * chi + p];
+                double aqq = M_re[q * chi + q];
+                double diff = aqq - app;
+                double mag = sqrt(mag2);
+
+                /* Rotation angle */
+                double t;
+                if (fabs(diff) < 1e-30)
+                    t = 1.0;
+                else {
+                    double tau = diff / (2.0 * mag);
+                    t = 1.0 / (fabs(tau) + sqrt(1.0 + tau * tau));
+                    if (tau < 0) t = -t;
+                }
+
+                double c = 1.0 / sqrt(1.0 + t * t);
+                double s = t * c;
+
+                /* Phase of the off-diagonal element */
+                double phase_re = re_pq / mag;
+                double phase_im = im_pq / mag;
+
+                /* Apply rotation to rows/cols p and q */
+                M_re[p * chi + p] -= t * mag;
+                M_re[q * chi + q] += t * mag;
+                M_re[p * chi + q] = 0;
+                M_im[p * chi + q] = 0;
+                M_re[q * chi + p] = 0;
+                M_im[q * chi + p] = 0;
+
+                for (int r = 0; r < chi; r++) {
+                    if (r == p || r == q) continue;
+
+                    /* Row p, col r  and  row q, col r */
+                    double rp_re = M_re[p * chi + r];
+                    double rp_im = M_im[p * chi + r];
+                    double rq_re = M_re[q * chi + r];
+                    double rq_im = M_im[q * chi + r];
+
+                    /* Apply complex Givens: with phase */
+                    double sp_re = s * phase_re, sp_im = s * phase_im;
+
+                    M_re[p * chi + r] = c * rp_re - (sp_re * rq_re + sp_im * rq_im);
+                    M_im[p * chi + r] = c * rp_im - (sp_re * rq_im - sp_im * rq_re);
+                    M_re[q * chi + r] = (sp_re * rp_re - sp_im * rp_im) + c * rq_re;
+                    M_im[q * chi + r] = (sp_re * rp_im + sp_im * rp_re) + c * rq_im;
+
+                    /* Hermitian: col = conj(row) */
+                    M_re[r * chi + p] = M_re[p * chi + r];
+                    M_im[r * chi + p] = -M_im[p * chi + r];
+                    M_re[r * chi + q] = M_re[q * chi + r];
+                    M_im[r * chi + q] = -M_im[q * chi + r];
+                }
+            }
+    }
+
+    /* Read eigenvalues from diagonal */
+    double entropy = 0;
+    for (int a = 0; a < chi; a++) {
+        double lambda = M_re[a * chi + a];
+        if (lambda > 1e-30)
+            entropy -= lambda * log2(lambda);
+    }
+
+    free(M_re); free(M_im);
 
     free(rho_re); free(rho_im);
     return entropy;
@@ -372,9 +468,9 @@ int main(void)
             }
             total_sub += 2 * ((N + 1) / 2);
 
-            /* ── Coherence recovery: COHERE odd sites, DISTILL+SATURATE all ── */
+            /* ── Coherence recovery: COHERE the SAME even sites that got decohered ── */
             #pragma omp parallel for schedule(static)
-            for (int i = 1; i < N; i += 2) {
+            for (int i = 0; i < N; i += 2) {
                 quhit_substrate_exec(eng, q[i], SUB_COHERE);
                 quhit_substrate_exec(eng, q[i], SUB_DISTILL);
                 quhit_substrate_exec(eng, q[i], SUB_SATURATE);
