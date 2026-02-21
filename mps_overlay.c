@@ -761,40 +761,20 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                 double hpq_r = Sr[p*k+q], hpq_i = Si[p*k+q];
                 double mag_sq = hpq_r*hpq_r + hpq_i*hpq_i;
 
-                /* SIDE-CHANNEL ρ: threshold skip — avoid sqrt too */
+                /* SIDE-CHANNEL ρ: threshold skip (BEFORE any mutation) */
                 if (mag_sq < rho_threshold * rho_threshold) continue;
 
-                /* ── SIDE-CHANNEL φ: Per-rotation INEXACT skip ────────
-                 * Probe φ measured: at sweep 8, 592/8128 rotations
-                 * produce EXACT results (no INEXACT flag).  In late
-                 * sweeps, clear flags before the rotation and check
-                 * after — if INEXACT wasn't raised, the rotation
-                 * was on an already-converged pair.
-                 * Only enable in late sweeps to avoid overhead. */
-                if (sweep >= 5) feclearexcept(FE_ALL_EXCEPT);
-
                 double mag = sqrt(mag_sq);
+                if (mag < 1e-25) continue;
 
+                /* Compute phase to make S[p,q] real */
                 double eR = hpq_r / mag, eI = -hpq_i / mag;
-                for (int i = 0; i < k; i++) {
-                    double xr = Sr[i*k+q], xi = Si[i*k+q];
-                    Sr[i*k+q] = xr*eR - xi*eI;
-                    Si[i*k+q] = xr*eI + xi*eR;
-                }
-                for (int j = 0; j < k; j++) {
-                    double xr = Sr[q*k+j], xi = Si[q*k+j];
-                    Sr[q*k+j] =  xr*eR + xi*eI;
-                    Si[q*k+j] = -xr*eI + xi*eR;
-                }
-                for (int i = 0; i < k; i++) {
-                    double xr = Wr[i*k+q], xi = Wi[i*k+q];
-                    Wr[i*k+q] = xr*eR - xi*eI;
-                    Wi[i*k+q] = xr*eI + xi*eR;
-                }
 
+                /* Compute rotation parameters from CURRENT state
+                 * WITHOUT modifying S yet.
+                 * After phase rotation, S[p,q] would become real = mag. */
                 double hpp = Sr[p*k+p], hqq = Sr[q*k+q];
-                double hpq_real = Sr[p*k+q];
-                if (fabs(hpq_real) < 1e-15) continue;
+                double hpq_real = mag;
 
                 double tau = (hqq - hpp) / (2.0 * hpq_real);
                 double t;
@@ -830,10 +810,24 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                     s = t * c;
                 }
 
-                /* ── SIDE-CHANNEL φ: skip if rotation was exact ── */
-                if (sweep >= 5 && !fetestexcept(FE_INEXACT))
-                    continue;
+                /* ── ATOMIC APPLICATION: Phase + Givens as one unit ──
+                 * Both transformations applied together — no skip between.
+                 * This prevents the unitarity bug where a skip after
+                 * phase rotation leaves the matrix in a corrupted state. */
 
+                /* Step A: Phase rotation on column q of S */
+                for (int i = 0; i < k; i++) {
+                    double xr = Sr[i*k+q], xi = Si[i*k+q];
+                    Sr[i*k+q] = xr*eR - xi*eI;
+                    Si[i*k+q] = xr*eI + xi*eR;
+                }
+                for (int j = 0; j < k; j++) {
+                    double xr = Sr[q*k+j], xi = Si[q*k+j];
+                    Sr[q*k+j] =  xr*eR + xi*eI;
+                    Si[q*k+j] = -xr*eI + xi*eR;
+                }
+
+                /* Step B: Givens rotation mixing rows/cols p,q */
                 for (int j = 0; j < k; j++) {
                     double rp = Sr[p*k+j], ip = Si[p*k+j];
                     double rq = Sr[q*k+j], iq = Si[q*k+j];
@@ -846,7 +840,14 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                     Sr[i*k+p] = c*rp - s*rq;  Si[i*k+p] = c*ip - s*iq;
                     Sr[i*k+q] = s*rp + c*rq;  Si[i*k+q] = s*ip + c*iq;
                 }
+
+                /* Step C: Accumulate both transforms in W */
                 for (int i = 0; i < k; i++) {
+                    /* Phase on col q */
+                    double xr = Wr[i*k+q], xi = Wi[i*k+q];
+                    Wr[i*k+q] = xr*eR - xi*eI;
+                    Wi[i*k+q] = xr*eI + xi*eR;
+                    /* Then Givens */
                     double rp = Wr[i*k+p], ip = Wi[i*k+p];
                     double rq = Wr[i*k+q], iq = Wi[i*k+q];
                     Wr[i*k+p] = c*rp - s*rq;  Wi[i*k+p] = c*ip - s*iq;
