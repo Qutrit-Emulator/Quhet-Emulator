@@ -707,7 +707,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                     };
                     double at = fabs(t);
                     for (int ai = 0; ai < 4; ai++) {
-                        if (fabs(at - attractors[ai]) < 0.05 * attractors[ai]) {
+                        if (fabs(at - attractors[ai]) < 0.01 * attractors[ai]) {
                             t = (t > 0) ? attractors[ai] : -attractors[ai];
                             break;
                         }
