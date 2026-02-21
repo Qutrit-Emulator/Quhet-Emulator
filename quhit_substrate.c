@@ -555,14 +555,16 @@ void quhit_substrate_print_isa(void)
  * SELF-TEST
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
+#include <stdlib.h>
+
 int quhit_substrate_self_test(void)
 {
     printf("  ┌────────────────────────────────────────────────────────────────────┐\n");
     printf("  │  SUBSTRATE OPCODE SELF-TEST                                       │\n");
     printf("  └────────────────────────────────────────────────────────────────────┘\n\n");
 
-    QuhitEngine eng;
-    quhit_engine_init(&eng);
+    QuhitEngine *eng = calloc(1, sizeof(QuhitEngine));
+    quhit_engine_init(eng);
     int pass = 0, fail = 0;
 
     #define CHECK(cond, name) do { \
@@ -572,18 +574,18 @@ int quhit_substrate_self_test(void)
 
     /* Test SUB_NULL: should reset to |0⟩ */
     {
-        uint32_t q = quhit_init_plus(&eng);
-        quhit_substrate_exec(&eng, q, SUB_NULL);
-        QuhitState *s = &eng.quhits[q].state;
+        uint32_t q = quhit_init_plus(eng);
+        quhit_substrate_exec(eng, q, SUB_NULL);
+        QuhitState *s = &eng->quhits[q].state;
         CHECK(fabs(s->re[0] - 1.0) < 1e-10 && fabs(s->re[1]) < 1e-10,
               "SUB_NULL: |+⟩ → |0⟩");
     }
 
     /* Test SUB_VOID: should zero everything */
     {
-        uint32_t q = quhit_init_plus(&eng);
-        quhit_substrate_exec(&eng, q, SUB_VOID);
-        QuhitState *s = &eng.quhits[q].state;
+        uint32_t q = quhit_init_plus(eng);
+        quhit_substrate_exec(eng, q, SUB_VOID);
+        QuhitState *s = &eng->quhits[q].state;
         double sum = 0;
         for (int k = 0; k < SUB_D; k++) sum += fabs(s->re[k]) + fabs(s->im[k]);
         CHECK(sum < 1e-15, "SUB_VOID: |+⟩ → 0 (total erasure)");
@@ -591,39 +593,39 @@ int quhit_substrate_self_test(void)
 
     /* Test SUB_SCALE_UP / SUB_SCALE_DN round-trip */
     {
-        uint32_t q = quhit_init(&eng);
-        quhit_substrate_exec(&eng, q, SUB_SCALE_UP);
-        CHECK(fabs(eng.quhits[q].state.re[0] - 2.0) < 1e-10,
+        uint32_t q = quhit_init(eng);
+        quhit_substrate_exec(eng, q, SUB_SCALE_UP);
+        CHECK(fabs(eng->quhits[q].state.re[0] - 2.0) < 1e-10,
               "SUB_SCALE_UP: |0⟩ amp doubles");
-        quhit_substrate_exec(&eng, q, SUB_SCALE_DN);
-        CHECK(fabs(eng.quhits[q].state.re[0] - 1.0) < 1e-10,
+        quhit_substrate_exec(eng, q, SUB_SCALE_DN);
+        CHECK(fabs(eng->quhits[q].state.re[0] - 1.0) < 1e-10,
               "SUB_SCALE_DN: round-trip restores");
     }
 
     /* Test SUB_PARITY: |0⟩ → |5⟩ */
     {
-        uint32_t q = quhit_init(&eng);
-        quhit_substrate_exec(&eng, q, SUB_PARITY);
-        QuhitState *s = &eng.quhits[q].state;
+        uint32_t q = quhit_init(eng);
+        quhit_substrate_exec(eng, q, SUB_PARITY);
+        QuhitState *s = &eng->quhits[q].state;
         CHECK(fabs(s->re[5] - 1.0) < 1e-10 && fabs(s->re[0]) < 1e-10,
               "SUB_PARITY: |0⟩ → |5⟩");
     }
 
     /* Test SUB_PARITY self-inverse: P²=I */
     {
-        uint32_t q = quhit_init(&eng);
-        quhit_substrate_exec(&eng, q, SUB_PARITY);
-        quhit_substrate_exec(&eng, q, SUB_PARITY);
-        CHECK(fabs(eng.quhits[q].state.re[0] - 1.0) < 1e-10,
+        uint32_t q = quhit_init(eng);
+        quhit_substrate_exec(eng, q, SUB_PARITY);
+        quhit_substrate_exec(eng, q, SUB_PARITY);
+        CHECK(fabs(eng->quhits[q].state.re[0] - 1.0) < 1e-10,
               "SUB_PARITY: P² = I");
     }
 
     /* Test SUB_QUIET: removes imaginary parts */
     {
-        uint32_t q = quhit_init(&eng);
-        quhit_apply_dft(&eng, q); /* puts into superposition with phases */
-        quhit_substrate_exec(&eng, q, SUB_QUIET);
-        QuhitState *s = &eng.quhits[q].state;
+        uint32_t q = quhit_init(eng);
+        quhit_apply_dft(eng, q); /* puts into superposition with phases */
+        quhit_substrate_exec(eng, q, SUB_QUIET);
+        QuhitState *s = &eng->quhits[q].state;
         double im_sum = 0;
         for (int k = 0; k < SUB_D; k++) im_sum += fabs(s->im[k]);
         CHECK(im_sum < 1e-10, "SUB_QUIET: DFT|0⟩ → real (decoherence)");
@@ -631,84 +633,84 @@ int quhit_substrate_self_test(void)
 
     /* Test SUB_NEGATE: self-inverse */
     {
-        uint32_t q = quhit_init(&eng);
-        quhit_substrate_exec(&eng, q, SUB_NEGATE);
-        CHECK(fabs(eng.quhits[q].state.re[0] - (-1.0)) < 1e-10,
+        uint32_t q = quhit_init(eng);
+        quhit_substrate_exec(eng, q, SUB_NEGATE);
+        CHECK(fabs(eng->quhits[q].state.re[0] - (-1.0)) < 1e-10,
               "SUB_NEGATE: |0⟩ → -|0⟩");
-        quhit_substrate_exec(&eng, q, SUB_NEGATE);
-        CHECK(fabs(eng.quhits[q].state.re[0] - 1.0) < 1e-10,
+        quhit_substrate_exec(eng, q, SUB_NEGATE);
+        CHECK(fabs(eng->quhits[q].state.re[0] - 1.0) < 1e-10,
               "SUB_NEGATE: (-1)² = I");
     }
 
     /* Test SUB_GOLDEN: preserves norm */
     {
-        uint32_t q = quhit_init_plus(&eng);
-        quhit_substrate_exec(&eng, q, SUB_GOLDEN);
-        double norm = qm_total_prob(&eng.quhits[q].state);
+        uint32_t q = quhit_init_plus(eng);
+        quhit_substrate_exec(eng, q, SUB_GOLDEN);
+        double norm = qm_total_prob(&eng->quhits[q].state);
         CHECK(fabs(norm - 1.0) < 1e-10, "SUB_GOLDEN: norm preserved");
     }
 
     /* Test SUB_DOTTIE: preserves norm */
     {
-        uint32_t q = quhit_init_plus(&eng);
-        quhit_substrate_exec(&eng, q, SUB_DOTTIE);
-        double norm = qm_total_prob(&eng.quhits[q].state);
+        uint32_t q = quhit_init_plus(eng);
+        quhit_substrate_exec(eng, q, SUB_DOTTIE);
+        double norm = qm_total_prob(&eng->quhits[q].state);
         CHECK(fabs(norm - 1.0) < 1e-10, "SUB_DOTTIE: norm preserved");
     }
 
     /* Test SUB_MIRROR: self-inverse, keeps |0⟩ and |3⟩ */
     {
-        uint32_t q = quhit_init_basis(&eng, 1);
-        quhit_substrate_exec(&eng, q, SUB_MIRROR);
-        CHECK(fabs(eng.quhits[q].state.re[5] - 1.0) < 1e-10,
+        uint32_t q = quhit_init_basis(eng, 1);
+        quhit_substrate_exec(eng, q, SUB_MIRROR);
+        CHECK(fabs(eng->quhits[q].state.re[5] - 1.0) < 1e-10,
               "SUB_MIRROR: |1⟩ → |5⟩");
-        quhit_substrate_exec(&eng, q, SUB_MIRROR);
-        CHECK(fabs(eng.quhits[q].state.re[1] - 1.0) < 1e-10,
+        quhit_substrate_exec(eng, q, SUB_MIRROR);
+        CHECK(fabs(eng->quhits[q].state.re[1] - 1.0) < 1e-10,
               "SUB_MIRROR: M² = I");
     }
 
     /* Test SUB_CLOCK: (-1)^k pattern */
     {
-        uint32_t q = quhit_init_basis(&eng, 1);
-        quhit_substrate_exec(&eng, q, SUB_CLOCK);
-        CHECK(fabs(eng.quhits[q].state.re[1] - (-1.0)) < 1e-10,
+        uint32_t q = quhit_init_basis(eng, 1);
+        quhit_substrate_exec(eng, q, SUB_CLOCK);
+        CHECK(fabs(eng->quhits[q].state.re[1] - (-1.0)) < 1e-10,
               "SUB_CLOCK: |1⟩ → -|1⟩ (ω³=−1)");
     }
 
     /* Test SUB_SQRT2: preserves norm */
     {
-        uint32_t q = quhit_init_plus(&eng);
-        quhit_substrate_exec(&eng, q, SUB_SQRT2);
-        double norm = qm_total_prob(&eng.quhits[q].state);
+        uint32_t q = quhit_init_plus(eng);
+        quhit_substrate_exec(eng, q, SUB_SQRT2);
+        double norm = qm_total_prob(&eng->quhits[q].state);
         CHECK(fabs(norm - 1.0) < 1e-10, "SUB_SQRT2: norm preserved");
     }
 
     /* Test SUB_SATURATE: fixes non-normalized state */
     {
-        uint32_t q = quhit_init(&eng);
-        quhit_substrate_exec(&eng, q, SUB_SCALE_UP);
-        quhit_substrate_exec(&eng, q, SUB_SCALE_UP);
+        uint32_t q = quhit_init(eng);
+        quhit_substrate_exec(eng, q, SUB_SCALE_UP);
+        quhit_substrate_exec(eng, q, SUB_SCALE_UP);
         /* Now amp = 4.0, norm = 16 */
-        quhit_substrate_exec(&eng, q, SUB_SATURATE);
-        double norm = qm_total_prob(&eng.quhits[q].state);
+        quhit_substrate_exec(eng, q, SUB_SATURATE);
+        double norm = qm_total_prob(&eng->quhits[q].state);
         CHECK(fabs(norm - 1.0) < 1e-10, "SUB_SATURATE: renormalizes to 1");
     }
 
     /* Test SUB_FUSE: reduces to 3 effective levels */
     {
-        uint32_t q = quhit_init_plus(&eng);
-        quhit_substrate_exec(&eng, q, SUB_FUSE);
-        QuhitState *s = &eng.quhits[q].state;
+        uint32_t q = quhit_init_plus(eng);
+        quhit_substrate_exec(eng, q, SUB_FUSE);
+        QuhitState *s = &eng->quhits[q].state;
         CHECK(fabs(s->re[1]) < 1e-10 && fabs(s->re[3]) < 1e-10 && fabs(s->re[5]) < 1e-10,
               "SUB_FUSE: odd levels zeroed");
     }
 
     /* Test substrate program execution */
     {
-        uint32_t q = quhit_init(&eng);
+        uint32_t q = quhit_init(eng);
         SubOp program[] = { SUB_SCALE_UP, SUB_NEGATE, SUB_PARITY, SUB_SATURATE };
-        quhit_substrate_program(&eng, q, program, 4);
-        double norm = qm_total_prob(&eng.quhits[q].state);
+        quhit_substrate_program(eng, q, program, 4);
+        double norm = qm_total_prob(&eng->quhits[q].state);
         CHECK(fabs(norm - 1.0) < 1e-10,
               "PROGRAM: SCALE_UP→NEGATE→PARITY→SATURATE preserves state");
     }
@@ -725,6 +727,7 @@ int quhit_substrate_self_test(void)
 
     printf("\n    Results: %d passed, %d failed\n\n", pass, fail);
 
-    quhit_engine_destroy(&eng);
+    quhit_engine_destroy(eng);
+    free(eng);
     return fail;
 }
