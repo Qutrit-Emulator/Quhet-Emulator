@@ -297,6 +297,98 @@ static double get_time(void)
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+/* ── Substrate → MPS bridge ───────────────────────────────────────────
+ *
+ * Critical insight: substrate opcodes modify eng->quhits[].state (local
+ * D=6 amplitudes), but entanglement entropy is measured from MPS tensors
+ * (a separate tensor network). To make substrate ops affect entanglement,
+ * we must convert them to D×D matrices and inject via mps_lazy_gate_1site.
+ *
+ * sub_to_unitary() probes an opcode by feeding each basis state |k⟩
+ * and reading the output → builds the D×D transformation matrix.
+ * ──────────────────────────────────────────────────────────────────── */
+
+static void sub_to_unitary(QuhitEngine *eng, SubOp op, double *U_re, double *U_im)
+{
+    int D = MPS_PHYS;
+
+    /* We'll use quhit slot 0 as a scratch pad — save and restore */
+    QuhitState saved = eng->quhits[0].state;
+
+    for (int k = 0; k < D; k++) {
+        /* Set state to |k⟩ */
+        for (int j = 0; j < D; j++) {
+            eng->quhits[0].state.re[j] = (j == k) ? 1.0 : 0.0;
+            eng->quhits[0].state.im[j] = 0.0;
+        }
+
+        /* Apply the substrate opcode */
+        quhit_substrate_exec(eng, 0, op);
+
+        /* Read out the transformed state → column k of the matrix */
+        for (int j = 0; j < D; j++) {
+            U_re[j * D + k] = eng->quhits[0].state.re[j];
+            U_im[j * D + k] = eng->quhits[0].state.im[j];
+        }
+    }
+
+    /* Restore original state */
+    eng->quhits[0].state = saved;
+}
+
+/* Build composite unitary for a sequence of substrate ops, then apply to MPS */
+static void mps_substrate_program(MpsLazyChain *lc, QuhitEngine *eng,
+                                   int site, const SubOp *ops, int n_ops)
+{
+    int D = MPS_PHYS;
+    int D2 = D * D;
+
+    /* Build individual unitaries */
+    double *U_re = (double *)calloc(D2, sizeof(double));
+    double *U_im = (double *)calloc(D2, sizeof(double));
+
+    /* Start with identity */
+    for (int j = 0; j < D; j++)
+        U_re[j * D + j] = 1.0;
+
+    for (int op = 0; op < n_ops; op++) {
+        /* Get matrix for this opcode */
+        double *G_re = (double *)calloc(D2, sizeof(double));
+        double *G_im = (double *)calloc(D2, sizeof(double));
+        sub_to_unitary(eng, ops[op], G_re, G_im);
+
+        /* Multiply: U_new = G × U_old */
+        double *P_re = (double *)calloc(D2, sizeof(double));
+        double *P_im = (double *)calloc(D2, sizeof(double));
+        for (int i = 0; i < D; i++)
+            for (int j = 0; j < D; j++)
+                for (int k = 0; k < D; k++) {
+                    P_re[i*D+j] += G_re[i*D+k]*U_re[k*D+j] - G_im[i*D+k]*U_im[k*D+j];
+                    P_im[i*D+j] += G_re[i*D+k]*U_im[k*D+j] + G_im[i*D+k]*U_re[k*D+j];
+                }
+
+        free(U_re); free(U_im);
+        U_re = P_re; U_im = P_im;
+        free(G_re); free(G_im);
+    }
+
+    /* Apply composite gate to MPS chain */
+    mps_lazy_gate_1site(lc, site, U_re, U_im);
+
+    free(U_re); free(U_im);
+}
+
+/* Apply a single substrate opcode to a site through MPS */
+static void mps_substrate_exec(MpsLazyChain *lc, QuhitEngine *eng,
+                                int site, SubOp op)
+{
+    int D = MPS_PHYS;
+    double U_re[MPS_PHYS * MPS_PHYS] = {0};
+    double U_im[MPS_PHYS * MPS_PHYS] = {0};
+    sub_to_unitary(eng, op, U_re, U_im);
+    mps_lazy_gate_1site(lc, site, U_re, U_im);
+}
+
 /* ── Substrate layer patterns ─────────────────────────────────────────── */
 
 /* 9 substrate circuit patterns, cycled per depth layer */
@@ -442,16 +534,17 @@ int main(void)
 
         /* ── Layer 3: Substrate opcode layer ─────────────────────────
          *  Apply a pattern of substrate gates to each quhit.
-         *  The pattern cycles through 6 configurations, each ending
+         *  The pattern cycles through 9 configurations, each ending
          *  with SUB_SATURATE to maintain normalization.
+         *
+         *  Uses mps_substrate_program() to inject through MPS pipeline.
+         *  Serialized because MPS is not thread-safe.
          * ──────────────────────────────────────────────────────────── */
         const SubOp *pattern = SUB_PATTERNS[d % N_PATTERNS];
         int sub_ops = 0;
 
-        #pragma omp parallel for schedule(static) reduction(+:sub_ops)
         for (int i = 0; i < N; i++) {
-            /* Apply the 3-opcode substrate program to each quhit */
-            quhit_substrate_program(eng, q[i], pattern, 3);
+            mps_substrate_program(lc, eng, i, pattern, 3);
             sub_ops += 3;
         }
         total_sub += sub_ops;
@@ -460,22 +553,19 @@ int main(void)
         if ((d + 1) % 5 == 0) {
             /* Every 5 cycles: apply SUB_QUIET (decoherence) to
              * even-indexed sites then saturate everything.
-             * This simulates the substrate's thermal noise. */
-            #pragma omp parallel for schedule(static)
+             * Then COHERE+DISTILL the SAME sites to recover phase. */
+            SubOp decohere_prog[] = { SUB_QUIET, SUB_SATURATE };
             for (int i = 0; i < N; i += 2) {
-                quhit_substrate_exec(eng, q[i], SUB_QUIET);
-                quhit_substrate_exec(eng, q[i], SUB_SATURATE);
+                mps_substrate_program(lc, eng, i, decohere_prog, 2);
             }
             total_sub += 2 * ((N + 1) / 2);
 
-            /* ── Coherence recovery: COHERE the SAME even sites that got decohered ── */
-            #pragma omp parallel for schedule(static)
+            /* ── Coherence recovery: COHERE the SAME even sites ── */
+            SubOp cohere_prog[] = { SUB_COHERE, SUB_DISTILL, SUB_SATURATE };
             for (int i = 0; i < N; i += 2) {
-                quhit_substrate_exec(eng, q[i], SUB_COHERE);
-                quhit_substrate_exec(eng, q[i], SUB_DISTILL);
-                quhit_substrate_exec(eng, q[i], SUB_SATURATE);
+                mps_substrate_program(lc, eng, i, cohere_prog, 3);
             }
-            total_sub += 3 * (N / 2);
+            total_sub += 3 * ((N + 1) / 2);
         }
 
         /* ── MPS renormalization ─────────────────────────────────── */
