@@ -53,8 +53,8 @@
 #define QUHIT_LOCAL_BYTES   96          /* 6 × 16 bytes per quhit          */
 #define QUHIT_JOINT_BYTES   576         /* 36 × 16 bytes per pair          */
 
-#define MAX_QUHITS          131072      /* Max quhits in engine             */
-#define MAX_PAIRS           32768       /* Max entangled pairs              */
+#define MAX_QUHITS          262144      /* Max quhits in engine (256K)      */
+#define MAX_PAIRS           262144      /* Max entangled pairs (256K)       */
 #define MAX_REGISTERS       256         /* Max quhit registers              */
 #define MAX_CZ_DEFERRED     4096        /* Max deferred CZ per pair         */
 
