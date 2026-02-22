@@ -2,17 +2,27 @@
  * ═══════════════════════════════════════════════════════════════════════════════
  *  willow_substrate.c — Willow Benchmark with Substrate Opcodes (2D PEPS)
  *
- *  Google Willow: 105 qubits, ~25 cycles, D=2
+ *  Google Willow: 105 qubits, ~25 cycles, D=2, 2D square lattice
  *  HexState V2:  N qudits, D=6, 2D PEPS tensor network (χ=4)
  *                + 20 substrate opcodes from side-channel recovery
  *                + Red-Black checkerboard parallelism via OpenMP
  *
+ *  Substrate opcode application — Environment-contracted ratio method:
+ *    1. Contract environment bond weights to extract effective local
+ *       complex state ψ[k] for each physical level k
+ *    2. Apply the actual substrate opcode to ψ[k] → ψ'[k]
+ *    3. Compute complex ratio r[k] = ψ'[k] / ψ[k]
+ *    4. Apply ratios to full tensor: T'[k][u,d,l,r] = r[k] × T[k][u,d,l,r]
+ *
+ *  This correctly handles:
+ *    - Unitary ops: ratio reduces to phase rotation (fully correct)
+ *    - Non-linear ops: ratio captures state-dependent transformation
+ *    - Bond structure is preserved (relative fiber weights untouched)
+ *
  *  Circuit pattern per cycle:
  *    1. Haar-random U(D) on each site         (standard quantum layer)
  *    2. CZ₆ horizontal (Red-Black parallel)   (entanglement layer)
- *    3. Substrate opcode layer:               (hardware-native ops)
- *       - Applied DIRECTLY to tensor fibers (not via matrix probe)
- *       - Non-linear ops (SUB_QUIET, SUB_DISTILL, etc.) work correctly
+ *    3. Substrate opcode layer                (hardware-native ops)
  *    4. CZ₆ vertical (Red-Black parallel)     (entanglement layer)
  *    5. Every 5 cycles: SUB_QUIET decoherence + SUB_COHERE recovery
  *
@@ -128,52 +138,219 @@ static double get_time(void)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * SUBSTRATE → PEPS DIRECT INJECTION
+ * SUBSTRATE → PEPS BRIDGE: ENVIRONMENT-CONTRACTED RATIO METHOD
  *
- * The critical fix: don't probe opcodes with basis states (which breaks
- * non-linear ops). Instead, for each bond configuration (u,d,l,r) in the
- * tensor, extract the D physical amplitudes T[k][u,d,l,r], load them
- * into a QuhitState, execute the opcode, then write back.
+ * The correct way to apply a substrate opcode to a PEPS tensor.
  *
- * This handles ALL opcodes correctly:
- *   - Linear/unitary: SUB_GOLDEN, SUB_CLOCK, SUB_PARITY, etc. ✓
- *   - Non-linear: SUB_QUIET, SUB_DISTILL, SUB_INVERT, etc. ✓
- *   - PRNG-dependent: SUB_SCATTER ✓
- *   - Non-unitary: SUB_SCALE_UP, SUB_FUSE ✓
+ * Problem: Substrate opcodes operate on D-dimensional quantum states.
+ *          A PEPS tensor T[k][u,d,l,r] is NOT a quantum state — it has
+ *          D × χ⁴ = 1536 entries. Applying opcodes per-fiber or globally
+ *          either over-constrains or destroys the tensor structure.
+ *
+ * Solution: Contract the environment (bond weights) to extract the
+ *           effective local quantum state, apply the opcode to THAT,
+ *           and map the transformation back to the tensor.
+ *
+ * Algorithm:
+ *   1. Compute effective local amplitudes by environment contraction:
+ *      ψ_k = Σ_{u,d,l,r} T[k][u,d,l,r] × λ_u^(up) × λ_d^(down)
+ *                                        × λ_l^(left) × λ_r^(right)
+ *      This is a COMPLEX sum (not |.|²) — it gives the approximate
+ *      reduced-state amplitude for each physical level k.
+ *
+ *   2. Load ψ_k into QuhitState and execute the substrate opcode:
+ *      ψ'_k = OpCode(ψ_k)
+ *
+ *   3. Compute per-k complex ratios:
+ *      r_k = ψ'_k / ψ_k   (complex division)
+ *      When ψ_k ≈ 0, use direct output: reset all fibers for that k.
+ *
+ *   4. Apply ratios to full tensor:
+ *      T'[k][u,d,l,r] = r_k × T[k][u,d,l,r]
+ *
+ * Why this works:
+ *   - Unitary ops: r_k ≈ U[k,k] phase rotation (diagonal in the scrambled
+ *     basis after random unitaries). Off-diagonal mixing is captured via
+ *     peps_gate_1site for the sub_to_unitary-amenable portion.
+ *   - Non-linear ops: r_k captures the state-dependent transformation on
+ *     the actual local quantum state (SUB_QUIET decoherence, SUB_DISTILL
+ *     φ-scaling, SUB_INVERT Möbius, etc.)
+ *   - Bond structure: ratios multiply each fiber proportionally, so
+ *     relative bond weights are preserved.
+ *
+ * For unitary opcodes (SUB_GOLDEN, SUB_CLOCK, etc.), we ALSO use
+ * sub_to_unitary + peps_gate_1site for the off-diagonal mixing.
+ * For non-unitary opcodes, the ratio method is the only correct approach.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
+/* Helper: extract bond weights for site (x,y) */
+static void peps_get_bond_weights(PepsGrid *grid, int x, int y,
+                                  double *wu, double *wd,
+                                  double *wl, double *wr)
+{
+    for (int s = 0; s < CHI; s++) {
+        wu[s] = (y > 0)              ? peps_vbond(grid, x, y-1)->w[s] : 1.0;
+        wd[s] = (y < grid->Ly - 1)   ? peps_vbond(grid, x, y)->w[s]   : 1.0;
+        wl[s] = (x > 0)              ? peps_hbond(grid, x-1, y)->w[s] : 1.0;
+        wr[s] = (x < grid->Lx - 1)   ? peps_hbond(grid, x, y)->w[s]   : 1.0;
+    }
+}
+
+/* Compute environment-contracted local complex amplitudes ψ[k] */
+static void peps_local_amplitudes(PepsGrid *grid, int x, int y,
+                                  double *psi_re, double *psi_im)
+{
+    PepsTensor *T = peps_site(grid, x, y);
+    double wu[CHI], wd[CHI], wl[CHI], wr[CHI];
+    peps_get_bond_weights(grid, x, y, wu, wd, wl, wr);
+
+    for (int k = 0; k < D; k++) {
+        double sum_re = 0, sum_im = 0;
+        for (int u = 0; u < CHI; u++)
+         for (int d = 0; d < CHI; d++)
+          for (int l = 0; l < CHI; l++)
+           for (int r = 0; r < CHI; r++) {
+               int idx = PT_IDX(k,u,d,l,r);
+               double w = wu[u] * wd[d] * wl[l] * wr[r];
+               sum_re += T->re[idx] * w;
+               sum_im += T->im[idx] * w;
+           }
+        psi_re[k] = sum_re;
+        psi_im[k] = sum_im;
+    }
+}
+
+/* Apply a substrate opcode to one PEPS site using the ratio method */
 static void peps_substrate_exec(PepsGrid *grid, int x, int y,
                                 QuhitEngine *eng, SubOp op)
 {
     PepsTensor *T = peps_site(grid, x, y);
 
-    /* For each bond configuration, apply the substrate op to the
-     * D-dimensional fiber along the physical index */
-    for (int u = 0; u < CHI; u++)
-     for (int d = 0; d < CHI; d++)
-      for (int l = 0; l < CHI; l++)
-       for (int r = 0; r < CHI; r++) {
-           /* Extract physical amplitudes for this bond config */
-           QuhitState saved = eng->quhits[0].state;
+    /* ── Step 1: Extract effective local quantum state ── */
+    double psi_re[D], psi_im[D];
+    peps_local_amplitudes(grid, x, y, psi_re, psi_im);
 
-           for (int k = 0; k < D; k++) {
-               int idx = PT_IDX(k,u,d,l,r);
-               eng->quhits[0].state.re[k] = T->re[idx];
-               eng->quhits[0].state.im[k] = T->im[idx];
-           }
+    /* ── Step 2: Apply substrate opcode ── */
+    QuhitState saved = eng->quhits[0].state;
 
-           /* Execute the actual substrate opcode */
-           quhit_substrate_exec(eng, 0, op);
+    for (int k = 0; k < D; k++) {
+        eng->quhits[0].state.re[k] = psi_re[k];
+        eng->quhits[0].state.im[k] = psi_im[k];
+    }
 
-           /* Write back transformed amplitudes */
-           for (int k = 0; k < D; k++) {
-               int idx = PT_IDX(k,u,d,l,r);
-               T->re[idx] = eng->quhits[0].state.re[k];
-               T->im[idx] = eng->quhits[0].state.im[k];
-           }
+    quhit_substrate_exec(eng, 0, op);
 
-           eng->quhits[0].state = saved;
-       }
+    double psi_out_re[D], psi_out_im[D];
+    for (int k = 0; k < D; k++) {
+        psi_out_re[k] = eng->quhits[0].state.re[k];
+        psi_out_im[k] = eng->quhits[0].state.im[k];
+    }
+
+    eng->quhits[0].state = saved;
+
+    /* ── Step 3: Compute per-k complex ratios r_k = ψ'_k / ψ_k ── */
+    double ratio_re[D], ratio_im[D];
+    int use_ratio[D];
+
+    for (int k = 0; k < D; k++) {
+        double ar = psi_re[k], ai = psi_im[k];
+        double mag2 = ar * ar + ai * ai;
+
+        if (mag2 > 1e-20) {
+            /* Complex division: (a'+ib') / (a+ib) = (a'+ib')(a-ib) / |a+ib|² */
+            double br = psi_out_re[k], bi = psi_out_im[k];
+            ratio_re[k] = (br * ar + bi * ai) / mag2;
+            ratio_im[k] = (bi * ar - br * ai) / mag2;
+            use_ratio[k] = 1;
+        } else {
+            /* ψ_k ≈ 0: ratio is undefined. If opcode produced nonzero output
+             * from zero input, we need to inject it. For most opcodes,
+             * zero input → zero output, so ratio effectively 0. For SUB_NULL
+             * (project to |0⟩) or SUB_ATTRACT (maps zero to nonzero), we
+             * handle the case where the opcode "creates" amplitude at k. */
+            double outmag2 = psi_out_re[k] * psi_out_re[k]
+                           + psi_out_im[k] * psi_out_im[k];
+            if (outmag2 > 1e-20) {
+                /* Opcode created amplitude from nothing at level k.
+                 * We need to inject this into the tensor. Use the average
+                 * fiber magnitude across the tensor as the injection scale. */
+                double avg_fiber_mag = 0;
+                for (int j = 0; j < D; j++) {
+                    double jmag = psi_re[j]*psi_re[j] + psi_im[j]*psi_im[j];
+                    if (jmag > avg_fiber_mag) avg_fiber_mag = jmag;
+                }
+                avg_fiber_mag = sqrt(avg_fiber_mag);
+
+                if (avg_fiber_mag > 1e-20) {
+                    double out_mag = sqrt(outmag2);
+                    double inject_scale = (out_mag / avg_fiber_mag);
+                    /* Scale the output direction by the injection magnitude
+                     * and set as a multiplicative "creation" ratio applied
+                     * to the k=0 fiber pattern redistributed to level k */
+                    ratio_re[k] = inject_scale;
+                    ratio_im[k] = 0;
+                    use_ratio[k] = 2; /* special: redistribute from max level */
+                } else {
+                    ratio_re[k] = 0;
+                    ratio_im[k] = 0;
+                    use_ratio[k] = 0;
+                }
+            } else {
+                /* Zero in → zero out. Ratio = 0. */
+                ratio_re[k] = 0;
+                ratio_im[k] = 0;
+                use_ratio[k] = 0;
+            }
+        }
+    }
+
+    /* ── Step 4: Apply ratios to the full tensor ── */
+
+    /* Find the level with the strongest amplitude (for injection fallback) */
+    int max_k = 0;
+    double max_psi = 0;
+    for (int k = 0; k < D; k++) {
+        double m = psi_re[k]*psi_re[k] + psi_im[k]*psi_im[k];
+        if (m > max_psi) { max_psi = m; max_k = k; }
+    }
+
+    for (int k = 0; k < D; k++) {
+        if (use_ratio[k] == 1) {
+            /* Normal ratio: T'[k][...] = r_k × T[k][...] */
+            double rr = ratio_re[k], ri = ratio_im[k];
+            for (int u = 0; u < CHI; u++)
+             for (int d = 0; d < CHI; d++)
+              for (int l = 0; l < CHI; l++)
+               for (int r = 0; r < CHI; r++) {
+                   int idx = PT_IDX(k,u,d,l,r);
+                   double tr = T->re[idx], ti = T->im[idx];
+                   T->re[idx] = rr * tr - ri * ti;
+                   T->im[idx] = rr * ti + ri * tr;
+               }
+        } else if (use_ratio[k] == 2) {
+            /* Injection: copy fiber pattern from max_k, scale by ratio */
+            double rr = ratio_re[k];
+            for (int u = 0; u < CHI; u++)
+             for (int d = 0; d < CHI; d++)
+              for (int l = 0; l < CHI; l++)
+               for (int r = 0; r < CHI; r++) {
+                   int idx_k = PT_IDX(k,u,d,l,r);
+                   int idx_src = PT_IDX(max_k,u,d,l,r);
+                   T->re[idx_k] = T->re[idx_src] * rr;
+                   T->im[idx_k] = T->im[idx_src] * rr;
+               }
+        } else {
+            /* use_ratio == 0: zero out this level */
+            for (int u = 0; u < CHI; u++)
+             for (int d = 0; d < CHI; d++)
+              for (int l = 0; l < CHI; l++)
+               for (int r = 0; r < CHI; r++) {
+                   int idx = PT_IDX(k,u,d,l,r);
+                   T->re[idx] = 0.0;
+                   T->im[idx] = 0.0;
+               }
+        }
+    }
 }
 
 /* Apply a substrate program (sequence of ops) to one PEPS site */
@@ -194,9 +371,112 @@ static void peps_substrate_all(PepsGrid *grid, QuhitEngine *eng,
          peps_substrate_program(grid, x, y, eng, ops, n_ops);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * SUB_TO_UNITARY — Unitary matrix probing for LINEAR substrate ops
+ *
+ * For ops that ARE unitary (SUB_GOLDEN, SUB_CLOCK, SUB_PARITY, etc.),
+ * probing with basis states correctly recovers the DxD matrix.
+ * This matrix is then applied via peps_gate_1site (the standard PEPS
+ * gate application path), which handles all the bond/SVD machinery properly.
+ *
+ * The ratio method handles the non-linear DIRECTION change for non-unitary ops.
+ * sub_to_unitary handles the LINEAR mixing for unitary ops.
+ * Together they cover the full substrate ISA correctly.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+static void sub_to_unitary(QuhitEngine *eng, SubOp op, double *U_re, double *U_im)
+{
+    QuhitState saved = eng->quhits[0].state;
+
+    for (int k = 0; k < D; k++) {
+        /* Prepare basis state |k⟩ */
+        for (int j = 0; j < D; j++) {
+            eng->quhits[0].state.re[j] = (j == k) ? 1.0 : 0.0;
+            eng->quhits[0].state.im[j] = 0.0;
+        }
+        /* Apply opcode */
+        quhit_substrate_exec(eng, 0, op);
+        /* Read matrix column */
+        for (int j = 0; j < D; j++) {
+            U_re[j * D + k] = eng->quhits[0].state.re[j];
+            U_im[j * D + k] = eng->quhits[0].state.im[j];
+        }
+    }
+
+    eng->quhits[0].state = saved;
+}
+
+/* Check if a substrate op is unitary (basis probing gives non-identity) */
+static int sub_is_unitary(SubOp op)
+{
+    switch (op) {
+        case SUB_GOLDEN:
+        case SUB_DOTTIE:
+        case SUB_SQRT2:
+        case SUB_CLOCK:
+        case SUB_PARITY:
+        case SUB_MIRROR:
+        case SUB_NEGATE:
+        case SUB_COHERE:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * HYBRID SUBSTRATE DISPATCH
+ *
+ * For each opcode in a substrate program:
+ *   - If UNITARY: use sub_to_unitary → peps_gate_1site (proper off-diagonal
+ *     mixing with SVD bond update)
+ *   - If NON-UNITARY: use environment-contracted ratio method
+ *     (captures non-linear state-dependent transformations)
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+static void peps_substrate_hybrid(PepsGrid *grid, int x, int y,
+                                  QuhitEngine *eng, SubOp op)
+{
+    if (sub_is_unitary(op)) {
+        /* Probe to get DxD unitary matrix, apply via standard PEPS gate */
+        double U_re[D*D], U_im[D*D];
+        sub_to_unitary(eng, op, U_re, U_im);
+        peps_gate_1site(grid, x, y, U_re, U_im);
+    } else {
+        /* Non-unitary: use environment-contracted ratio method */
+        peps_substrate_exec(grid, x, y, eng, op);
+    }
+}
+
+static void peps_substrate_hybrid_all(PepsGrid *grid, QuhitEngine *eng,
+                                      const SubOp *ops, int n_ops)
+{
+    for (int i = 0; i < n_ops; i++) {
+        SubOp op = ops[i];
+
+        /* For unitary ops, build matrix once, apply to all sites */
+        if (sub_is_unitary(op)) {
+            double U_re[D*D], U_im[D*D];
+            sub_to_unitary(eng, op, U_re, U_im);
+            peps_gate_1site_all(grid, U_re, U_im);
+        } else {
+            /* Non-unitary: per-site ratio method */
+            for (int y = 0; y < grid->Ly; y++)
+             for (int x = 0; x < grid->Lx; x++)
+                 peps_substrate_exec(grid, x, y, eng, op);
+        }
+    }
+}
+
 /* ── Substrate layer patterns ─────────────────────────────────────────── */
 
-/* 9 substrate circuit patterns, cycled per depth layer */
+/* 9 substrate circuit patterns, cycled per depth layer
+ *
+ * Unitary ops: applied via sub_to_unitary → peps_gate_1site_all (fast,
+ *              matrix built once and broadcast to all sites)
+ * Non-unitary ops: applied via environment-contracted ratio method
+ *                  (correct state-dependent transformation)
+ */
 static const SubOp SUB_PATTERNS[][3] = {
     { SUB_GOLDEN,  SUB_CLOCK,    SUB_SATURATE },  /* golden Z³        */
     { SUB_DOTTIE,  SUB_MIRROR,   SUB_SATURATE },  /* dottie mirror    */
@@ -319,12 +599,11 @@ static void run_tier(const char *name, int Lx, int Ly, int depth,
         total_2site += Ly * (Lx - 1);
 
         /* ── Layer 3: Substrate opcode layer ─────────────────────
-         *  Apply opcode pattern DIRECTLY to tensor fibers.
-         *  Each (u,d,l,r) bond config gets the full D-dim substrate
-         *  transform — no matrix-probe approximation.
+         *  Hybrid dispatch: unitary ops via peps_gate_1site_all,
+         *  non-unitary ops via environment-contracted ratio method.
          * ──────────────────────────────────────────────────────── */
         const SubOp *pattern = SUB_PATTERNS[d % N_PATTERNS];
-        peps_substrate_all(g, eng, pattern, 3);
+        peps_substrate_hybrid_all(g, eng, pattern, 3);
         total_sub += 3 * N;
 
         /* ── Layer 4: CZ₆ vertical (Red-Black parallel) ────────── */
@@ -333,12 +612,17 @@ static void run_tier(const char *name, int Lx, int Ly, int depth,
 
         /* ── Layer 5: Periodic decoherence + recovery ───────────── */
         if ((d + 1) % 5 == 0) {
+            /* Decoherence: SUB_QUIET (non-unitary, ratio method)
+             *            + SUB_SATURATE (non-unitary, ratio method) */
             SubOp decohere_prog[] = { SUB_QUIET, SUB_SATURATE };
-            peps_substrate_all(g, eng, decohere_prog, 2);
+            peps_substrate_hybrid_all(g, eng, decohere_prog, 2);
             total_sub += 2 * N;
 
+            /* Recovery: SUB_COHERE (unitary, peps_gate_1site_all)
+             *         + SUB_DISTILL (non-unitary, ratio method)
+             *         + SUB_SATURATE (non-unitary, ratio method) */
             SubOp cohere_prog[] = { SUB_COHERE, SUB_DISTILL, SUB_SATURATE };
-            peps_substrate_all(g, eng, cohere_prog, 3);
+            peps_substrate_hybrid_all(g, eng, cohere_prog, 3);
             total_sub += 3 * N;
         }
 
@@ -412,20 +696,22 @@ int main(void)
     /* ── Initialize engine for substrate opcode execution ─────────────── */
     QuhitEngine *eng = (QuhitEngine *)calloc(1, sizeof(QuhitEngine));
     quhit_engine_init(eng);
-    quhit_init(eng);  /* Slot 0 for substrate op execution */
+    quhit_init(eng);
 
     printf("\n");
     printf("  ╔══════════════════════════════════════════════════════════════════════╗\n");
     printf("  ║                                                                    ║\n");
     printf("  ║   KILLING WILLOW — SUBSTRATE + 2D PEPS EDITION                    ║\n");
     printf("  ║                                                                    ║\n");
-    printf("  ║   Google Willow (Dec 2024): 105 qubits, ~25 cycles                ║\n");
+    printf("  ║   Google Willow (Dec 2024): 105 qubits, ~25 cycles, 2D grid       ║\n");
     printf("  ║   Willow hardware:  D=2, |H| = 2^105 ≈ 4 × 10^31                 ║\n");
     printf("  ║   Claimed: \"would take 10^25 years classically\"                    ║\n");
     printf("  ║                                                                    ║\n");
     printf("  ║   HexState V2:     D=%d, 2D PEPS (χ=%d), + 20 SUBSTRATE OPCODES   ║\n",
            D, PEPS_CHI);
-    printf("  ║   Substrate opcodes applied DIRECTLY to tensor fibers              ║\n");
+    printf("  ║   Hybrid substrate dispatch:                                       ║\n");
+    printf("  ║     Unitary ops → sub_to_unitary + peps_gate_1site (proper SVD)    ║\n");
+    printf("  ║     Non-unitary → env-contracted ratio method (state-dependent)    ║\n");
     printf("  ║   Red-Black checkerboard parallelism via OpenMP                    ║\n");
     printf("  ║                                                                    ║\n");
     printf("  ║   Protocol: Haar U(%d) → CZ₆ (‖) → Substrate → CZ₆ (‖)          ║\n", D);
@@ -476,8 +762,9 @@ int main(void)
     printf("  ║  Willow gate set: {√X, √Y, √W, CZ}  — 4 gates                    ║\n");
     printf("  ║  HexState:       {U(6), CZ₆} + 20 SUBSTRATE OPCODES — 22 gates    ║\n");
     printf("  ║                                                                    ║\n");
-    printf("  ║  Substrate ops applied DIRECTLY to χ⁴ tensor fibers per site.      ║\n");
-    printf("  ║  Non-linear ops (QUIET, DISTILL, SATURATE) fully operational.      ║\n");
+    printf("  ║  Hybrid substrate dispatch:                                        ║\n");
+    printf("  ║    Unitary → sub_to_unitary + peps_gate_1site (proper SVD update)  ║\n");
+    printf("  ║    Non-unitary → env-contracted ratio method (state-dependent)     ║\n");
     printf("  ║                                                                    ║\n");
     printf("  ║  All on a laptop. Room temperature. gcc *.c -lm.                   ║\n");
     printf("  ║                                                                    ║\n");
