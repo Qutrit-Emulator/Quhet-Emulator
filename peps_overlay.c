@@ -374,12 +374,12 @@ static void peps_truncated_svd(const double *M_re, const double *M_im,
     double *Y_re = (double *)calloc(m * kk, sizeof(double));
     double *Y_im = (double *)calloc(m * kk, sizeof(double));
     {
-        static unsigned svd_call_id = 0;
+        /* Deterministic seed per bond: use bond_key + chi_eff state.
+         * This makes the random projection independent of gate application
+         * order, enabling correct parallel execution. */
         unsigned base_seed;
-        base_seed = ++svd_call_id;
-        base_seed = base_seed * 2654435761u + 12345u;
-        base_seed ^= (unsigned)(peps_substrate_seed >> 32)
-                   ^ (unsigned)(peps_substrate_seed);
+        base_seed = (unsigned)bond_key * 2654435761u + 12345u;
+        base_seed ^= (unsigned)peps_chi_eff[key] * 1103515245u;
 
         for (int j = 0; j < kk; j++) {
             unsigned ls = base_seed + (unsigned)j * 1103515245u;
