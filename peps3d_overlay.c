@@ -95,7 +95,7 @@ Tns3dGrid *tns3d_init(int Lx, int Ly, int Lz)
 
     g->site_reg = (int *)calloc(N, sizeof(int));
     for (int i = 0; i < N; i++) {
-        g->site_reg[i] = quhit_reg_init(g->eng, (uint64_t)i, 7, TNS3D_CHI);
+        g->site_reg[i] = quhit_reg_init(g->eng, (uint64_t)i, 7, TNS3D_D);
         if (g->site_reg[i] >= 0) {
             g->eng->registers[g->site_reg[i]].bulk_rule = 0;
             quhit_reg_sv_set(g->eng, g->site_reg[i], 0, 1.0, 0.0);
