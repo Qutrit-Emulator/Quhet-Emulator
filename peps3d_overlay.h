@@ -22,7 +22,7 @@
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 #define TNS3D_D     6       /* Physical dimension (SU(6) native)          */
-#define TNS3D_CHI   3       /* Bond dimension (χ⁶ storage per site)       */
+#define TNS3D_CHI   6       /* Bond dimension — matches D, full register usage */
 
 /* Derived powers of D — for basis encoding (matches register dim=D) */
 #define TNS3D_D2    (TNS3D_D * TNS3D_D)                    /* 36  */
