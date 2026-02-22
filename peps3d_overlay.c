@@ -70,6 +70,14 @@ Tns3dGrid *tns3d_init(int Lx, int Ly, int Lz)
     for (long i = 0; i < nx; i++) for (int s = 0; s < TNS3D_CHI; s++) g->x_bonds[i].w[s] = 1.0;
     for (long i = 0; i < ny; i++) for (int s = 0; s < TNS3D_CHI; s++) g->y_bonds[i].w[s] = 1.0;
     for (long i = 0; i < nz; i++) for (int s = 0; s < TNS3D_CHI; s++) g->z_bonds[i].w[s] = 1.0;
+
+    /* ── Magic Pointer: allocate engine + per-site quhits ── */
+    g->eng = (QuhitEngine *)calloc(1, sizeof(QuhitEngine));
+    quhit_engine_init(g->eng);
+    g->q_phys = (uint32_t *)calloc(N, sizeof(uint32_t));
+    for (long i = 0; i < N; i++)
+        g->q_phys[i] = quhit_init_basis(g->eng, 0);
+
     return g;
 }
 
@@ -77,6 +85,12 @@ void tns3d_free(Tns3dGrid *g)
 {
     if (!g) return;
     free(g->tensors); free(g->x_bonds); free(g->y_bonds); free(g->z_bonds);
+    /* ── Magic Pointer cleanup ── */
+    if (g->eng) {
+        quhit_engine_destroy(g->eng);
+        free(g->eng);
+    }
+    free(g->q_phys);
     free(g);
 }
 
@@ -121,6 +135,12 @@ void tns3d_gate_1site(Tns3dGrid *g, int x, int y, int z,
             t->re[idx] = vr;
             t->im[idx] = vi;
         }
+    }
+
+    /* ── Magic Pointer: mirror gate to physical quhit ── */
+    if (g->eng && g->q_phys) {
+        long site_idx = (long)z * g->Ly * g->Lx + (long)y * g->Lx + x;
+        quhit_apply_unitary(g->eng, g->q_phys[site_idx], U_re, U_im);
     }
 }
 
@@ -481,6 +501,13 @@ void tns3d_gate_x(Tns3dGrid *grid, int x, int y, int z,
 
     for (int s=0;s<TNS3D_CHI;s++) lam->w[s] = sig[s];
     free(Ur);free(Ui);free(Vr);free(Vi);
+
+    /* ── Magic Pointer: mirror 2-site gate to quhits ── */
+    if (grid->eng && grid->q_phys) {
+        long sa = (long)z*grid->Ly*grid->Lx + (long)y*grid->Lx + x;
+        long sb = (long)z*grid->Ly*grid->Lx + (long)y*grid->Lx + (x+1);
+        quhit_apply_cz(grid->eng, grid->q_phys[sa], grid->q_phys[sb]);
+    }
 }
 
 /* ═══════════════ 2-SITE GATE: Y-DIRECTION (x,y,z)—(x,y+1,z) ═══════════════
@@ -578,6 +605,13 @@ void tns3d_gate_y(Tns3dGrid *grid, int x, int y, int z,
 
     for (int s=0;s<TNS3D_CHI;s++) lam->w[s] = sig[s];
     free(Ur);free(Ui);free(Vr);free(Vi);
+
+    /* ── Magic Pointer: mirror 2-site gate to quhits ── */
+    if (grid->eng && grid->q_phys) {
+        long sa = (long)z*grid->Ly*grid->Lx + (long)y*grid->Lx + x;
+        long sb = (long)z*grid->Ly*grid->Lx + (long)(y+1)*grid->Lx + x;
+        quhit_apply_cz(grid->eng, grid->q_phys[sa], grid->q_phys[sb]);
+    }
 }
 
 /* ═══════════════ 2-SITE GATE: Z-DIRECTION (x,y,z)—(x,y,z+1) ═══════════════
@@ -675,6 +709,13 @@ void tns3d_gate_z(Tns3dGrid *grid, int x, int y, int z,
 
     for (int s=0;s<TNS3D_CHI;s++) lam->w[s] = sig[s];
     free(Ur);free(Ui);free(Vr);free(Vi);
+
+    /* ── Magic Pointer: mirror 2-site gate to quhits ── */
+    if (grid->eng && grid->q_phys) {
+        long sa = (long)z*grid->Ly*grid->Lx + (long)y*grid->Lx + x;
+        long sb = (long)(z+1)*grid->Ly*grid->Lx + (long)y*grid->Lx + x;
+        quhit_apply_cz(grid->eng, grid->q_phys[sa], grid->q_phys[sb]);
+    }
 }
 
 /* ═══════════════ LOCAL DENSITY ═══════════════ */

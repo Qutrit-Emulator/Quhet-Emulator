@@ -263,8 +263,6 @@ uint32_t mps_overlay_measure(QuhitEngine *eng, uint32_t *quhits, int n, int targ
 void mps_gate_1site(QuhitEngine *eng, uint32_t *quhits, int n,
                     int site, const double *U_re, const double *U_im)
 {
-    (void)eng; (void)quhits; (void)n;
-
     /* Heap-allocate: at χ=128, each is 6×128×128 × 8 = 768 KB */
     size_t tsz = (size_t)MPS_PHYS * MPS_CHI * MPS_CHI;
     double *old_re = (double *)malloc(tsz * sizeof(double));
@@ -290,6 +288,10 @@ void mps_gate_1site(QuhitEngine *eng, uint32_t *quhits, int n,
                 }
                 mps_write_tensor(site, kp, a, b, sr, si);
             }
+
+    /* ── Magic Pointer: mirror gate to physical quhit ── */
+    if (eng && quhits && site < n)
+        quhit_apply_unitary(eng, quhits[site], U_re, U_im);
 
     free(old_re);
     free(old_im);
@@ -1120,6 +1122,10 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     free(sig);
     free(vc_re); free(vc_im);
     free(u_re); free(u_im);
+
+    /* ── Magic Pointer: mirror 2-site gate to physical quhits ── */
+    if (eng && quhits && site + 1 < n)
+        quhit_apply_cz(eng, quhits[site], quhits[site + 1]);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════

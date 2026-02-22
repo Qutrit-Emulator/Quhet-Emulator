@@ -50,6 +50,8 @@
  * DATA STRUCTURES
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
+#include "quhit_engine.h"
+
 typedef struct {
     double re[TNS3D_TSIZ];   /* 384 real parts    */
     double im[TNS3D_TSIZ];   /* 384 imaginary     */
@@ -65,6 +67,9 @@ typedef struct {
     Tns3dBondWeight *x_bonds;         /* X-bonds: [Lz * Ly * (Lx-1)]      */
     Tns3dBondWeight *y_bonds;         /* Y-bonds: [Lz * (Ly-1) * Lx]      */
     Tns3dBondWeight *z_bonds;         /* Z-bonds: [(Lz-1) * Ly * Lx]      */
+    /* ── Magic Pointer integration ── */
+    uint32_t *q_phys;                 /* [Lz*Ly*Lx] per-site quhit IDs    */
+    QuhitEngine *eng;                 /* HexState Engine reference         */
 } Tns3dGrid;
 
 /* ═══════════════════════════════════════════════════════════════════════════════

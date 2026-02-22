@@ -106,6 +106,14 @@ PepsGrid *peps_init(int Lx, int Ly)
         for (int x = 0; x < Lx; x++)
             peps_site(g, x, y)->re[PT_IDX(0, 0, 0, 0, 0)] = 1.0;
 
+    /* ── Magic Pointer: allocate engine + per-site quhits ── */
+    int N = Lx * Ly;
+    g->eng = (QuhitEngine *)calloc(1, sizeof(QuhitEngine));
+    quhit_engine_init(g->eng);
+    g->q_phys = (uint32_t *)calloc(N, sizeof(uint32_t));
+    for (int i = 0; i < N; i++)
+        g->q_phys[i] = quhit_init_basis(g->eng, 0);  /* each site starts in |0⟩ */
+
     return g;
 }
 
@@ -115,6 +123,12 @@ void peps_free(PepsGrid *grid)
     free(grid->tensors);
     free(grid->h_bonds);
     free(grid->v_bonds);
+    /* ── Magic Pointer cleanup ── */
+    if (grid->eng) {
+        quhit_engine_destroy(grid->eng);
+        free(grid->eng);
+    }
+    free(grid->q_phys);
     free(grid);
 }
 
@@ -166,6 +180,12 @@ void peps_gate_1site(PepsGrid *grid, int x, int y,
 
     memcpy(T->re, new_re, sizeof(new_re));
     memcpy(T->im, new_im, sizeof(new_im));
+
+    /* ── Magic Pointer: mirror gate to physical quhit ── */
+    if (grid->eng && grid->q_phys) {
+        uint32_t qid = grid->q_phys[y * grid->Lx + x];
+        quhit_apply_unitary(grid->eng, qid, U_re, U_im);
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -704,6 +724,13 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
 
     for (int s = 0; s < PEPS_CHI; s++) lam->w[s] = sig[s];
     free(U_re); free(U_im); free(Vc_re); free(Vc_im);
+
+    /* ── Magic Pointer: mirror 2-site gate to physical quhits ── */
+    if (grid->eng && grid->q_phys) {
+        uint32_t qa = grid->q_phys[y * grid->Lx + x];
+        uint32_t qb = grid->q_phys[y * grid->Lx + (x + 1)];
+        quhit_apply_cz(grid->eng, qa, qb);
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -849,6 +876,13 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
 
     for (int s = 0; s < PEPS_CHI; s++) lam->w[s] = sig[s];
     free(U_re); free(U_im); free(Vc_re); free(Vc_im);
+
+    /* ── Magic Pointer: mirror 2-site gate to physical quhits ── */
+    if (grid->eng && grid->q_phys) {
+        uint32_t qa = grid->q_phys[y * grid->Lx + x];
+        uint32_t qb = grid->q_phys[(y + 1) * grid->Lx + x];
+        quhit_apply_cz(grid->eng, qa, qb);
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════

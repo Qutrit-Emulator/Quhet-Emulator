@@ -44,6 +44,8 @@
  * DATA STRUCTURES
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
+#include "quhit_engine.h"
+
 typedef struct {
     double re[PEPS_TSIZ];
     double im[PEPS_TSIZ];
@@ -58,6 +60,9 @@ typedef struct {
     PepsTensor *tensors;       /* [Ly * Lx] site tensors               */
     PepsBondWeight *h_bonds;   /* Horizontal bonds: [Ly * (Lx-1)]     */
     PepsBondWeight *v_bonds;   /* Vertical bonds:   [(Ly-1) * Lx]     */
+    /* ── Magic Pointer integration ── */
+    uint32_t *q_phys;         /* [Ly * Lx] per-site physical quhit IDs */
+    QuhitEngine *eng;          /* HexState Engine reference             */
 } PepsGrid;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
