@@ -22,7 +22,7 @@
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 #define TNS3D_D     6       /* Physical dimension (SU(6) native)          */
-#define TNS3D_CHI   12      /* Bond dimension per axis                    */
+#define TNS3D_CHI   6       /* Bond dimension per axis                    */
 
 /* Derived powers of χ — for basis encoding (register dim=χ) */
 #define TNS3D_C2    (TNS3D_CHI * TNS3D_CHI)                        /* 144    */
