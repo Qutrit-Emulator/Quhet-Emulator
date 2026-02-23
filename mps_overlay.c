@@ -339,48 +339,51 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     int sA = site, sB = site + 1;
     int D = MPS_PHYS, chi = MPS_CHI;
     int dchi = D * chi;  /* DCHI = 768 at χ=128 */
+    int chi2 = chi * chi;
     size_t dchi2 = (size_t)dchi * dchi;
 
-    /* ── Step 1: Read tensors from registers ── */
-    double *Ai_re = (double *)calloc((size_t)D * chi * chi, sizeof(double));
-    double *Ai_im = (double *)calloc((size_t)D * chi * chi, sizeof(double));
-    double *Aj_re = (double *)calloc((size_t)D * chi * chi, sizeof(double));
-    double *Aj_im = (double *)calloc((size_t)D * chi * chi, sizeof(double));
+    /* ── Step 1+2: Build Θ from SPARSE register entries ──
+     * Register basis: k*χ² + α*χ + β
+     * Contract: Θ[(kA,α),(kB,β)] = Σ_γ A[kA,α,γ] × B[kB,γ,β]
+     * Iterate over nnzA × nnzB pairs matching on γ. */
 
-    for (int k = 0; k < D; k++)
-        for (int a = 0; a < chi; a++)
-            for (int b = 0; b < chi; b++) {
-                int idx = k * chi * chi + a * chi + b;
-                mps_read_tensor(sA, k, a, b, &Ai_re[idx], &Ai_im[idx]);
-                mps_read_tensor(sB, k, a, b, &Aj_re[idx], &Aj_im[idx]);
-            }
-
-    /* ── Step 2: Contract Θ[(kA,α),(kB,β)] = Σ_γ A[kA,α,γ] × B[kB,γ,β] ── */
     double *Th_re = (double *)calloc(dchi2, sizeof(double));
     double *Th_im = (double *)calloc(dchi2, sizeof(double));
 
-    for (int kA = 0; kA < D; kA++)
-     for (int a = 0; a < chi; a++) {
-         int row = kA * chi + a;
-         for (int kB = 0; kB < D; kB++)
-          for (int b = 0; b < chi; b++) {
-              int col = kB * chi + b;
-              double sr = 0, si = 0;
-              for (int g = 0; g < chi; g++) {
-                  int iA = kA * chi * chi + a * chi + g;
-                  int iB = kB * chi * chi + g * chi + b;
-                  double ar = Ai_re[iA], ai = Ai_im[iA];
-                  double br = Aj_re[iB], bi = Aj_im[iB];
-                  sr += ar*br - ai*bi;
-                  si += ar*bi + ai*br;
-              }
-              Th_re[row * dchi + col] = sr;
-              Th_im[row * dchi + col] = si;
-          }
-     }
+    QuhitRegister *regA = &eng->registers[mps_store[sA].reg_idx];
+    QuhitRegister *regB = &eng->registers[mps_store[sB].reg_idx];
+
+    for (uint32_t eA = 0; eA < regA->num_nonzero; eA++) {
+        uint64_t bsA = regA->entries[eA].basis_state;
+        double arA = regA->entries[eA].amp_re;
+        double aiA = regA->entries[eA].amp_im;
+        if (arA*arA + aiA*aiA < 1e-30) continue;
+
+        int kA = (int)(bsA / chi2);
+        int alpha = (int)((bsA / chi) % chi);
+        int gamma_A = (int)(bsA % chi);  /* shared bond */
+
+        int row = kA * chi + alpha;
+
+        for (uint32_t eB = 0; eB < regB->num_nonzero; eB++) {
+            uint64_t bsB = regB->entries[eB].basis_state;
+            double arB = regB->entries[eB].amp_re;
+            double aiB = regB->entries[eB].amp_im;
+            if (arB*arB + aiB*aiB < 1e-30) continue;
+
+            int kB = (int)(bsB / chi2);
+            int gamma_B = (int)((bsB / chi) % chi);  /* shared bond */
+            int beta = (int)(bsB % chi);
+
+            if (gamma_A != gamma_B) continue;
+
+            int col = kB * chi + beta;
+            Th_re[row * dchi + col] += arA*arB - aiA*aiB;
+            Th_im[row * dchi + col] += arA*aiB + aiA*arB;
+        }
+    }
 
     /* ── Step 3: Apply gate G to physical indices ── */
-    /* Θ'[(kA',α),(kB',β)] = Σ_{kA,kB} G[kA'*D+kB', kA*D+kB] × Θ[(kA,α),(kB,β)] */
     double *Th2_re = (double *)calloc(dchi2, sizeof(double));
     double *Th2_im = (double *)calloc(dchi2, sizeof(double));
 
@@ -424,7 +427,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
 
     free(Th2_re); free(Th2_im);
 
-    /* ── Step 5: Write back to registers ── */
+    /* ── Step 5: Write back directly to registers ── */
 
     /* Normalize singular values */
     double sig_norm = 0;
@@ -434,21 +437,26 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
         for (int i = 0; i < chi; i++) sig[i] *= scale;
     }
 
-    /* A'[kA', α, γ] = U[(kA'*χ+α), γ]  — left-canonical */
-    mps_zero_site(sA);
+    /* A'[kA', α, γ] = U[(kA'*χ+α), γ] */
+    regA->num_nonzero = 0;
     for (int kA = 0; kA < D; kA++)
      for (int a = 0; a < chi; a++) {
          int row = kA * chi + a;
          for (int g = 0; g < chi; g++) {
              double re = U_re[row * chi + g];
              double im = U_im[row * chi + g];
-             if (re*re + im*im > 1e-30)
-                 mps_write_tensor(sA, kA, a, g, re, im);
+             if (re*re + im*im > 1e-30 && regA->num_nonzero < 4096) {
+                 uint64_t bs = (uint64_t)kA * chi2 + (uint64_t)a * chi + g;
+                 regA->entries[regA->num_nonzero].basis_state = bs;
+                 regA->entries[regA->num_nonzero].amp_re = re;
+                 regA->entries[regA->num_nonzero].amp_im = im;
+                 regA->num_nonzero++;
+             }
          }
      }
 
-    /* B'[kB', γ, β] = σ[γ] × V†[γ, (kB'*χ+β)]  — gauge on right */
-    mps_zero_site(sB);
+    /* B'[kB', γ, β] = σ[γ] × V†[γ, (kB'*χ+β)] */
+    regB->num_nonzero = 0;
     for (int kB = 0; kB < D; kB++)
      for (int g = 0; g < chi; g++) {
          double s = sig[g];
@@ -457,16 +465,19 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
              int col = kB * chi + b;
              double re = s * Vc_re[g * dchi + col];
              double im = s * Vc_im[g * dchi + col];
-             if (re*re + im*im > 1e-30)
-                 mps_write_tensor(sB, kB, g, b, re, im);
+             if (re*re + im*im > 1e-30 && regB->num_nonzero < 4096) {
+                 uint64_t bs = (uint64_t)kB * chi2 + (uint64_t)g * chi + b;
+                 regB->entries[regB->num_nonzero].basis_state = bs;
+                 regB->entries[regB->num_nonzero].amp_re = re;
+                 regB->entries[regB->num_nonzero].amp_im = im;
+                 regB->num_nonzero++;
+             }
          }
      }
 
     free(U_re); free(U_im);
     free(sig);
     free(Vc_re); free(Vc_im);
-    free(Ai_re); free(Ai_im);
-    free(Aj_re); free(Aj_im);
 
     /* ── Mirror to engine quhits ── */
     if (eng && quhits && sB < n)

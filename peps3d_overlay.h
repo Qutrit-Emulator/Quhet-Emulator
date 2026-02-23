@@ -22,24 +22,24 @@
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 #define TNS3D_D     6       /* Physical dimension (SU(6) native)          */
-#define TNS3D_CHI   6       /* Bond dimension — matches D, full register usage */
+#define TNS3D_CHI   12      /* Bond dimension per axis                    */
 
-/* Derived powers of D — for basis encoding (matches register dim=D) */
-#define TNS3D_D2    (TNS3D_D * TNS3D_D)                    /* 36  */
-#define TNS3D_D3    (TNS3D_D * TNS3D_D * TNS3D_D)          /* 216 */
-#define TNS3D_D4    (TNS3D_D2 * TNS3D_D2)                  /* 1296 */
-#define TNS3D_D5    (TNS3D_D2 * TNS3D_D3)                  /* 7776 */
-#define TNS3D_D6    (TNS3D_D3 * TNS3D_D3)                  /* 46656 */
-#define TNS3D_D7    (TNS3D_D6 * TNS3D_D)                   /* 279936 */
-#define TNS3D_TSIZ  TNS3D_D7  /* Full register basis space */
+/* Derived powers of χ — for basis encoding (register dim=χ) */
+#define TNS3D_C2    (TNS3D_CHI * TNS3D_CHI)                        /* 144    */
+#define TNS3D_C3    (TNS3D_CHI * TNS3D_CHI * TNS3D_CHI)            /* 1728   */
+#define TNS3D_C4    (TNS3D_C2 * TNS3D_C2)                          /* 20736  */
+#define TNS3D_C5    (TNS3D_C2 * TNS3D_C3)                          /* 248832 */
+#define TNS3D_C6    (TNS3D_C3 * TNS3D_C3)                          /* 2985984 */
+#define TNS3D_TSIZ  (TNS3D_D * TNS3D_C6)  /* D×χ⁶ = max basis+1 */
 
 /* 7-index tensor basis encoding: |k,u,d,l,r,f,b⟩
- * Register encodes: b + f*D + r*D² + l*D³ + d*D⁴ + u*D⁵ + k*D⁶
+ * k ∈ [0,D), bonds ∈ [0,χ)
+ * Register encodes: b + f*χ + r*χ² + l*χ³ + d*χ⁴ + u*χ⁵ + k*χ⁶
  * Position 0 = b (least sig), position 6 = k (most sig)
  * gate_1site operates at position 6 (physical index k) */
 #define T3D_IDX(k,u,d,l,r,f,b) \
-    ((k)*TNS3D_D6 + (u)*TNS3D_D5 + (d)*TNS3D_D4 + \
-     (l)*TNS3D_D3 + (r)*TNS3D_D2 + (f)*TNS3D_D + (b))
+    ((k)*TNS3D_C6 + (u)*TNS3D_C5 + (d)*TNS3D_C4 + \
+     (l)*TNS3D_C3 + (r)*TNS3D_C2 + (f)*TNS3D_CHI + (b))
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * DATA STRUCTURES — Magic Pointer based
