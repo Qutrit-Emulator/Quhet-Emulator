@@ -115,19 +115,81 @@ void peps_set_product_state(PepsGrid *grid, int x, int y,
  * 1-SITE GATE — Pure Magic Pointer: O(entries × D)
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
+struct tmp_entry { uint64_t basis; double re, im; };
+
+static int cmp_basis(const void *a, const void *b)
+{
+    const struct tmp_entry *ea = (const struct tmp_entry *)a;
+    const struct tmp_entry *eb = (const struct tmp_entry *)b;
+    if (ea->basis < eb->basis) return -1;
+    if (ea->basis > eb->basis) return 1;
+    return 0;
+}
+
 void peps_gate_1site(PepsGrid *grid, int x, int y,
                      const double *U_re, const double *U_im)
 {
     int site = y * grid->Lx + x;
 
-    /* ── Magic Pointer: gate via register — O(entries × D) ── */
-    if (grid->eng && grid->site_reg)
-        quhit_reg_apply_unitary_pos(grid->eng, grid->site_reg[site],
-                                    0, U_re, U_im);
+    /* ── Manual register-based 1-site gate on physical index k ── */
+    if (grid->eng && grid->site_reg) {
+        int reg_idx = grid->site_reg[site];
+        if (reg_idx >= 0) {
+            QuhitRegister *reg = &grid->eng->registers[reg_idx];
+            int D = PEPS_D;
 
-    /* ── Mirror to per-site quhit (marginal readout) ── */
-    if (grid->eng && grid->q_phys)
-        quhit_apply_unitary(grid->eng, grid->q_phys[site], U_re, U_im);
+            uint32_t max_out = reg->num_nonzero * D + 1;
+            if (max_out < 4096) max_out = 4096;
+            struct tmp_entry *tmp = calloc(max_out, sizeof(*tmp));
+            uint32_t nout = 0;
+
+            for (uint32_t e = 0; e < reg->num_nonzero; e++) {
+                uint64_t bs = reg->entries[e].basis_state;
+                double ar = reg->entries[e].amp_re;
+                double ai = reg->entries[e].amp_im;
+                int k = (int)(bs / PEPS_CHI4);
+                uint64_t bond = bs % PEPS_CHI4;
+
+                for (int kp = 0; kp < D; kp++) {
+                    double ur = U_re[kp * D + k];
+                    double ui = U_im[kp * D + k];
+                    double nr = ur * ar - ui * ai;
+                    double ni = ur * ai + ui * ar;
+                    if (nr*nr + ni*ni < 1e-10) continue;
+
+                    if (nout < max_out) {
+                        tmp[nout].basis = (uint64_t)kp * PEPS_CHI4 + bond;
+                        tmp[nout].re = nr;
+                        tmp[nout].im = ni;
+                        nout++;
+                    }
+                }
+            }
+
+            /* Sort by basis state to accumulate duplicates in O(K log K) */
+            qsort(tmp, nout, sizeof(struct tmp_entry), cmp_basis);
+
+            reg->num_nonzero = 0;
+            for (uint32_t t = 0; t < nout; t++) {
+                double acc_re = tmp[t].re;
+                double acc_im = tmp[t].im;
+                /* Accumulate duplicates */
+                while (t + 1 < nout && tmp[t+1].basis == tmp[t].basis) {
+                    t++;
+                    acc_re += tmp[t].re;
+                    acc_im += tmp[t].im;
+                }
+                if (acc_re*acc_re + acc_im*acc_im >= 1e-10 &&
+                    reg->num_nonzero < 4096) {
+                    reg->entries[reg->num_nonzero].basis_state = tmp[t].basis;
+                    reg->entries[reg->num_nonzero].amp_re = acc_re;
+                    reg->entries[reg->num_nonzero].amp_im = acc_im;
+                    reg->num_nonzero++;
+                }
+            }
+            free(tmp);
+        }
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -239,7 +301,7 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
     QuhitRegister *regA = &grid->eng->registers[grid->site_reg[sA]];
     QuhitRegister *regB = &grid->eng->registers[grid->site_reg[sB]];
 
-    int max_E = chi * chi;
+    int max_E = 144;
     uint64_t *uniq_envA = (uint64_t*)malloc(max_E * sizeof(uint64_t));
     uint64_t *uniq_envB = (uint64_t*)malloc(max_E * sizeof(uint64_t));
     int num_EA = 0, num_EB = 0;
@@ -367,10 +429,12 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
     free(Th2_re); free(Th2_im);
 
     /* ── 5. Update bond weight ── */
+    int rank = chi < svddim_B ? chi : svddim_B;
+    if (rank > svddim_A) rank = svddim_A;
     double sig_norm = 0;
-    for (int s = 0; s < chi; s++) sig_norm += sig[s];
+    for (int s = 0; s < rank; s++) sig_norm += sig[s];
     if (sig_norm > 1e-30)
-        for (int s = 0; s < chi; s++) hb_shared->w[s] = sig[s] / sig_norm;
+        for (int s = 0; s < rank; s++) hb_shared->w[s] = sig[s] / sig_norm;
 
     /* ── 6. Write back — preserving ALL bond values ── */
     regA->num_nonzero = 0;
@@ -383,11 +447,12 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
          int lA = (int)(env % chi);
          double invw = 1.0;
          if (wu_A[uA] > 1e-30) invw /= wu_A[uA];
+         if (wd_A[dA] > 1e-30) invw /= wd_A[dA];
          if (wl_A[lA] > 1e-30) invw /= wl_A[lA];
-         for (int g = 0; g < chi; g++) {
-             double re = U_re[row * chi + g] * invw;
-             double im = U_im[row * chi + g] * invw;
-             if (re*re + im*im > 1e-30 && regA->num_nonzero < 4096) {
+         for (int g = 0; g < rank; g++) {
+             double re = U_re[row * rank + g] * invw;
+             double im = U_im[row * rank + g] * invw;
+             if (re*re + im*im > 1e-10 && regA->num_nonzero < 4096) {
                  uint64_t bs = PT_IDX(kA, uA, dA, lA, g);
                  regA->entries[regA->num_nonzero].basis_state = bs;
                  regA->entries[regA->num_nonzero].amp_re = re;
@@ -406,12 +471,13 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
          int dB = (int)((env / chi) % chi);
          int rB = (int)(env % chi);
          double invw = 1.0;
+         if (wu_B[uB] > 1e-30) invw /= wu_B[uB];
          if (wd_B[dB] > 1e-30) invw /= wd_B[dB];
          if (wr_B[rB] > 1e-30) invw /= wr_B[rB];
-         for (int g = 0; g < chi; g++) {
+         for (int g = 0; g < rank; g++) {
              double re = Vc_re[g * svddim_B + col] * invw;
              double im = Vc_im[g * svddim_B + col] * invw;
-             if (re*re + im*im > 1e-30 && regB->num_nonzero < 4096) {
+             if (re*re + im*im > 1e-10 && regB->num_nonzero < 4096) {
                  uint64_t bs = PT_IDX(kB, uB, dB, g, rB);
                  regB->entries[regB->num_nonzero].basis_state = bs;
                  regB->entries[regB->num_nonzero].amp_re = re;
@@ -494,7 +560,7 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
     QuhitRegister *regA = &grid->eng->registers[grid->site_reg[sA]];
     QuhitRegister *regB = &grid->eng->registers[grid->site_reg[sB]];
 
-    int max_E = chi * chi;
+    int max_E = 144;
     uint64_t *uniq_envA = (uint64_t*)malloc(max_E * sizeof(uint64_t));
     uint64_t *uniq_envB = (uint64_t*)malloc(max_E * sizeof(uint64_t));
     int num_EA = 0, num_EB = 0;
@@ -625,10 +691,12 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
     free(Th2_re); free(Th2_im);
 
     /* ── 5. Update bond weight ── */
+    int rank = chi < svddim_B ? chi : svddim_B;
+    if (rank > svddim_A) rank = svddim_A;
     double sig_norm = 0;
-    for (int s = 0; s < chi; s++) sig_norm += sig[s];
+    for (int s = 0; s < rank; s++) sig_norm += sig[s];
     if (sig_norm > 1e-30)
-        for (int s = 0; s < chi; s++) vb_shared->w[s] = sig[s] / sig_norm;
+        for (int s = 0; s < rank; s++) vb_shared->w[s] = sig[s] / sig_norm;
 
     /* ── 6. Write back — preserving ALL bond values ── */
     regA->num_nonzero = 0;
@@ -640,12 +708,13 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
          int lA = (int)((env / chi) % chi);
          int rA = (int)(env % chi);
          double invw = 1.0;
+         if (wu_A[uA] > 1e-30) invw /= wu_A[uA];
          if (wl_A[lA] > 1e-30) invw /= wl_A[lA];
          if (wr_A[rA] > 1e-30) invw /= wr_A[rA];
-         for (int g = 0; g < chi; g++) {
-             double re = U_re[row * chi + g] * invw;
-             double im = U_im[row * chi + g] * invw;
-             if (re*re + im*im > 1e-30 && regA->num_nonzero < 4096) {
+         for (int g = 0; g < rank; g++) {
+             double re = U_re[row * rank + g] * invw;
+             double im = U_im[row * rank + g] * invw;
+             if (re*re + im*im > 1e-10 && regA->num_nonzero < 4096) {
                  uint64_t bs = PT_IDX(kA, uA, g, lA, rA);
                  regA->entries[regA->num_nonzero].basis_state = bs;
                  regA->entries[regA->num_nonzero].amp_re = re;
@@ -664,12 +733,13 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
          int lB = (int)((env / chi) % chi);
          int rB = (int)(env % chi);
          double invw = 1.0;
+         if (wd_B[dB] > 1e-30) invw /= wd_B[dB];
          if (wl_B[lB] > 1e-30) invw /= wl_B[lB];
          if (wr_B[rB] > 1e-30) invw /= wr_B[rB];
-         for (int g = 0; g < chi; g++) {
+         for (int g = 0; g < rank; g++) {
              double re = Vc_re[g * svddim_B + col] * invw;
              double im = Vc_im[g * svddim_B + col] * invw;
-             if (re*re + im*im > 1e-30 && regB->num_nonzero < 4096) {
+             if (re*re + im*im > 1e-10 && regB->num_nonzero < 4096) {
                  uint64_t bs = PT_IDX(kB, g, dB, lB, rB);
                  regB->entries[regB->num_nonzero].basis_state = bs;
                  regB->entries[regB->num_nonzero].amp_re = re;
@@ -713,7 +783,7 @@ void peps_local_density(PepsGrid *grid, int x, int y, double *probs)
 
     /* Iterate over sparse entries, extract physical digit (position 0) */
     for (uint32_t e = 0; e < r->num_nonzero; e++) {
-        uint32_t k = (uint32_t)(r->entries[e].basis_state % PEPS_D);
+        uint32_t k = (uint32_t)(r->entries[e].basis_state / PEPS_CHI4);
         double re = r->entries[e].amp_re;
         double im = r->entries[e].amp_im;
         double p = re * re + im * im;
