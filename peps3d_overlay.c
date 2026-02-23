@@ -135,7 +135,7 @@ void tns3d_set_product_state(Tns3dGrid *g, int x, int y, int z,
     g->eng->registers[reg].num_nonzero = 0;
     for (int k = 0; k < TNS3D_D; k++) {
         if (amps_re[k] * amps_re[k] + amps_im[k] * amps_im[k] > 1e-30)
-            quhit_reg_sv_set(g->eng, reg, (uint64_t)k, amps_re[k], amps_im[k]);
+            quhit_reg_sv_set(g->eng, reg, (uint64_t)k * TNS3D_C6, amps_re[k], amps_im[k]);
     }
 }
 
@@ -298,6 +298,7 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
     /* ── 2. Build Θ ── */
     int svddim_A = D * num_EA;
     int svddim_B = D * num_EB;
+
     size_t svd2 = (size_t)svddim_A * svddim_B;
     double *Th_re = (double *)calloc(svd2, sizeof(double));
     double *Th_im = (double *)calloc(svd2, sizeof(double));
@@ -343,6 +344,7 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
             Th_im[row * svddim_B + col] += arA*bi + aiA*br;
         }
     }
+
 
     /* ── 3. Apply Gate ── */
     double *Th2_re = (double *)calloc(svd2, sizeof(double));
