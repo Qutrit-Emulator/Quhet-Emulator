@@ -30,8 +30,8 @@
 
 /* ═══════════════ Constants ═══════════════ */
 
-#define HUBBARD_U      4.0    /* Onsite repulsion */
-#define HUBBARD_MU     2.0    /* Chemical potential (U/2 = half filling) */
+#define HUBBARD_U      8.0    /* Onsite repulsion */
+#define HUBBARD_MU     2.5    /* Chemical potential (less than U/2 for hole doping) */
 #define HUBBARD_T      1.0    /* Hopping amplitude */
 #define COOL_DTAU      0.1    /* Imaginary time step */
 #define COOL_STEPS     30     /* Number of Trotter steps */
@@ -239,11 +239,42 @@ static void print_observables(Tns3dGrid *g)
            tot_density / N, tot_double / N);
 }
 
+static void print_spatial_map(Tns3dGrid *g)
+{
+    printf("\n  ═══ SPATIAL CHARGE DENSITY MAP ⟨n_i⟩ ═══\n");
+    for (int y = g->Ly - 1; y >= 0; y--) {
+        printf("  y=%d |", y);
+        for (int x = 0; x < g->Lx; x++) {
+            double p[6]; tns3d_local_density(g, x, y, 0, p);
+            double density = p[1] + p[2] + 2.0 * p[3];
+            // Format to show high density as dark, low density as light
+            if (density > 0.9) printf(" ██ ");
+            else if (density > 0.7) printf(" ▓▓ ");
+            else if (density > 0.4) printf(" ▒▒ ");
+            else printf(" ░░ ");
+        }
+        printf("|\n");
+    }
+    printf("\n  ═══ SPATIAL SPIN MAP ⟨S^z_i⟩ ═══\n");
+    for (int y = g->Ly - 1; y >= 0; y--) {
+        printf("  y=%d |", y);
+        for (int x = 0; x < g->Lx; x++) {
+            double p[6]; tns3d_local_density(g, x, y, 0, p);
+            double sz = 0.5 * p[1] - 0.5 * p[2];
+            if (sz > 0.2) printf("  ↑ ");
+            else if (sz < -0.2) printf("  ↓ ");
+            else printf("  . ");
+        }
+        printf("|\n");
+    }
+}
+
 /* ═══════════════ Main ═══════════════ */
 
 int main(void)
 {
-    int Lx = 8, Ly = 8;
+    // 12x4 strips are ideal for observing 4-period charge stripes
+    int Lx = 12, Ly = 4;
     int Nsites = Lx * Ly;
 
     printf("╔══════════════════════════════════════════════════════════════╗\n");
@@ -308,6 +339,8 @@ int main(void)
     printf("  Calculated Ground State observables via %d PEPS Cooling steps.\n", COOL_STEPS);
     printf("  Total Time: %.2f seconds\n", total_time);
     
+    print_spatial_map(g);
+
     tns3d_free(g);
     free(onsite_re); free(onsite_im);
     free(hop_re); free(hop_im);
