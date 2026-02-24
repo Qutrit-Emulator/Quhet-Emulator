@@ -563,6 +563,37 @@ void tns3d_gate_z_all(Tns3dGrid *g, const double *G_re, const double *G_im)
     }
 }
 
+void tns3d_gate_1site_pos(Tns3dGrid *g, int x, int y, int z, const double *U_re, const double *U_im)
+{
+    if (x<0 || x>=g->Lx || y<0 || y>=g->Ly || z<0 || z>=g->Lz) return;
+    int site = (z * g->Ly + y) * g->Lx + x;
+    int reg = g->site_reg[site];
+    if (reg < 0) return;
+    quhit_reg_apply_unitary_pos(g->eng, reg, 0, U_re, U_im);
+}
+
+void tns3d_normalize_site(Tns3dGrid *g, int x, int y, int z)
+{
+    if (x<0 || x>=g->Lx || y<0 || y>=g->Ly || z<0 || z>=g->Lz) return;
+    int site = (z * g->Ly + y) * g->Lx + x;
+    int reg = g->site_reg[site];
+    if (reg < 0) return;
+    QuhitRegister *r = &g->eng->registers[reg];
+    
+    double n2 = 0;
+    for (uint32_t e = 0; e < r->num_nonzero; e++) {
+        n2 += r->entries[e].amp_re * r->entries[e].amp_re +
+              r->entries[e].amp_im * r->entries[e].amp_im;
+    }
+    if (n2 > 1e-20) {
+        double inv = 1.0 / sqrt(n2);
+        for (uint32_t e = 0; e < r->num_nonzero; e++) {
+            r->entries[e].amp_re *= inv;
+            r->entries[e].amp_im *= inv;
+        }
+    }
+}
+
 void tns3d_gate_1site_all(Tns3dGrid *g, const double *U_re, const double *U_im)
 {
     #ifdef _OPENMP

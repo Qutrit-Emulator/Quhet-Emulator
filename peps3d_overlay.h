@@ -93,6 +93,8 @@ void tns3d_local_density(Tns3dGrid *grid, int x, int y, int z, double *probs);
 void tns3d_gate_x_all(Tns3dGrid *grid, const double *G_re, const double *G_im);
 void tns3d_gate_y_all(Tns3dGrid *grid, const double *G_re, const double *G_im);
 void tns3d_gate_z_all(Tns3dGrid *grid, const double *G_re, const double *G_im);
+void tns3d_gate_1site_pos(Tns3dGrid *g, int x, int y, int z, const double *U_re, const double *U_im);
+void tns3d_normalize_site(Tns3dGrid *g, int x, int y, int z);
 void tns3d_gate_1site_all(Tns3dGrid *grid, const double *U_re, const double *U_im);
 void tns3d_trotter_step(Tns3dGrid *grid, const double *G_re, const double *G_im);
 
