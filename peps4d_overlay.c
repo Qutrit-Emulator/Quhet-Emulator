@@ -125,6 +125,10 @@ void tns4d_free(Tns4dGrid *g)
     free(g->y_bonds);
     free(g->z_bonds);
     free(g->w_bonds);
+    if (g->eng) {
+        quhit_engine_destroy(g->eng);
+        free(g->eng);
+    }
     free(g->q_phys);
     free(g->site_reg);
     free(g);
