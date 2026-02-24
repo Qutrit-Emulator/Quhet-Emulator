@@ -16,6 +16,10 @@ This utility will NOT function on ARM CPUs, for now.. because they use a somewha
 </p>
 
 <p align="center">
+  <a href="bitcoin:bc1qw98uqm5vr3p6upudm97dpevejgjpmx8mgw6cvt"><img src="https://img.shields.io/badge/Donate_BTC-bc1qw98uqm5vr3p6upudm97dpevejgjpmx8mgw6cvt-f7931a?logo=bitcoin&style=for-the-badge" alt="Donate Bitcoin"></a>
+</p>
+
+<p align="center">
   <strong>⬡ HEXSTATE ENGINE</strong>
 </p>
 
