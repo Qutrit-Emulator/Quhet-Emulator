@@ -96,7 +96,4 @@ void tns3d_gate_z_all(Tns3dGrid *grid, const double *G_re, const double *G_im);
 void tns3d_gate_1site_all(Tns3dGrid *grid, const double *U_re, const double *U_im);
 void tns3d_trotter_step(Tns3dGrid *grid, const double *G_re, const double *G_im);
 
-/* ═══════════════ PHASE 10: INTER-GRID (ADS/CFT) ═══════════════ */
-void tns3d_gate_intergrid(Tns3dGrid *gL, Tns3dGrid *gR, int site, const double *G_re, const double *G_im);
-
 #endif /* PEPS3D_OVERLAY_H */
