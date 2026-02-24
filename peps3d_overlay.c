@@ -427,10 +427,10 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
          uint64_t pure = (envB / bp[bond_B]) * bp[bond_B + 1] + (envB % bp[bond_B]);
          for (int gv = 0; gv < rank; gv++) {
              double s = sig[gv];
-             if (s < 1e-10) continue;
-             double re = s * Vc_re[gv * svddim_B + col];
-             double im = s * Vc_im[gv * svddim_B + col];
-             if (re*re + im*im < 1e-10) continue;
+             if (s < 1e-100) continue;
+             double re = sig_norm * Vc_re[gv * svddim_B + col];
+             double im = sig_norm * Vc_im[gv * svddim_B + col];
+             if (re*re + im*im < 1e-100) continue;
 
              uint64_t bs = kB * TNS3D_C6 + pure + gv * bp[bond_B];
              if (regB->num_nonzero < 4096) {
@@ -446,6 +446,11 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
     free(sig);
     free(Vc_re); free(Vc_im);
     free(uniq_envA); free(uniq_envB);
+
+    if (regA->num_nonzero == 0 || regB->num_nonzero == 0) {
+        printf("  [SVD TRUNCATION FAULT] sA=%d, sB=%d, axis=%d, EA=%d, EB=%d, rank=%d, sig_norm=%e\n", 
+               sA, sB, shared_axis, num_EA, num_EB, rank, sig_norm);
+    }
 }
 
 
@@ -503,8 +508,18 @@ void tns3d_local_density(Tns3dGrid *g, int x, int y, int z, double *probs)
 
     if (total > 1e-30)
         for (int k = 0; k < TNS3D_D; k++) probs[k] /= total;
-    else
+    else {
+        if (x == 3 && y == 3 && z == 3) {
+            printf("  [LOCAL DENSITY ZERO FAULT] x=3 y=3 z=3, total=%.1e, entries=%d\n", total, r->num_nonzero);
+            for (uint32_t e = 0; e < r->num_nonzero && e < 5; e++) {
+                uint64_t bs = r->entries[e].basis_state;
+                int k = (int)(bs / TNS3D_C6);
+                double p = r->entries[e].amp_re * r->entries[e].amp_re + r->entries[e].amp_im * r->entries[e].amp_im;
+                printf("    entry %d: k=%d, amp=(%.2e, %.2e), p=%.1e\n", e, k, r->entries[e].amp_re, r->entries[e].amp_im, p);
+            }
+        }
         probs[0] = 1.0;
+    }
 }
 
 /* ═══════════════ BATCH GATE APPLICATION ═══════════════ */

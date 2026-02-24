@@ -35,13 +35,13 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
         for (int i = 0; i < n; i++)
             for (int j = i + 1; j < n; j++)
                 off += H_re[i*n+j]*H_re[i*n+j] + H_im[i*n+j]*H_im[i*n+j];
-        if (off < 1e-28 * n * n) break;
+        if (off < 1e-100 * n * n) break;
 
         for (int p = 0; p < n; p++)
          for (int q = p + 1; q < n; q++) {
              double apr = H_re[p*n+q], api = H_im[p*n+q];
              double mag = sqrt(apr*apr + api*api);
-             if (mag < 1e-30) continue;
+             if (mag < 1e-100) continue;
 
              double hpp = H_re[p*n+p], hqq = H_re[q*n+q];
              double tau = (hqq - hpp) / (2.0 * mag);
@@ -162,7 +162,7 @@ static void tsvd_truncated(const double *M_re, const double *M_im,
     memset(U_im, 0, (size_t)m * rank * sizeof(double));
 
     for (int j = 0; j < rank; j++) {
-        if (sigma[j] < 1e-30) continue;
+        if (sigma[j] < 1e-100) continue;
         double inv = 1.0 / sigma[j];
         for (int i = 0; i < m; i++) {
             double sr = 0, si = 0;
