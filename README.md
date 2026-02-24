@@ -24,6 +24,13 @@ This utility will NOT function on ARM CPUs, for now.. because they use a somewha
 </p>
 
 ---
+<p align="center">
+# An Open Letter to QDX (and others)
+</p>
+On the off-chance you didn't already incorporate my code in some form in your project, feel free to take whatever you need from it if it can improve your software. I am uninterested in selling it or receiving any form of credit; that is why it is available under the MIT license.
+
+I realize I didn't include explicit license headers in the source files of my project, just the README specifying MIT. So I am going to go ahead now and explicitly grant you complete permission to use it as you see fit.
+
 
 ## What Is This?
 
