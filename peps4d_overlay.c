@@ -55,7 +55,7 @@ static void tns4d_reg_write(Tns4dGrid *g, int site,
     r->num_nonzero = 0;
     for (uint64_t bs = 0; bs < (uint64_t)TNS4D_TSIZ; bs++) {
         if (T_re[bs]*T_re[bs] + T_im[bs]*T_im[bs] > 1e-30) {
-            if (r->num_nonzero < r->max_entries) {
+            if (r->num_nonzero < 4096) {
                 r->entries[r->num_nonzero].basis_state = bs;
                 r->entries[r->num_nonzero].amp_re = T_re[bs];
                 r->entries[r->num_nonzero].amp_im = T_im[bs];
@@ -120,14 +120,6 @@ Tns4dGrid *tns4d_init(int Lx, int Ly, int Lz, int Lw)
 void tns4d_free(Tns4dGrid *g)
 {
     if (!g) return;
-    int N = g->Lx * g->Ly * g->Lz * g->Lw;
-    for (int i = 0; i < N; i++) {
-        if (g->site_reg[i] >= 0)
-            quhit_reg_free(g->eng, g->site_reg[i]);
-        quhit_free(g->eng, g->q_phys[i]);
-    }
-    quhit_engine_destroy(g->eng);
-    free(g->eng);
     free(g->tensors);
     free(g->x_bonds);
     free(g->y_bonds);
@@ -236,7 +228,7 @@ void tns4d_gate_1site(Tns4dGrid *g, int x, int y, int z, int w,
     r->num_nonzero = 0;
     for (size_t i = 0; i < ntmp; i++) {
         if (tmp[i].re*tmp[i].re + tmp[i].im*tmp[i].im < 1e-30) continue;
-        if (r->num_nonzero < r->max_entries) {
+        if (r->num_nonzero < 4096) {
             r->entries[r->num_nonzero].basis_state = tmp[i].basis;
             r->entries[r->num_nonzero].amp_re = tmp[i].re;
             r->entries[r->num_nonzero].amp_im = tmp[i].im;
