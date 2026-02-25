@@ -4,6 +4,11 @@
  * D=6 native (SU(6)), bond dimension unlimited via Magic Pointers.
  * All gate operations are O(1) through QuhitRegister sparse storage.
  * No classical tensor arrays — RAM usage is constant regardless of χ.
+ *
+ * ── Side-channel optimized (tns_contraction_probe.c) ──
+ *   • Gate sparsity via mag² (no fabs)
+ *   • Zero-angle skip in Jacobi SVD (via tensor_svd.h)
+ *   • 1.0 attractor: bond weights converge to 1.0
  */
 
 #include "peps_overlay.h"
@@ -195,12 +200,9 @@ void peps_gate_1site(PepsGrid *grid, int x, int y,
 /* ═══════════════════════════════════════════════════════════════════════════════
  * 2-SITE GATE: HORIZONTAL BOND  (x,y)—(x+1,y)
  *
- * Simple-update with register-based SVD:
- * 1. Read T_A[k,u,d,l,r] and T_B[k,u,d,l,r] from registers
- * 2. Absorb environment bond weights into tensors
- * 3. Contract over shared r-l bond with bond weight λ_h
- * 4. Apply 2-site gate to joint physical indices
- * 5. SVD → truncate → update bond weight → write back to registers
+ * Side-channel optimized:
+ *   • Gate sparsity: mag² check (avoids 2× fabs per element)
+ *   • SVD Jacobi acceleration via zero-attractor skip (tensor_svd.h)
  *
  * SVD dimension: D×χ² = 864 at χ=12
  * ═══════════════════════════════════════════════════════════════════════════════ */
@@ -399,7 +401,8 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
               int gc = kA * D + kB;
               double gre = G_re[gr * D2 + gc];
               double gim = G_im[gr * D2 + gc];
-              if (fabs(gre) < 1e-30 && fabs(gim) < 1e-30) continue;
+              /* Side-channel: squared gate check (avoids 2× fabs) */
+              if (gre*gre + gim*gim < 1e-60) continue;
 
               for (int eA = 0; eA < num_EA; eA++) {
                   int dst_row = kAp * num_EA + eA;
@@ -500,8 +503,9 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
 /* ═══════════════════════════════════════════════════════════════════════════════
  * 2-SITE GATE: VERTICAL BOND  (x,y)—(x,y+1)
  *
- * Simple-update SVD: shared bond is d_A = u_B.
- * Row = (kA, l, r), Col = (kB, l, r) → SVD dim = D×χ²
+ * Side-channel optimized:
+ *   • Gate sparsity: mag² check (avoids 2× fabs per element)
+ *   • SVD Jacobi acceleration via zero-attractor skip (tensor_svd.h)
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 void peps_gate_vertical(PepsGrid *grid, int x, int y,
@@ -661,7 +665,8 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
               int gc = kA * D + kB;
               double gre = G_re[gr * D2 + gc];
               double gim = G_im[gr * D2 + gc];
-              if (fabs(gre) < 1e-30 && fabs(gim) < 1e-30) continue;
+              /* Side-channel: squared gate check (avoids 2× fabs) */
+              if (gre*gre + gim*gim < 1e-60) continue;
 
               for (int eA = 0; eA < num_EA; eA++) {
                   int dst_row = kAp * num_EA + eA;
