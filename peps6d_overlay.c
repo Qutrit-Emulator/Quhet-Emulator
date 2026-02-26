@@ -184,7 +184,7 @@ static void tns6d_gate_2site_generic(Tns6dGrid *g, int sA, int sB,
     QuhitRegister *regA=&g->eng->registers[g->site_reg[sA]];
     QuhitRegister *regB=&g->eng->registers[g->site_reg[sB]];
 
-    int max_E=chi*chi;
+    int max_E=chi;
     uint64_t *ueA=(uint64_t*)malloc(max_E*sizeof(uint64_t));
     uint64_t *ueB=(uint64_t*)malloc(max_E*sizeof(uint64_t));
     int nEA=0, nEB=0;
