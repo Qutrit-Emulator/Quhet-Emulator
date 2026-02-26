@@ -25,21 +25,22 @@
 /* ═══════════════ CONSTANTS ═══════════════ */
 
 #define TNS5D_D    6       /* Physical dimension (SU(6)) */
-#define TNS5D_CHI  64ULL   /* Max χ for 10 bonds: 6×64^10 = 6×2^60 fits uint64 */
+#define TNS5D_CHI  128ULL  /* Bond dimension per axis */
 
 /* Cumulative products for 11-index encoding (derived from CHI):
  * basis = k*C10 + b9*C9 + b8*C8 + ... + b1*C1 + b0
+ * NOTE: C10 = 128^10 = 2^70, requires basis_t (128-bit)
  */
-#define TNS5D_C1   (TNS5D_CHI)
-#define TNS5D_C2   (TNS5D_CHI * TNS5D_CHI)
+#define TNS5D_C1   ((unsigned __int128)TNS5D_CHI)
+#define TNS5D_C2   (TNS5D_C1 * TNS5D_CHI)
 #define TNS5D_C3   (TNS5D_C2 * TNS5D_CHI)
-#define TNS5D_C4   (TNS5D_C2 * TNS5D_C2)
-#define TNS5D_C5   (TNS5D_C3 * TNS5D_C2)
-#define TNS5D_C6   (TNS5D_C3 * TNS5D_C3)
-#define TNS5D_C7   (TNS5D_C4 * TNS5D_C3)
-#define TNS5D_C8   (TNS5D_C4 * TNS5D_C4)
-#define TNS5D_C9   (TNS5D_C5 * TNS5D_C4)
-#define TNS5D_C10  (TNS5D_C5 * TNS5D_C5)
+#define TNS5D_C4   (TNS5D_C3 * TNS5D_CHI)
+#define TNS5D_C5   (TNS5D_C4 * TNS5D_CHI)
+#define TNS5D_C6   (TNS5D_C5 * TNS5D_CHI)
+#define TNS5D_C7   (TNS5D_C6 * TNS5D_CHI)
+#define TNS5D_C8   (TNS5D_C7 * TNS5D_CHI)
+#define TNS5D_C9   (TNS5D_C8 * TNS5D_CHI)
+#define TNS5D_C10  (TNS5D_C9 * TNS5D_CHI)
 #define TNS5D_TSIZ (TNS5D_D * TNS5D_C10)
 
 /* ═══════════════ DATA STRUCTURES ═══════════════ */
