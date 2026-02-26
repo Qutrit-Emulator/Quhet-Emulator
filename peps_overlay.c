@@ -48,12 +48,14 @@ PepsGrid *peps_init(int Lx, int Ly)
     g->h_bonds = (PepsBondWeight *)calloc(Ly * (Lx - 1), sizeof(PepsBondWeight));
     g->v_bonds = (PepsBondWeight *)calloc((Ly - 1) * Lx, sizeof(PepsBondWeight));
 
-    for (int i = 0; i < Ly * (Lx - 1); i++)
-        for (int s = 0; s < PEPS_CHI; s++)
-            g->h_bonds[i].w[s] = 1.0;
-    for (int i = 0; i < (Ly - 1) * Lx; i++)
-        for (int s = 0; s < PEPS_CHI; s++)
-            g->v_bonds[i].w[s] = 1.0;
+    for (int i = 0; i < Ly * (Lx - 1); i++) {
+        g->h_bonds[i].w = (double *)calloc((size_t)PEPS_CHI, sizeof(double));
+        for (int s = 0; s < (int)PEPS_CHI; s++) g->h_bonds[i].w[s] = 1.0;
+    }
+    for (int i = 0; i < (Ly - 1) * Lx; i++) {
+        g->v_bonds[i].w = (double *)calloc((size_t)PEPS_CHI, sizeof(double));
+        for (int s = 0; s < (int)PEPS_CHI; s++) g->v_bonds[i].w[s] = 1.0;
+    }
 
     /* ── Magic Pointer: allocate engine ── */
     g->eng = (QuhitEngine *)calloc(1, sizeof(QuhitEngine));
@@ -84,6 +86,10 @@ void peps_free(PepsGrid *grid)
 {
     if (!grid) return;
     free(grid->tensors);
+    int nb_h = grid->Ly * (grid->Lx - 1);
+    int nb_v = (grid->Ly - 1) * grid->Lx;
+    for (int i = 0; i < nb_h; i++) free(grid->h_bonds[i].w);
+    for (int i = 0; i < nb_v; i++) free(grid->v_bonds[i].w);
     free(grid->h_bonds);
     free(grid->v_bonds);
     if (grid->eng) {
@@ -216,7 +222,7 @@ static void peps_reg_read_dense(PepsGrid *grid, int site,
                                 double *T_re, double *T_im)
 {
     int reg = grid->site_reg[site];
-    int chi = PEPS_CHI;
+    int chi = (int)PEPS_CHI;
     size_t tsz = (size_t)PEPS_D * PEPS_CHI4;
     memset(T_re, 0, tsz * sizeof(double));
     memset(T_im, 0, tsz * sizeof(double));
@@ -252,7 +258,7 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
 {
     int sA = y * grid->Lx + x;
     int sB = y * grid->Lx + (x + 1);
-    int D = PEPS_D, chi = PEPS_CHI;
+    int D = PEPS_D, chi = (int)PEPS_CHI;
     int chi2 = chi * chi;
     int svddim = D * chi2;  /* 864 */
 
@@ -513,7 +519,7 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
 {
     int sA = y * grid->Lx + x;
     int sB = (y + 1) * grid->Lx + x;
-    int D = PEPS_D, chi = PEPS_CHI;
+    int D = PEPS_D, chi = (int)PEPS_CHI;
     int chi2 = chi * chi;
     int svddim = D * chi2;
 
