@@ -363,7 +363,7 @@ static void tns5d_gate_2site_generic(Tns5dGrid *g,
     double *Vc_re = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
     double *Vc_im = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
 
-    tsvd_truncated(Th2_re, Th2_im, svddim_A, svddim_B, chi,
+    tsvd_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B, chi,
                    U_re, U_im, sig, Vc_re, Vc_im);
     free(Th2_re); free(Th2_im);
 
