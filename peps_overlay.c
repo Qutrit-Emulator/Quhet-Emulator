@@ -262,10 +262,14 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
     int chi2 = chi * chi;
     int svddim = D * chi2;  /* 864 */
 
-    /* ── 1. Bond weights ── */
-    double wu_A[PEPS_CHI], wd_A[PEPS_CHI], wl_A[PEPS_CHI];
-    double wu_B[PEPS_CHI], wd_B[PEPS_CHI], wr_B[PEPS_CHI];
-    double wh[PEPS_CHI];
+    /* ── 1. Bond weights (heap to avoid stack overflow at high χ) ── */
+    double *wu_A = (double*)calloc(chi, sizeof(double));
+    double *wd_A = (double*)calloc(chi, sizeof(double));
+    double *wl_A = (double*)calloc(chi, sizeof(double));
+    double *wu_B = (double*)calloc(chi, sizeof(double));
+    double *wd_B = (double*)calloc(chi, sizeof(double));
+    double *wr_B = (double*)calloc(chi, sizeof(double));
+    double *wh   = (double*)calloc(chi, sizeof(double));
 
     if (y > 0) {
         PepsBondWeight *vb = peps_vbond(grid, x, y - 1);
@@ -504,6 +508,10 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
     /* Mirror to engine quhits */
     if (grid->eng && grid->q_phys)
         quhit_apply_cz(grid->eng, grid->q_phys[sA], grid->q_phys[sB]);
+
+    free(wu_A); free(wd_A); free(wl_A);
+    free(wu_B); free(wd_B); free(wr_B);
+    free(wh);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -523,10 +531,14 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
     int chi2 = chi * chi;
     int svddim = D * chi2;
 
-    /* ── 1. Bond weights ── */
-    double wu_A[PEPS_CHI], wl_A[PEPS_CHI], wr_A[PEPS_CHI];
-    double wd_B[PEPS_CHI], wl_B[PEPS_CHI], wr_B[PEPS_CHI];
-    double wv[PEPS_CHI];
+    /* ── 1. Bond weights (heap) ── */
+    double *wu_A = (double*)calloc(chi, sizeof(double));
+    double *wl_A = (double*)calloc(chi, sizeof(double));
+    double *wr_A = (double*)calloc(chi, sizeof(double));
+    double *wd_B = (double*)calloc(chi, sizeof(double));
+    double *wl_B = (double*)calloc(chi, sizeof(double));
+    double *wr_B = (double*)calloc(chi, sizeof(double));
+    double *wv   = (double*)calloc(chi, sizeof(double));
 
     if (y > 0) {
         PepsBondWeight *vb = peps_vbond(grid, x, y - 1);
@@ -768,6 +780,10 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
     /* Mirror to engine quhits */
     if (grid->eng && grid->q_phys)
         quhit_apply_cz(grid->eng, grid->q_phys[sA], grid->q_phys[sB]);
+
+    free(wu_A); free(wl_A); free(wr_A);
+    free(wd_B); free(wl_B); free(wr_B);
+    free(wv);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
