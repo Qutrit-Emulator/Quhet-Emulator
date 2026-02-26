@@ -274,6 +274,11 @@ static void tns6d_gate_2site_generic(Tns6dGrid *g, int sA, int sB,
     free(T2r);free(T2i);
 
     int rank=chi<sdB?chi:sdB; if(rank>sdA) rank=sdA;
+    /* Cap rank so write-back stays within 4096-entry register limit */
+    int max_env=nEA>nEB?nEA:nEB;
+    int rank_cap=max_env>0?4096/(D*max_env):rank;
+    if(rank_cap<1) rank_cap=1;
+    if(rank>rank_cap) rank=rank_cap;
     double sn=0; for(int s=0;s<rank;s++) sn+=sig[s];
     /* Side-channel: 1.0 attractor CONFIRMED — bond weights lock at 1.0 */
     for(int s=0;s<(int)TNS6D_CHI;s++) bw->w[s]=1.0;
