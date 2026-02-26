@@ -43,8 +43,8 @@ static void tns4d_reg_read(Tns4dGrid *g, int site, double *T_re, double *T_im)
     if (reg < 0 || !g->eng) return;
     QuhitRegister *r = &g->eng->registers[reg];
     for (uint32_t e = 0; e < r->num_nonzero; e++) {
-        uint64_t bs = r->entries[e].basis_state;
-        if (bs < (uint64_t)TNS4D_TSIZ) {
+        basis_t bs = r->entries[e].basis_state;
+        if (bs < (basis_t)TNS4D_TSIZ) {
             T_re[bs] = r->entries[e].amp_re;
             T_im[bs] = r->entries[e].amp_im;
         }
@@ -58,7 +58,7 @@ static void tns4d_reg_write(Tns4dGrid *g, int site,
     if (reg < 0 || !g->eng) return;
     QuhitRegister *r = &g->eng->registers[reg];
     r->num_nonzero = 0;
-    for (uint64_t bs = 0; bs < (uint64_t)TNS4D_TSIZ; bs++) {
+    for (basis_t bs = 0; bs < (basis_t)TNS4D_TSIZ; bs++) {
         if (T_re[bs]*T_re[bs] + T_im[bs]*T_im[bs] > 1e-30) {
             if (r->num_nonzero < 4096) {
                 r->entries[r->num_nonzero].basis_state = bs;
@@ -169,7 +169,7 @@ void tns4d_set_product_state(Tns4dGrid *g, int x, int y, int z, int w,
     for (int k = 0; k < TNS4D_D; k++) {
         double re = amps_re[k], im = amps_im[k];
         if (re*re + im*im > 1e-30) {
-            r->entries[r->num_nonzero].basis_state = (uint64_t)k * TNS4D_C8;
+            r->entries[r->num_nonzero].basis_state = (basis_t)k * TNS4D_C8;
             r->entries[r->num_nonzero].amp_re = re;
             r->entries[r->num_nonzero].amp_im = im;
             r->num_nonzero++;
@@ -179,11 +179,11 @@ void tns4d_set_product_state(Tns4dGrid *g, int x, int y, int z, int w,
 
 /* ═══════════════ 1-SITE GATE ═══════════════ */
 
-struct tmp4d_entry { uint64_t basis; double re, im; };
+struct tmp4d_entry { basis_t basis; double re, im; };
 
 static int cmp4d_basis(const void *a, const void *b) {
-    uint64_t ba = ((const struct tmp4d_entry *)a)->basis;
-    uint64_t bb = ((const struct tmp4d_entry *)b)->basis;
+    basis_t ba = ((const struct tmp4d_entry *)a)->basis;
+    basis_t bb = ((const struct tmp4d_entry *)b)->basis;
     return (ba > bb) - (ba < bb);
 }
 
@@ -200,7 +200,7 @@ void tns4d_gate_1site(Tns4dGrid *g, int x, int y, int z, int w,
     if (old_nnz == 0) return;
 
     /* Save old sparse entries */
-    uint64_t *old_bs = (uint64_t *)malloc(old_nnz * sizeof(uint64_t));
+    basis_t *old_bs = (basis_t *)malloc(old_nnz * sizeof(basis_t));
     double   *old_re = (double *)malloc(old_nnz * sizeof(double));
     double   *old_im = (double *)malloc(old_nnz * sizeof(double));
     for (uint32_t e = 0; e < old_nnz; e++) {
@@ -215,9 +215,9 @@ void tns4d_gate_1site(Tns4dGrid *g, int x, int y, int z, int w,
     size_t ntmp = 0;
 
     for (uint32_t e = 0; e < old_nnz; e++) {
-        uint64_t bs_old = old_bs[e];
+        basis_t bs_old = old_bs[e];
         int k_old = (int)(bs_old / TNS4D_C8);
-        uint64_t bond_part = bs_old % TNS4D_C8;
+        basis_t bond_part = bs_old % TNS4D_C8;
 
         for (int k_new = 0; k_new < D; k_new++) {
             double ure = U_re[k_new * D + k_old];
@@ -227,7 +227,7 @@ void tns4d_gate_1site(Tns4dGrid *g, int x, int y, int z, int w,
             double tre = ure * old_re[e] - uim * old_im[e];
             double tim = ure * old_im[e] + uim * old_re[e];
 
-            uint64_t new_bs = (uint64_t)k_new * TNS4D_C8 + bond_part;
+            basis_t new_bs = (basis_t)k_new * TNS4D_C8 + bond_part;
 
             /* Try to accumulate */
             int found = 0;
@@ -281,7 +281,7 @@ static void tns4d_gate_2site_generic(Tns4dGrid *g,
                                      const double *G_re, const double *G_im)
 {
     int D = TNS4D_D, chi = (int)TNS4D_CHI;
-    uint64_t bp[9] = {1, TNS4D_CHI, TNS4D_C2, TNS4D_C3, TNS4D_C4,
+    basis_t bp[9] = {1, TNS4D_CHI, TNS4D_C2, TNS4D_C3, TNS4D_C4,
                       TNS4D_C5, TNS4D_C6, TNS4D_C7, TNS4D_C8};
 
     int bond_A = -1, bond_B = -1;
@@ -295,13 +295,13 @@ static void tns4d_gate_2site_generic(Tns4dGrid *g,
 
     /* ── 1. Find Sparse-Rank Environment ── */
     int max_E = chi;
-    uint64_t *uniq_envA = (uint64_t*)malloc(max_E * sizeof(uint64_t));
-    uint64_t *uniq_envB = (uint64_t*)malloc(max_E * sizeof(uint64_t));
+    basis_t *uniq_envA = (basis_t*)malloc(max_E * sizeof(basis_t));
+    basis_t *uniq_envB = (basis_t*)malloc(max_E * sizeof(basis_t));
     int num_EA = 0, num_EB = 0;
 
     for (uint32_t eA = 0; eA < regA->num_nonzero; eA++) {
-        uint64_t pure = regA->entries[eA].basis_state % TNS4D_C8;
-        uint64_t env = (pure / bp[bond_A + 1]) * bp[bond_A] + (pure % bp[bond_A]);
+        basis_t pure = regA->entries[eA].basis_state % TNS4D_C8;
+        basis_t env = (pure / bp[bond_A + 1]) * bp[bond_A] + (pure % bp[bond_A]);
         int found = 0;
         for (int i = 0; i < num_EA; i++) {
             if (uniq_envA[i] == env) { found = 1; break; }
@@ -310,8 +310,8 @@ static void tns4d_gate_2site_generic(Tns4dGrid *g,
     }
 
     for (uint32_t eB = 0; eB < regB->num_nonzero; eB++) {
-        uint64_t pure = regB->entries[eB].basis_state % TNS4D_C8;
-        uint64_t env = (pure / bp[bond_B + 1]) * bp[bond_B] + (pure % bp[bond_B]);
+        basis_t pure = regB->entries[eB].basis_state % TNS4D_C8;
+        basis_t env = (pure / bp[bond_B + 1]) * bp[bond_B] + (pure % bp[bond_B]);
         int found = 0;
         for (int i = 0; i < num_EB; i++) {
             if (uniq_envB[i] == env) { found = 1; break; }
@@ -333,15 +333,15 @@ static void tns4d_gate_2site_generic(Tns4dGrid *g,
     double *Th_im = (double *)calloc(svd2, sizeof(double));
 
     for (uint32_t eA = 0; eA < regA->num_nonzero; eA++) {
-        uint64_t bsA = regA->entries[eA].basis_state;
+        basis_t bsA = regA->entries[eA].basis_state;
         double arA = regA->entries[eA].amp_re;
         double aiA = regA->entries[eA].amp_im;
         if (arA*arA + aiA*aiA < 1e-10) continue;
 
         int kA = (int)(bsA / TNS4D_C8);
-        uint64_t pureA = bsA % TNS4D_C8;
+        basis_t pureA = bsA % TNS4D_C8;
         int shared_valA = (int)((pureA / bp[bond_A]) % chi);
-        uint64_t envA = (pureA / bp[bond_A + 1]) * bp[bond_A] + (pureA % bp[bond_A]);
+        basis_t envA = (pureA / bp[bond_A + 1]) * bp[bond_A] + (pureA % bp[bond_A]);
 
         int idx_EA = -1;
         for (int i = 0; i < num_EA; i++) if (uniq_envA[i] == envA) { idx_EA = i; break; }
@@ -349,17 +349,17 @@ static void tns4d_gate_2site_generic(Tns4dGrid *g,
         int row = kA * num_EA + idx_EA;
 
         for (uint32_t eB = 0; eB < regB->num_nonzero; eB++) {
-            uint64_t bsB = regB->entries[eB].basis_state;
+            basis_t bsB = regB->entries[eB].basis_state;
             double arB = regB->entries[eB].amp_re;
             double aiB = regB->entries[eB].amp_im;
             if (arB*arB + aiB*aiB < 1e-10) continue;
 
-            uint64_t pureB = bsB % TNS4D_C8;
+            basis_t pureB = bsB % TNS4D_C8;
             int shared_valB = (int)((pureB / bp[bond_B]) % chi);
             if (shared_valA != shared_valB) continue;
 
             int kB = (int)(bsB / TNS4D_C8);
-            uint64_t envB = (pureB / bp[bond_B + 1]) * bp[bond_B] + (pureB % bp[bond_B]);
+            basis_t envB = (pureB / bp[bond_B + 1]) * bp[bond_B] + (pureB % bp[bond_B]);
 
             int idx_EB = -1;
             for (int i = 0; i < num_EB; i++) if (uniq_envB[i] == envB) { idx_EB = i; break; }
@@ -440,15 +440,15 @@ static void tns4d_gate_2site_generic(Tns4dGrid *g,
     for (int kA = 0; kA < D; kA++)
      for (int eA = 0; eA < num_EA; eA++) {
          int row = kA * num_EA + eA;
-         uint64_t envA = uniq_envA[eA];
-         uint64_t pure = (envA / bp[bond_A]) * bp[bond_A + 1] + (envA % bp[bond_A]);
+         basis_t envA = uniq_envA[eA];
+         basis_t pure = (envA / bp[bond_A]) * bp[bond_A + 1] + (envA % bp[bond_A]);
          for (int gv = 0; gv < rank; gv++) {
              double weight = (sig_norm > 1e-30 && sig[gv] > 1e-30) ? sqrt(sig[gv] / sig_norm) : 0.0;
              double re = U_re[row * rank + gv] * weight;
              double im = U_im[row * rank + gv] * weight;
              if (re*re + im*im < 1e-50) continue;
 
-             uint64_t bs = kA * TNS4D_C8 + pure + gv * bp[bond_A];
+             basis_t bs = kA * TNS4D_C8 + pure + gv * bp[bond_A];
              if (regA->num_nonzero < 4096) {
                  regA->entries[regA->num_nonzero].basis_state = bs;
                  regA->entries[regA->num_nonzero].amp_re = re;
@@ -461,15 +461,15 @@ static void tns4d_gate_2site_generic(Tns4dGrid *g,
     for (int kB = 0; kB < D; kB++)
      for (int eB = 0; eB < num_EB; eB++) {
          int col = kB * num_EB + eB;
-         uint64_t envB = uniq_envB[eB];
-         uint64_t pure = (envB / bp[bond_B]) * bp[bond_B + 1] + (envB % bp[bond_B]);
+         basis_t envB = uniq_envB[eB];
+         basis_t pure = (envB / bp[bond_B]) * bp[bond_B + 1] + (envB % bp[bond_B]);
          for (int gv = 0; gv < rank; gv++) {
              double weight = (sig_norm > 1e-30 && sig[gv] > 1e-30) ? sqrt(sig[gv] / sig_norm) : 0.0;
              double re = weight * Vc_re[gv * svddim_B + col];
              double im = weight * Vc_im[gv * svddim_B + col];
              if (re*re + im*im < 1e-50) continue;
 
-             uint64_t bs = kB * TNS4D_C8 + pure + gv * bp[bond_B];
+             basis_t bs = kB * TNS4D_C8 + pure + gv * bp[bond_B];
              if (regB->num_nonzero < 4096) {
                  regB->entries[regB->num_nonzero].basis_state = bs;
                  regB->entries[regB->num_nonzero].amp_re = re;
@@ -535,7 +535,7 @@ void tns4d_local_density(Tns4dGrid *g, int x, int y, int z, int w, double *probs
     double total = 0;
 
     for (uint32_t e = 0; e < r->num_nonzero; e++) {
-        uint64_t bs = r->entries[e].basis_state;
+        basis_t bs = r->entries[e].basis_state;
         int k = (int)(bs / TNS4D_C8);
         if (k >= TNS4D_D) continue;
         double re = r->entries[e].amp_re;
