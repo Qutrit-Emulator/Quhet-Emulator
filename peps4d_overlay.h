@@ -24,17 +24,17 @@
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 #define TNS4D_D     6       /* Physical dimension (SU(6) native)          */
-#define TNS4D_CHI   3       /* Bond dimension per axis (8 bonds → χ³ feasible) */
+#define TNS4D_CHI   128ULL  /* Bond dimension per axis (8 bonds → χ³ feasible) */
 
-/* Derived powers of χ — for basis encoding */
-#define TNS4D_C2    (TNS4D_CHI * TNS4D_CHI)                              /*     9  */
-#define TNS4D_C3    (TNS4D_CHI * TNS4D_CHI * TNS4D_CHI)                  /*    27  */
-#define TNS4D_C4    (TNS4D_C2 * TNS4D_C2)                                /*    81  */
-#define TNS4D_C5    (TNS4D_C2 * TNS4D_C3)                                /*   243  */
-#define TNS4D_C6    (TNS4D_C3 * TNS4D_C3)                                /*   729  */
-#define TNS4D_C7    (TNS4D_C3 * TNS4D_C4)                                /*  2187  */
-#define TNS4D_C8    (TNS4D_C4 * TNS4D_C4)                                /*  6561  */
-#define TNS4D_TSIZ  (TNS4D_D * TNS4D_C8)  /* D×χ⁸ = 39366 max basis+1   */
+/* Derived powers of χ — for basis encoding (ULL to prevent overflow) */
+#define TNS4D_C2    (TNS4D_CHI * TNS4D_CHI)
+#define TNS4D_C3    (TNS4D_CHI * TNS4D_CHI * TNS4D_CHI)
+#define TNS4D_C4    (TNS4D_C2 * TNS4D_C2)
+#define TNS4D_C5    (TNS4D_C2 * TNS4D_C3)
+#define TNS4D_C6    (TNS4D_C3 * TNS4D_C3)
+#define TNS4D_C7    (TNS4D_C3 * TNS4D_C4)
+#define TNS4D_C8    (TNS4D_C4 * TNS4D_C4)
+#define TNS4D_TSIZ  (TNS4D_D * TNS4D_C8)  /* D×χ⁸ max basis+1   */
 
 /* 9-index tensor basis encoding: |k,u,d,l,r,f,b,i,o⟩
  *   k ∈ [0,D), bonds ∈ [0,χ)
@@ -55,9 +55,9 @@
  * gate_1site operates at position 8 (physical index k)
  */
 #define T4D_IDX(k,u,d,l,r,f,b,i,o) \
-    ((k)*TNS4D_C8 + (u)*TNS4D_C7 + (d)*TNS4D_C6 + \
-     (l)*TNS4D_C5 + (r)*TNS4D_C4 + (f)*TNS4D_C3 + \
-     (b)*TNS4D_C2 + (i)*TNS4D_CHI + (o))
+    ((uint64_t)(k)*TNS4D_C8 + (uint64_t)(u)*TNS4D_C7 + (uint64_t)(d)*TNS4D_C6 + \
+     (uint64_t)(l)*TNS4D_C5 + (uint64_t)(r)*TNS4D_C4 + (uint64_t)(f)*TNS4D_C3 + \
+     (uint64_t)(b)*TNS4D_C2 + (uint64_t)(i)*TNS4D_CHI + (uint64_t)(o))
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * DATA STRUCTURES — Magic Pointer based
@@ -71,7 +71,7 @@ typedef struct {
 } Tns4dTensor;
 
 typedef struct {
-    double w[TNS4D_CHI];
+    double *w;  /* Heap-allocated: χ singular values on this bond */
 } Tns4dBondWeight;
 
 typedef struct {
