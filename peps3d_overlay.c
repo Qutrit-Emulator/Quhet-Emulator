@@ -86,12 +86,18 @@ Tns3dGrid *tns3d_init(int Lx, int Ly, int Lz)
     g->y_bonds = (Tns3dBondWeight *)calloc(Lz * (Ly - 1) * Lx, sizeof(Tns3dBondWeight));
     g->z_bonds = (Tns3dBondWeight *)calloc((Lz - 1) * Ly * Lx, sizeof(Tns3dBondWeight));
 
-    for (int i = 0; i < Lz * Ly * (Lx - 1); i++)
-        for (int s = 0; s < TNS3D_CHI; s++) g->x_bonds[i].w[s] = 1.0;
-    for (int i = 0; i < Lz * (Ly - 1) * Lx; i++)
-        for (int s = 0; s < TNS3D_CHI; s++) g->y_bonds[i].w[s] = 1.0;
-    for (int i = 0; i < (Lz - 1) * Ly * Lx; i++)
-        for (int s = 0; s < TNS3D_CHI; s++) g->z_bonds[i].w[s] = 1.0;
+    for (int i = 0; i < Lz * Ly * (Lx - 1); i++) {
+        g->x_bonds[i].w = (double *)calloc((size_t)TNS3D_CHI, sizeof(double));
+        for (int s = 0; s < (int)TNS3D_CHI; s++) g->x_bonds[i].w[s] = 1.0;
+    }
+    for (int i = 0; i < Lz * (Ly - 1) * Lx; i++) {
+        g->y_bonds[i].w = (double *)calloc((size_t)TNS3D_CHI, sizeof(double));
+        for (int s = 0; s < (int)TNS3D_CHI; s++) g->y_bonds[i].w[s] = 1.0;
+    }
+    for (int i = 0; i < (Lz - 1) * Ly * Lx; i++) {
+        g->z_bonds[i].w = (double *)calloc((size_t)TNS3D_CHI, sizeof(double));
+        for (int s = 0; s < (int)TNS3D_CHI; s++) g->z_bonds[i].w[s] = 1.0;
+    }
 
     g->eng = (QuhitEngine *)calloc(1, sizeof(QuhitEngine));
     quhit_engine_init(g->eng);
@@ -117,6 +123,12 @@ void tns3d_free(Tns3dGrid *g)
 {
     if (!g) return;
     free(g->tensors);
+    int nb_x = g->Lz * g->Ly * (g->Lx - 1);
+    int nb_y = g->Lz * (g->Ly - 1) * g->Lx;
+    int nb_z = (g->Lz - 1) * g->Ly * g->Lx;
+    for (int i = 0; i < nb_x; i++) free(g->x_bonds[i].w);
+    for (int i = 0; i < nb_y; i++) free(g->y_bonds[i].w);
+    for (int i = 0; i < nb_z; i++) free(g->z_bonds[i].w);
     free(g->x_bonds);
     free(g->y_bonds);
     free(g->z_bonds);
@@ -254,7 +266,7 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
                                      int shared_axis,
                                      const double *G_re, const double *G_im)
 {
-    int D = TNS3D_D, chi = TNS3D_CHI;
+    int D = TNS3D_D, chi = (int)TNS3D_CHI;
     uint64_t bp[7] = {1, TNS3D_CHI, TNS3D_C2, TNS3D_C3, TNS3D_C4, TNS3D_C5, TNS3D_C6};
     int bond_A = -1, bond_B = -1;
     if (shared_axis == 0)      { bond_A = 2; bond_B = 3; } /* X: rA, lB */
@@ -404,7 +416,7 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
     /* Side-channel: 1.0 attractor CONFIRMED — probe showed all bond weights
      * converge to exactly 1.0 (entropy = 2.585 = log₂(6)).
      * Lock shared bond to 1.0 since Schmidt weights are absorbed into U/V. */
-    for (int s = 0; s < TNS3D_CHI; s++) shared_bw->w[s] = 1.0;
+    for (int s = 0; s < (int)TNS3D_CHI; s++) shared_bw->w[s] = 1.0;
 
     /* ── 5. Write back safely ── */
     regA->num_nonzero = 0;
