@@ -22,14 +22,14 @@
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 #define TNS3D_D     6       /* Physical dimension (SU(6) native)          */
-#define TNS3D_CHI   6       /* Bond dimension per axis                    */
+#define TNS3D_CHI   256ULL  /* Bond dimension per axis                    */
 
-/* Derived powers of χ — for basis encoding (register dim=χ) */
-#define TNS3D_C2    (TNS3D_CHI * TNS3D_CHI)                        /* 144    */
-#define TNS3D_C3    (TNS3D_CHI * TNS3D_CHI * TNS3D_CHI)            /* 1728   */
-#define TNS3D_C4    (TNS3D_C2 * TNS3D_C2)                          /* 20736  */
-#define TNS3D_C5    (TNS3D_C2 * TNS3D_C3)                          /* 248832 */
-#define TNS3D_C6    (TNS3D_C3 * TNS3D_C3)                          /* 2985984 */
+/* Derived powers of χ — for basis encoding (ULL to prevent overflow) */
+#define TNS3D_C2    (TNS3D_CHI * TNS3D_CHI)
+#define TNS3D_C3    (TNS3D_CHI * TNS3D_CHI * TNS3D_CHI)
+#define TNS3D_C4    (TNS3D_C2 * TNS3D_C2)
+#define TNS3D_C5    (TNS3D_C2 * TNS3D_C3)
+#define TNS3D_C6    (TNS3D_C3 * TNS3D_C3)
 #define TNS3D_TSIZ  (TNS3D_D * TNS3D_C6)  /* D×χ⁶ = max basis+1 */
 
 /* 7-index tensor basis encoding: |k,u,d,l,r,f,b⟩
@@ -38,8 +38,8 @@
  * Position 0 = b (least sig), position 6 = k (most sig)
  * gate_1site operates at position 6 (physical index k) */
 #define T3D_IDX(k,u,d,l,r,f,b) \
-    ((k)*TNS3D_C6 + (u)*TNS3D_C5 + (d)*TNS3D_C4 + \
-     (l)*TNS3D_C3 + (r)*TNS3D_C2 + (f)*TNS3D_CHI + (b))
+    ((uint64_t)(k)*TNS3D_C6 + (uint64_t)(u)*TNS3D_C5 + (uint64_t)(d)*TNS3D_C4 + \
+     (uint64_t)(l)*TNS3D_C3 + (uint64_t)(r)*TNS3D_C2 + (uint64_t)(f)*TNS3D_CHI + (uint64_t)(b))
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * DATA STRUCTURES — Magic Pointer based
@@ -53,7 +53,7 @@ typedef struct {
 } Tns3dTensor;
 
 typedef struct {
-    double w[TNS3D_CHI];
+    double *w;  /* Heap-allocated: χ singular values */
 } Tns3dBondWeight;
 
 typedef struct {
