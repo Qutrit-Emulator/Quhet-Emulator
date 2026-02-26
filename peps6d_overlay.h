@@ -25,25 +25,25 @@
 #include <math.h>
 
 #define TNS6D_D    6
-#define TNS6D_CHI  2
+#define TNS6D_CHI  128ULL
 
-/* Cumulative bond powers for 13-index encoding */
-#define TNS6D_C1   2
-#define TNS6D_C2   4
-#define TNS6D_C3   8
-#define TNS6D_C4   16
-#define TNS6D_C5   32
-#define TNS6D_C6   64
-#define TNS6D_C7   128
-#define TNS6D_C8   256
-#define TNS6D_C9   512
-#define TNS6D_C10  1024
-#define TNS6D_C11  2048
-#define TNS6D_C12  4096
-#define TNS6D_TSIZ (TNS6D_D * TNS6D_C12)  /* 24,576 */
+/* Cumulative bond powers for 13-index encoding (derived from CHI) */
+#define TNS6D_C1   (TNS6D_CHI)
+#define TNS6D_C2   (TNS6D_CHI * TNS6D_CHI)
+#define TNS6D_C3   (TNS6D_C2 * TNS6D_CHI)
+#define TNS6D_C4   (TNS6D_C2 * TNS6D_C2)
+#define TNS6D_C5   (TNS6D_C3 * TNS6D_C2)
+#define TNS6D_C6   (TNS6D_C3 * TNS6D_C3)
+#define TNS6D_C7   (TNS6D_C4 * TNS6D_C3)
+#define TNS6D_C8   (TNS6D_C4 * TNS6D_C4)
+#define TNS6D_C9   (TNS6D_C5 * TNS6D_C4)
+#define TNS6D_C10  (TNS6D_C5 * TNS6D_C5)
+#define TNS6D_C11  (TNS6D_C6 * TNS6D_C5)
+#define TNS6D_C12  (TNS6D_C6 * TNS6D_C6)
+#define TNS6D_TSIZ (TNS6D_D * TNS6D_C12)
 
 typedef struct { int reg_idx; } Tns6dTensor;
-typedef struct { double w[TNS6D_CHI]; } Tns6dBondWeight;
+typedef struct { double *w; /* Heap-allocated */ } Tns6dBondWeight;
 
 typedef struct {
     int Lx, Ly, Lz, Lw, Lv, Lu;
