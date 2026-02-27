@@ -39,6 +39,7 @@
 /* ─── Side-channel primitives ─── */
 #include "arithmetic.h"
 #include "born_rule.h"
+#include "quhit_gauss.h"
 #include "statevector.h"
 #include "superposition.h"
 #include "entanglement.h"
@@ -92,7 +93,7 @@ typedef struct {
     uint64_t     chunk_id;          /* Parent chunk ID                      */
     uint64_t     n_quhits;          /* Number of quhits in register         */
     uint32_t     dim;               /* Dimension per quhit (D=6)            */
-    uint8_t      bulk_rule;         /* 0=constant, 1=cyclic V(k)=k%D       */
+    uint8_t      bulk_rule;         /* 0=general, 1=GHZ, 2=Gauss circuit   */
 
     /* The Hilbert Space — self-describing sparse entries */
     uint32_t     num_nonzero;       /* Active basis entries                 */
@@ -105,6 +106,13 @@ typedef struct {
     uint8_t      collapsed;         /* 1 = measurement has occurred         */
     uint32_t     collapse_outcome;  /* Determined value (all members)       */
     uint64_t     magic_base;        /* Base Magic Pointer for register      */
+
+    /* ─── Gauss Circuit Log (bulk_rule=2) ─── */
+    uint16_t     gauss_n_cz;        /* Number of CZ gates recorded          */
+    uint16_t     gauss_cz_a[256];   /* CZ pair: qubit A index               */
+    uint16_t     gauss_cz_b[256];   /* CZ pair: qubit B index               */
+    uint16_t     gauss_n_dft;       /* Number of DFT sweeps applied         */
+    uint8_t      gauss_ready;       /* 1 = full circuit applied, ready      */
 } QuhitRegister;
 
 /* ─── Inspection Snapshot (non-destructive readout) ─── */
