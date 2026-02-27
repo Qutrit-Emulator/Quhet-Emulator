@@ -438,7 +438,7 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
          basis_t pure = (envA / bp[bond_A]) * bp[bond_A + 1] + (envA % bp[bond_A]);
          for (int gv = 0; gv < rank; gv++) {
              // Symmetrically inject sqrt of normalized Schmidt weight
-             double weight = (sig_norm > 1e-30 && sig[gv] > 1e-30) ? sqrt(sig[gv] / sig_norm) : 0.0;
+             double weight = (sig_norm > 1e-30 && sig[gv] > 1e-30) ? born_fast_isqrt(sig[gv] * sig_norm) * sig[gv] : 0.0;
              double re = U_re[row * rank + gv] * weight;
              double im = U_im[row * rank + gv] * weight;
              if (re*re + im*im < 1e-50) continue;
@@ -460,7 +460,7 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
          basis_t pure = (envB / bp[bond_B]) * bp[bond_B + 1] + (envB % bp[bond_B]);
          for (int gv = 0; gv < rank; gv++) {
              // Symmetrically inject sqrt of normalized Schmidt weight
-             double weight = (sig_norm > 1e-30 && sig[gv] > 1e-30) ? sqrt(sig[gv] / sig_norm) : 0.0;
+             double weight = (sig_norm > 1e-30 && sig[gv] > 1e-30) ? born_fast_isqrt(sig[gv] * sig_norm) * sig[gv] : 0.0;
              double re = weight * Vc_re[gv * svddim_B + col];
              double im = weight * Vc_im[gv * svddim_B + col];
              if (re*re + im*im < 1e-50) continue;
@@ -616,7 +616,7 @@ void tns3d_normalize_site(Tns3dGrid *g, int x, int y, int z)
               r->entries[e].amp_im * r->entries[e].amp_im;
     }
     if (n2 > 1e-20) {
-        double inv = 1.0 / sqrt(n2);
+        double inv = born_fast_isqrt(n2);
         for (uint32_t e = 0; e < r->num_nonzero; e++) {
             r->entries[e].amp_re *= inv;
             r->entries[e].amp_im *= inv;
