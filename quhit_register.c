@@ -386,46 +386,34 @@ SV_Amplitude quhit_reg_sv_get(QuhitEngine *eng, int reg_idx,
         /*
          * Gauss circuit mode: evaluate amplitude analytically in O(N).
          * Returns log-polar: amp.re/im = unit phase, amp.log2_mag = log₂|A|.
-         * For small N (M<248), also stores exact re/im.
+         * For small N (M<248), re/im carry the exact value.
          */
         int N = (int)reg->n_quhits;
 
         /* Decode basis_k to j-vector. basis_t is 128-bit (~49 base-6 digits).
-         * For N>49, remaining digits are 0 (states with multi-digit index
-         * cannot be represented in basis_t). */
+         * For N>49, remaining digits are 0. */
         int *jv = (int*)calloc(N, sizeof(int));
         if (!jv) return amp;
         basis_t v = basis_k;
-        int dmax = N < 49 ? N : 49;  /* max digits in basis_t */
+        int dmax = N < 49 ? N : 49;
         for (int i = 0; i < dmax; i++) { jv[i] = (int)(v % D); v /= D; }
-        /* jv[49..N-1] already zeroed by calloc */
 
-        /* Use line formula (CZ log overflow or line detected) */
-        if (reg->gauss_n_cz >= 256 || reg->gauss_n_cz == (uint16_t)(N - 1)) {
-            /* Log-polar: always exact for any N */
-            int ph; double l2m;
-            gauss_amp_line_log(jv, N, &ph, &l2m);
-            if (ph < 0) {
-                amp.re = 0; amp.im = 0; amp.log2_mag = -INFINITY;
-            } else {
-                amp.log2_mag = l2m;
-                amp.re = GAUSS_W6R[ph];  /* unit phase */
-                amp.im = GAUSS_W6I[ph];
-                /* If magnitude is representable, scale re/im */
-                if (N/2 < 248) {
-                    double mag = 1.0;
-                    for (int m = 0; m < N/2; m++) mag /= 6.0;
-                    amp.re *= mag;
-                    amp.im *= mag;
-                    amp.log2_mag = -INFINITY;  /* re/im are exact */
-                }
-            }
+        /* Analytic line formula — O(N), exact for any N */
+        int ph; double l2m;
+        gauss_amp_line_log(jv, N, &ph, &l2m);
+        if (ph < 0) {
+            amp.re = 0; amp.im = 0; amp.log2_mag = -INFINITY;
         } else {
-            gauss_amp_general(jv, N,
-                              reg->gauss_cz_a, reg->gauss_cz_b,
-                              (int)reg->gauss_n_cz,
-                              &amp.re, &amp.im);
-            amp.log2_mag = -INFINITY;
+            amp.log2_mag = l2m;
+            amp.re = GAUSS_W6R[ph];
+            amp.im = GAUSS_W6I[ph];
+            if (N/2 < 248) {
+                double mag = 1.0;
+                for (int m = 0; m < N/2; m++) mag /= 6.0;
+                amp.re *= mag;
+                amp.im *= mag;
+                amp.log2_mag = -INFINITY;
+            }
         }
         free(jv);
         return amp;
