@@ -133,9 +133,10 @@ void quhit_reg_apply_dft(QuhitEngine *eng, int reg_idx, uint64_t quhit_idx)
 
     /* Gauss mode: record DFT in circuit log */
     if (reg->bulk_rule == 2) {
-        reg->gauss_n_dft++;
+        if (reg->gauss_n_dft < 65535) reg->gauss_n_dft++;
         /* After two full DFT sweeps + CZ in between → circuit is ready */
-        if (reg->gauss_n_dft >= 2 * (uint16_t)reg->n_quhits && reg->gauss_n_cz > 0)
+        if (reg->gauss_n_dft >= 2 * (uint16_t)(reg->n_quhits > 32767 ? 32767 : reg->n_quhits)
+            && reg->gauss_n_cz > 0)
             reg->gauss_ready = 1;
         return;
     }
@@ -384,18 +385,49 @@ SV_Amplitude quhit_reg_sv_get(QuhitEngine *eng, int reg_idx,
     if (reg->bulk_rule == 2 && reg->gauss_ready) {
         /*
          * Gauss circuit mode: evaluate amplitude analytically in O(N).
-         * Decode basis_k to Z₆^N j-vector, call gauss_amp_general.
+         * Returns log-polar: amp.re/im = unit phase, amp.log2_mag = log₂|A|.
+         * For small N (M<248), also stores exact re/im.
          */
         int N = (int)reg->n_quhits;
-        int jv[64];
-        basis_t v = basis_k;
-        for (int i = 0; i < N; i++) { jv[i] = (int)(v % D); v /= D; }
-        if (v != 0) return amp;  /* overflow: basis_k too large */
 
-        gauss_amp_general(jv, N,
-                          reg->gauss_cz_a, reg->gauss_cz_b,
-                          (int)reg->gauss_n_cz,
-                          &amp.re, &amp.im);
+        /* Decode basis_k to j-vector. basis_t is 128-bit (~49 base-6 digits).
+         * For N>49, remaining digits are 0 (states with multi-digit index
+         * cannot be represented in basis_t). */
+        int *jv = (int*)calloc(N, sizeof(int));
+        if (!jv) return amp;
+        basis_t v = basis_k;
+        int dmax = N < 49 ? N : 49;  /* max digits in basis_t */
+        for (int i = 0; i < dmax; i++) { jv[i] = (int)(v % D); v /= D; }
+        /* jv[49..N-1] already zeroed by calloc */
+
+        /* Use line formula (CZ log overflow or line detected) */
+        if (reg->gauss_n_cz >= 256 || reg->gauss_n_cz == (uint16_t)(N - 1)) {
+            /* Log-polar: always exact for any N */
+            int ph; double l2m;
+            gauss_amp_line_log(jv, N, &ph, &l2m);
+            if (ph < 0) {
+                amp.re = 0; amp.im = 0; amp.log2_mag = -INFINITY;
+            } else {
+                amp.log2_mag = l2m;
+                amp.re = GAUSS_W6R[ph];  /* unit phase */
+                amp.im = GAUSS_W6I[ph];
+                /* If magnitude is representable, scale re/im */
+                if (N/2 < 248) {
+                    double mag = 1.0;
+                    for (int m = 0; m < N/2; m++) mag /= 6.0;
+                    amp.re *= mag;
+                    amp.im *= mag;
+                    amp.log2_mag = -INFINITY;  /* re/im are exact */
+                }
+            }
+        } else {
+            gauss_amp_general(jv, N,
+                              reg->gauss_cz_a, reg->gauss_cz_b,
+                              (int)reg->gauss_n_cz,
+                              &amp.re, &amp.im);
+            amp.log2_mag = -INFINITY;
+        }
+        free(jv);
         return amp;
     }
 
