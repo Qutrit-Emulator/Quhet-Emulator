@@ -17,7 +17,7 @@
  * CONSTANTS
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
-#define MPS_CHI  1024
+#define MPS_CHI  512
 #ifndef MPS_PHYS
 #define MPS_PHYS 6
 #endif
