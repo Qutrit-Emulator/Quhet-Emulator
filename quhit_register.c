@@ -130,6 +130,16 @@ void quhit_reg_apply_dft(QuhitEngine *eng, int reg_idx, uint64_t quhit_idx)
 {
     if (reg_idx < 0 || (uint32_t)reg_idx >= eng->num_registers) return;
     QuhitRegister *reg = &eng->registers[reg_idx];
+
+    /* Gauss mode: record DFT in circuit log */
+    if (reg->bulk_rule == 2) {
+        reg->gauss_n_dft++;
+        /* After two full DFT sweeps + CZ in between → circuit is ready */
+        if (reg->gauss_n_dft >= 2 * (uint16_t)reg->n_quhits && reg->gauss_n_cz > 0)
+            reg->gauss_ready = 1;
+        return;
+    }
+
     (void)quhit_idx;  /* For GHZ, DFT on any position = DFT on the state */
 
     /* Apply DFT₆ to the register's amplitude array using superposition.h */
@@ -165,6 +175,17 @@ void quhit_reg_apply_cz(QuhitEngine *eng, int reg_idx,
 {
     if (reg_idx < 0 || (uint32_t)reg_idx >= eng->num_registers) return;
     QuhitRegister *reg = &eng->registers[reg_idx];
+
+    /* Gauss mode: record CZ pair in circuit log */
+    if (reg->bulk_rule == 2) {
+        if (reg->gauss_n_cz < 256) {
+            reg->gauss_cz_a[reg->gauss_n_cz] = (uint16_t)idx_a;
+            reg->gauss_cz_b[reg->gauss_n_cz] = (uint16_t)idx_b;
+            reg->gauss_n_cz++;
+        }
+        return;
+    }
+
     uint32_t D = reg->dim;
     double omega = 2.0 * M_PI / D;
 
@@ -283,6 +304,25 @@ uint64_t quhit_reg_measure(QuhitEngine *eng, int reg_idx,
     if (reg_idx < 0 || (uint32_t)reg_idx >= eng->num_registers) return 0;
     QuhitRegister *reg = &eng->registers[reg_idx];
     uint32_t D = reg->dim;
+
+    /* Gauss mode: use analytic Born sampling */
+    if (reg->bulk_rule == 2 && reg->gauss_ready) {
+        double rand_01 = quhit_prng_double(eng);
+        int outcome = gauss_born_sample((int)reg->n_quhits,
+                                        (int)quhit_idx, rand_01);
+
+        /* Collapse to measured state */
+        reg->num_nonzero = 1;
+        reg->entries[0].basis_state = (basis_t)outcome;
+        reg->entries[0].amp_re = 1.0;
+        reg->entries[0].amp_im = 0.0;
+        reg->collapsed = 1;
+        reg->collapse_outcome = (uint32_t)outcome;
+        reg->gauss_ready = 0;  /* circuit consumed */
+        reg->bulk_rule = 0;    /* revert to general mode */
+        return (uint64_t)outcome;
+    }
+
     (void)quhit_idx;
 
     /* Extract amplitudes into flat arrays for born_sample() */
@@ -341,18 +381,32 @@ SV_Amplitude quhit_reg_sv_get(QuhitEngine *eng, int reg_idx,
     QuhitRegister *reg = &eng->registers[reg_idx];
     uint32_t D = reg->dim;
 
+    if (reg->bulk_rule == 2 && reg->gauss_ready) {
+        /*
+         * Gauss circuit mode: evaluate amplitude analytically in O(N).
+         * Decode basis_k to Z₆^N j-vector, call gauss_amp_general.
+         */
+        int N = (int)reg->n_quhits;
+        int jv[64];
+        basis_t v = basis_k;
+        for (int i = 0; i < N; i++) { jv[i] = (int)(v % D); v /= D; }
+        if (v != 0) return amp;  /* overflow: basis_k too large */
+
+        gauss_amp_general(jv, N,
+                          reg->gauss_cz_a, reg->gauss_cz_b,
+                          (int)reg->gauss_n_cz,
+                          &amp.re, &amp.im);
+        return amp;
+    }
+
     if (reg->bulk_rule == 1) {
         /*
          * GHZ mode: amplitude is nonzero only if ALL N digits are equal.
-         * Extract first digit and verify all others match.
-         * This is O(log_D(k)) ≈ O(N) in digit count, but effectively O(1)
-         * for pattern detection: just check if k mod D == k/D mod D == ...
          */
         uint32_t first_digit = (uint32_t)(basis_k % D);
         basis_t remaining = basis_k;
         int all_same = 1;
 
-        /* Check each digit — early exit on mismatch */
         for (uint64_t q = 0; q < reg->n_quhits && all_same; q++) {
             if ((remaining % D) != first_digit) {
                 all_same = 0;
@@ -360,11 +414,9 @@ SV_Amplitude quhit_reg_sv_get(QuhitEngine *eng, int reg_idx,
             remaining /= D;
         }
 
-        /* After extracting N digits, remaining must be 0 (no overflow) */
         if (remaining != 0) all_same = 0;
 
         if (all_same) {
-            /* Find the amplitude for this basis entry */
             for (uint32_t e = 0; e < reg->num_nonzero; e++) {
                 if ((uint32_t)(reg->entries[e].basis_state % D) == first_digit) {
                     amp.re = reg->entries[e].amp_re;
@@ -373,7 +425,7 @@ SV_Amplitude quhit_reg_sv_get(QuhitEngine *eng, int reg_idx,
                 }
             }
         }
-        return amp;  /* Zero amplitude */
+        return amp;
     }
 
     /* General mode: linear scan through stored entries */
