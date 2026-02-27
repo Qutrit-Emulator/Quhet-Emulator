@@ -16,9 +16,11 @@
 #ifndef TENSOR_SVD_H
 #define TENSOR_SVD_H
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "born_rule.h"   /* born_fast_isqrt, born_fast_recip */
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * JACOBI HERMITIAN EIGENDECOMPOSITION
@@ -57,12 +59,12 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
               * negligible relative to diagonal gap. This is the single
               * biggest speedup — eliminates ~60% of rotation work. */
              if (mag2 < sc_thresh) continue;
-             double mag = sqrt(mag2);
+             double mag = mag2 * born_fast_isqrt(mag2);
 
              double hpp = H_re[p*n+p], hqq = H_re[q*n+q];
              double tau = (hqq - hpp) / (2.0 * mag);
-             double t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau) + sqrt(1.0 + tau*tau));
-             double c = 1.0 / sqrt(1.0 + t*t);
+             double t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau) + fabs(tau) * born_fast_isqrt(1.0 + 1.0/(tau*tau)));
+             double c = born_fast_isqrt(1.0 + t*t);
              double s = t * c;
 
              /* Phase to make H[p][q] real: e^{-iθ} */
@@ -171,7 +173,7 @@ static void tsvd_truncated(const double *M_re, const double *M_im,
     int rank = chi < n ? chi : n;
     if (rank > m) rank = m;
     for (int i = 0; i < rank; i++)
-        sigma[i] = eig[i] > 0 ? sqrt(eig[i]) : 0;
+        sigma[i] = eig[i] > 0 ? eig[i] * born_fast_isqrt(eig[i]) : 0;
 
     /* U = M V σ⁻¹  (m × rank) */
     memset(U_re, 0, (size_t)m * rank * sizeof(double));
@@ -179,7 +181,7 @@ static void tsvd_truncated(const double *M_re, const double *M_im,
 
     for (int j = 0; j < rank; j++) {
         if (sigma[j] < 1e-100) continue;
-        double inv = 1.0 / sigma[j];
+        double inv = born_fast_recip(sigma[j]);
         for (int i = 0; i < m; i++) {
             double sr = 0, si = 0;
             for (int k = 0; k < n; k++) {
@@ -304,7 +306,7 @@ static void tsvd_mgs(double *Q_re, double *Q_im, int rows, int cols)
         for (int i = 0; i < rows; i++)
             norm += Q_re[i*cols+j]*Q_re[i*cols+j] + Q_im[i*cols+j]*Q_im[i*cols+j];
         if (norm > 1e-30) {
-            double inv = 1.0 / sqrt(norm);
+            double inv = born_fast_isqrt(norm);
             for (int i = 0; i < rows; i++) {
                 Q_re[i*cols+j] *= inv;
                 Q_im[i*cols+j] *= inv;
@@ -491,7 +493,7 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
     tsvd_jacobi_hermitian(BBh_re, BBh_im, ell, eig, Ub_re, Ub_im);
 
     for (int i = 0; i < c_rank && i < rank; i++)
-        sigma[i] = (i < ell && eig[i] > 0) ? sqrt(eig[i]) : 0;
+        sigma[i] = (i < ell && eig[i] > 0) ? eig[i] * born_fast_isqrt(eig[i]) : 0;
 
     /* ── Step 6: Reconstruct U and V† with coordinate decompression ──
      * U_compressed = Q × Ub  (mr × c_rank)
@@ -516,7 +518,7 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
     /* V†: compute in compressed space, scatter to original cols */
     for (int j = 0; j < c_rank && j < rank; j++) {
         if (sigma[j] < 1e-100) continue;
-        double inv = 1.0 / sigma[j];
+        double inv = born_fast_recip(sigma[j]);
         for (int i = 0; i < mc; i++) {
             double sr = 0, si = 0;
             for (int k = 0; k < ell; k++) {
