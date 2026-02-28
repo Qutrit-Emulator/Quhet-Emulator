@@ -24,12 +24,26 @@
  *   • FMA sparse MatVec: fma() in the hottest inner loops
  *   • FMA norm accumulation in MGS
  *
+ * ── Layer 6 Universal Constant Upgrades ──
+ *   • All 10 magic thresholds replaced with ε-derived constants
+ *   • Information-theoretic rank truncation: σ[j]/σ[0] < ε
+ *   • 1 Newton iteration (9.2 bits, sufficient for self-correcting Jacobi)
+ *
+ * ── Layer 7 Deep Structure Upgrades ──
+ *   • Kahan compensated sum for Jacobi convergence (addition loses ~1 bit/op)
+ *   • FMA projection subtraction in MGS (subtraction is 50% irreversible)
+ *   • Denormals are SAFE: no performance cliff (Layer 7 Probe 6)
+ *   • Max sweeps 100→30: fixed-point convergence in 6-29 iters (Probe 8)
+ *
  * ── Measured Substrate Parameters (from probes) ──
  *   Timing quantum:     39 ns   (Layer 4)
  *   FPU dispatch width: 4-wide  (Layer 3)   Speculation depth: 8 loads (Layer 5)
  *   Cache line:         64 B    (Layer 5)   L1 cliff: ~2 KB (Layer 5)
  *   Effective freq:     0.44 GHz (Layer 5)  Peak: 1.8 GFLOP/s
  *   PRNG quality:       clean   (Layer 3)   Born constant: flat basin (Layer 3)
+ *   Rounding mode:      RTE     (Layer 7)   Benford: χ² = 0.000008 (Layer 7)
+ *   Denormal penalty:   NONE    (Layer 7)   NaN propagation: left-dominant
+ *   FMA captures:       ε²=4.93e-32         Irreversibility: 32.4% (Layer 7)
  */
 
 #ifndef TENSOR_SVD_H
@@ -47,13 +61,13 @@
  *
  * Derived from substrate probes. These replace ALL magic thresholds.
  *   ε     = 2⁻⁵² = 2.2204e-16  (Probe 1: the precision atom)
- *   ε²    = 2⁻¹⁰⁴ ≈ 4.93e-32  (relative convergence threshold)
+ *   ε²    = 2⁻¹⁰⁴ ≈ 4.93e-32  (convergence threshold = FMA precision floor, L7P4)
  *   3.322 = log₂(10)           (Probe 4: precision Rosetta Stone)
  *   52 bits ÷ 3.322 = 15.65 decimal digits (the precision horizon)
  * ═══════════════════════════════════════════════════════════════════════════════ */
 #define TSVD_EPS          DBL_EPSILON           /* 2⁻⁵² = 2.2204e-16          */
-#define TSVD_EPS2         (TSVD_EPS * TSVD_EPS) /* 2⁻¹⁰⁴ ≈ 4.93e-32          */
-#define TSVD_SAFE_MIN     DBL_MIN               /* 2⁻¹⁰²² ≈ 2.225e-308       */
+#define TSVD_EPS2         (TSVD_EPS * TSVD_EPS) /* 2⁻¹⁰⁴ = FMA precision floor */
+#define TSVD_SAFE_MIN     DBL_MIN               /* 2⁻¹⁰²² (L7: denormal-safe)  */
 #define TSVD_NOISE_FLOOR  (TSVD_EPS * 16.0)     /* ~16 ULPs, below = noise    */
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -80,12 +94,21 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
         diag_norm += H_re[i*n+i] * H_re[i*n+i];
     double sc_thresh = TSVD_EPS2 * (diag_norm > TSVD_SAFE_MIN ? diag_norm : 1.0);
 
-    for (int sweep = 0; sweep < 100; sweep++) {
-        double off = 0;
+    for (int sweep = 0; sweep < 30; sweep++) {  /* L7: 30 max (Probe 8: converges in 6-29) */
+        /* LAYER 7: Kahan compensated summation for off-diagonal norm.
+         * Probe 2 showed addition loses ~1 bit per op. For n=36,
+         * the sum has n(n-1)/2 = 630 terms → ~10 bits lost without
+         * compensation. Kahan recovers these bits. */
+        double off = 0, kahan_c = 0;
         for (int i = 0; i < n; i++)
-            for (int j = i + 1; j < n; j++)
-                off += H_re[i*n+j]*H_re[i*n+j] + H_im[i*n+j]*H_im[i*n+j];
-        if (off < sc_thresh) break;  /* side-channel: relative convergence */
+            for (int j = i + 1; j < n; j++) {
+                double term = H_re[i*n+j]*H_re[i*n+j] + H_im[i*n+j]*H_im[i*n+j];
+                double y = term - kahan_c;
+                double t = off + y;
+                kahan_c = (t - off) - y;
+                off = t;
+            }
+        if (off < sc_thresh) break;  /* Layer 6+7: compensated convergence */
 
         for (int p = 0; p < n; p++)
          for (int q = p + 1; q < n; q++) {
@@ -375,10 +398,13 @@ static void tsvd_mgs(double *Q_re, double *Q_im, int rows, int cols)
                 di = fma(Q_re[i*cols+k], Q_im[i*cols+j], di);
                 di = fma(-Q_im[i*cols+k], Q_re[i*cols+j], di);
             }
-            /* col_j -= inner * col_k */
+            /* LAYER 7: FMA projection subtraction.
+             * Probe 2 showed subtraction is 50% irreversible (loses ~1 bit).
+             * Using fma(-dr, col_k, col_j) gives single-rounding, preserving
+             * the bit that naive subtract loses. */
             for (int i = 0; i < rows; i++) {
-                Q_re[i*cols+j] -= dr*Q_re[i*cols+k] + di*Q_im[i*cols+k];
-                Q_im[i*cols+j] -= dr*Q_im[i*cols+k] - di*Q_re[i*cols+k];
+                Q_re[i*cols+j] = fma(-dr, Q_re[i*cols+k], fma(-di, Q_im[i*cols+k], Q_re[i*cols+j]));
+                Q_im[i*cols+j] = fma(-dr, Q_im[i*cols+k], fma( di, Q_re[i*cols+k], Q_im[i*cols+j]));
             }
         }
         /* Normalize — LAYER 5: FMA norm accumulation */
