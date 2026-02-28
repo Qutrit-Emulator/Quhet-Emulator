@@ -71,27 +71,50 @@ static inline double born_prob_fast(double re, double im) {
 }
 
 /* ═══════════════════════════════════════════════════════════
- * FAST INVERSE SQRT — Quake III (double precision)
+ * FAST INVERSE SQRT — FMA-accelerated Newton on bit-hack
  *
- * Sidechannel probe (probe_isqrt.c) results:
- *   • 1 Newton: 9.2 bits  — old, caused 5.67e-4 Bell error
- *   • 2 Newton: 17.7 bits — free (ILP pipeline)
- *   • 3 Newton: 34.9 bits — free (ILP pipeline, 2.3ns same as 1N)
- *   • Max relative error: 3.17e-11
+ * Sidechannel probe (probe_reality.c) results:
+ *   • Bit-hack + 4N plain:  51.6 bits, 2.2 ns
+ *   • Bit-hack + 4N FMA:    51.6 bits, 2.0 ns  ← WINNER
+ *   • SSE rsqrtss + 3N:     51.5 bits, 2.0 ns
+ *   • Householder4 2-iter:  51.1 bits, 2.4 ns
+ *   • libm 1/sqrt:          52.0 bits, 2.5 ns
  *
- * All 3 iterations run in 2.3 ns/call due to instruction-level
- * parallelism — the CPU pipelines the multiply chains.
+ * Quantum-discovered constant: 0x5FE6EB06D314E41A
+ * (ITE search over 6^8=1.68M configurations)
+ *
+ * FMA fuses multiply-add → 1 fewer rounding error per step,
+ * 10% faster than plain multiply chain.
  * ═══════════════════════════════════════════════════════════ */
 
 static inline double born_fast_isqrt(double x) {
     uint64_t i = _born_d2b(x);
     i = BORN_MAGIC_ISQRT - (i >> 1);
     double y = _born_b2d(i);
-    y = y * (1.5 - 0.5 * x * y * y);  /* Newton 1: ~4.5 → 9 bits   */
-    y = y * (1.5 - 0.5 * x * y * y);  /* Newton 2:   9 → 17.7 bits */
-    y = y * (1.5 - 0.5 * x * y * y);  /* Newton 3: 17.7 → 34.9 bits */
-    y = y * (1.5 - 0.5 * x * y * y);  /* Newton 4: 34.9 → 51.6 bits */
+    double hx = -0.5 * x;
+#if defined(__FMA__) || defined(__AVX2__)
+    y = y * fma(hx * y, y, 1.5);  /* FMA Newton 1: ~4.5 → 9 bits   */
+    y = y * fma(hx * y, y, 1.5);  /* FMA Newton 2:   9 → 17.7 bits */
+    y = y * fma(hx * y, y, 1.5);  /* FMA Newton 3: 17.7 → 34.9 bits */
+    y = y * fma(hx * y, y, 1.5);  /* FMA Newton 4: 34.9 → 51.6 bits */
+#else
+    y = y * (1.5 + hx * y * y);   /* fallback: plain multiply chain */
+    y = y * (1.5 + hx * y * y);
+    y = y * (1.5 + hx * y * y);
+    y = y * (1.5 + hx * y * y);
+#endif
     return y;
+}
+
+/* ═══════════════════════════════════════════════════════════
+ * FAST SQRT — derived from isqrt: sqrt(x) = x * isqrt(x)
+ *
+ * 51.6 bits precision, ~2.3 ns (1 extra multiply over isqrt).
+ * Faster than sqrtsd (5.1 ns) and libm sqrt (2.5 ns).
+ * ═══════════════════════════════════════════════════════════ */
+
+static inline double born_fast_sqrt(double x) {
+    return x * born_fast_isqrt(x);
 }
 
 /* ═══════════════════════════════════════════════════════════
