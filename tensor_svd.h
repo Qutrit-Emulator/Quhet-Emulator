@@ -71,6 +71,37 @@
 #define TSVD_NOISE_FLOOR  (TSVD_EPS * 16.0)     /* ~16 ULPs, below = noise    */
 
 /* ═══════════════════════════════════════════════════════════════════════════════
+ * PRECOMPUTED EIGENVALUE SPECTRA (from substrate_probe_jacobi.c)
+ *
+ * The Jacobi probe found that D=6 quantum SVD produces EXACTLY TWO
+ * eigenvalue patterns, cycling with period 2 during Trotter evolution.
+ * Both are precomputed here as compile-time constants — zero runtime cost.
+ *
+ * Pattern A (87% of calls): M†M ∝ I₆
+ *   • All eigenvalues = 1/D
+ *   • V = I₆
+ *   • Occurs when no CZ gate has acted (pure local gates)
+ *
+ * Pattern B (12.5% of calls): M†M has paired off-diagonal structure
+ *   • Pairs: (0,3), (1,4), (2,5) each with value = 1/D
+ *   • Eigenvalues: [2/D, 2/D, 2/D, 0, 0, 0]
+ *   • V columns: (|i⟩+|i+3⟩)/√2 for the 3 nonzero, (|i⟩-|i+3⟩)/√2 for the 3 zero
+ *   • Occurs after DFT+CZ gate sequences
+ *
+ * Detection cost: O(n) diagonal check + O(n) off-diagonal spot-check
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+#define TSVD_INV_D      (1.0 / 6.0)           /* 0.166666... = eigenvalue for Pattern A */
+#define TSVD_TWO_INV_D  (2.0 / 6.0)           /* 0.333333... = eigenvalue for Pattern B */
+#define TSVD_INV_SQRT2  0.70710678118654752440 /* 1/√2 for Pattern B eigenvectors       */
+
+/* Pattern B eigenvector indices: the three pairs whose symmetric/antisymmetric
+ * combinations form the eigenvectors. CZ gate creates entanglement between
+ * computational basis states |k⟩ and |k+3 mod 6⟩. */
+static const int TSVD_PAIR_A[3] = {0, 1, 2};  /* first index of each pair */
+static const int TSVD_PAIR_B[3] = {3, 4, 5};  /* second index (= first + D/2) */
+
+/* ═══════════════════════════════════════════════════════════════════════════════
  * JACOBI HERMITIAN EIGENDECOMPOSITION
  *
  * Diagonalizes n×n Hermitian H via Jacobi rotations.
@@ -94,76 +125,82 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
         diag_norm += H_re[i*n+i] * H_re[i*n+i];
     double sc_thresh = TSVD_EPS2 * (diag_norm > TSVD_SAFE_MIN ? diag_norm : 1.0);
 
-    /* ═══ LAYER 9: JACOBI FAST-PATHS (from substrate_probe_jacobi.c) ═══
+
+    /* ═══ LAYER 9: PRECOMPUTED SPECTRAL PATTERNS ═════════════════════════
      *
-     * Sidechannel probe showed:
-     *   • 86.5% of M†M are already diagonal → 0 sweeps needed
-     *   • 99.5% of M†M are circulant → diagonalizable via DFT
-     *   • Only <1% need full Jacobi iteration
-     * ════════════════════════════════════════════════════════════════════ */
+     * The Jacobi sidechannel probe found EXACTLY TWO eigenvalue patterns
+     * for D=6 quantum operations. Both are analytically known:
+     *
+     *   Pattern A (87%): M†M = d0 × I₆
+     *     → eigenvalues = [d0, d0, d0, d0, d0, d0], V = I
+     *
+     *   Pattern B (12.5%): M†M has paired off-diag at (0,3),(1,4),(2,5)
+     *     → eigenvalues = [2d0, 2d0, 2d0, 0, 0, 0]
+     *     → V = sym/antisym combinations: (|i⟩±|i+3⟩)/√2
+     *
+     * Detection: O(n) diagonal uniformity + 3 pair checks + off-diag energy
+     * Cost: ~18 comparisons vs ~600 FLOPs for even 1 Jacobi sweep
+     * ══════════════════════════════════════════════════════════════════ */
 
-    /* ─── Fast-path 1: Already diagonal (87% of calls) ─── */
-    double off_norm = 0;
-    for (int i = 0; i < n; i++)
-        for (int j = i + 1; j < n; j++)
-            off_norm += H_re[i*n+j]*H_re[i*n+j] + H_im[i*n+j]*H_im[i*n+j];
+    if (n == 6) {
+        double d0 = H_re[0];
+        int diag_uniform = 1;
+        for (int i = 1; i < 6; i++)
+            if (fabs(H_re[i*7] - d0) > 1e-12 * fabs(d0)) { diag_uniform = 0; break; }
 
-    if (off_norm < sc_thresh) {
-        /* M†M is diagonal — eigenvalues are on the diagonal, V = I */
-        for (int i = 0; i < n; i++) diag[i] = H_re[i*n+i];
-        /* Sort descending with eigenvector permutation */
-        for (int i = 0; i < n - 1; i++) {
-            int mx = i;
-            for (int j = i + 1; j < n; j++)
-                if (diag[j] > diag[mx]) mx = j;
-            if (mx != i) {
-                double tmp = diag[i]; diag[i] = diag[mx]; diag[mx] = tmp;
-                for (int k = 0; k < n; k++) {
-                    double tr = W_re[k*n+i]; W_re[k*n+i] = W_re[k*n+mx]; W_re[k*n+mx] = tr;
+        if (diag_uniform && d0 > TSVD_SAFE_MIN) {
+            /* Compute off-diagonal energy */
+            double off = 0;
+            for (int i = 0; i < 6; i++)
+                for (int j = i + 1; j < 6; j++)
+                    off += H_re[i*6+j]*H_re[i*6+j] + H_im[i*6+j]*H_im[i*6+j];
+
+            if (off < 1e-20) {
+                /* ─── PATTERN A: M†M = d0 × I₆ (87% of calls) ───
+                 * Eigenvalues = d0, V = I (already initialized above) */
+                for (int i = 0; i < 6; i++) diag[i] = d0;
+                return;
+            }
+
+            /* Check Pattern B: paired off-diag at (0,3),(1,4),(2,5) = d0 */
+            int is_paired = 1;
+            for (int p = 0; p < 3 && is_paired; p++) {
+                int ia = TSVD_PAIR_A[p], ib = TSVD_PAIR_B[p];
+                if (fabs(H_re[ia*6+ib] - d0) > 1e-10 * fabs(d0)) is_paired = 0;
+                if (fabs(H_im[ia*6+ib]) > 1e-10 * fabs(d0)) is_paired = 0;
+            }
+
+            if (is_paired) {
+                /* ─── PATTERN B: Rank-3 paired spectrum (12.5% of calls) ───
+                 * Eigenvalues: [2d0, 2d0, 2d0, 0, 0, 0]
+                 * V columns 0-2: (|ia⟩+|ib⟩)/√2 (sym, eigenvalue 2d0)
+                 * V columns 3-5: (|ia⟩-|ib⟩)/√2 (antisym, eigenvalue 0) */
+                double eig_nz = 2.0 * d0;
+                diag[0] = eig_nz; diag[1] = eig_nz; diag[2] = eig_nz;
+                diag[3] = 0;      diag[4] = 0;      diag[5] = 0;
+
+                memset(W_re, 0, 36 * sizeof(double));
+                for (int p = 0; p < 3; p++) {
+                    int ia = TSVD_PAIR_A[p], ib = TSVD_PAIR_B[p];
+                    W_re[ia*6+p]   =  TSVD_INV_SQRT2;  /* sym */
+                    W_re[ib*6+p]   =  TSVD_INV_SQRT2;
+                    W_re[ia*6+p+3] =  TSVD_INV_SQRT2;  /* antisym */
+                    W_re[ib*6+p+3] = -TSVD_INV_SQRT2;
                 }
+                return;
             }
         }
-        return;  /* Zero Jacobi iterations */
     }
 
-    /* ─── Fast-path 2: Circulant matrix (99.5% of remaining calls) ───
-     *
-     * A circulant Hermitian matrix has H[i][j] = h[(i-j) mod n].
-     * Its eigenvalues are the DFT of the first row: λ_k = Σ_j h[j] × ω^(jk)
-     * Its eigenvectors are the columns of the DFT matrix.
-     * For D=6, we already have DFT6[6][6] precomputed. */
-    if (n <= 6) {
-        int is_circ = 1;
-        for (int i = 1; i < n && is_circ; i++)
-            for (int j = 0; j < n && is_circ; j++) {
-                int shift = ((i - j) % n + n) % n;
-                /* Compare H[i][j] with H[0][shift] */
-                if (fabs(H_re[i*n+j] - H_re[0*n+shift]) > 1e-10 * (fabs(H_re[0*n+shift]) + 1e-30) ||
-                    fabs(H_im[i*n+j] - H_im[0*n+shift]) > 1e-10 * (fabs(H_im[0*n+shift]) + 1e-30))
-                    is_circ = 0;
-            }
+    /* ─── Fallback: generic diagonal bypass for any n ─── */
+    {
+        double off_norm = 0;
+        for (int i = 0; i < n; i++)
+            for (int j = i + 1; j < n; j++)
+                off_norm += H_re[i*n+j]*H_re[i*n+j] + H_im[i*n+j]*H_im[i*n+j];
 
-        if (is_circ) {
-            /* Eigenvalues λ_k = Σ_j h[j] × ω^(jk) where h = first row */
-            for (int k = 0; k < n; k++) {
-                double lr = 0, li = 0;
-                for (int j = 0; j < n; j++) {
-                    /* ω^(jk) for D=6: use precomputed OMEGA6 */
-                    int idx = (j * k) % n;
-                    double wr = OMEGA6[idx].re, wi = OMEGA6[idx].im;
-                    lr += H_re[0*n+j] * wr - H_im[0*n+j] * wi;
-                    li += H_re[0*n+j] * wi + H_im[0*n+j] * wr;
-                }
-                /* Eigenvalue of Hermitian matrix must be real */
-                diag[k] = lr;
-            }
-            /* Eigenvectors = DFT columns (conjugated for Hermitian convention) */
-            for (int k = 0; k < n; k++)
-                for (int i = 0; i < n; i++) {
-                    W_re[i*n+k] = DFT6[i][k].re;
-                    W_im[i*n+k] = DFT6[i][k].im;
-                }
-            /* Sort descending */
+        if (off_norm < sc_thresh) {
+            for (int i = 0; i < n; i++) diag[i] = H_re[i*n+i];
             for (int i = 0; i < n - 1; i++) {
                 int mx = i;
                 for (int j = i + 1; j < n; j++)
@@ -172,15 +209,14 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
                     double tmp = diag[i]; diag[i] = diag[mx]; diag[mx] = tmp;
                     for (int k = 0; k < n; k++) {
                         double tr = W_re[k*n+i]; W_re[k*n+i] = W_re[k*n+mx]; W_re[k*n+mx] = tr;
-                        double ti = W_im[k*n+i]; W_im[k*n+i] = W_im[k*n+mx]; W_im[k*n+mx] = ti;
                     }
                 }
             }
-            return;  /* Circulant diagonalized via DFT — zero Jacobi iterations */
+            return;
         }
     }
 
-    /* ─── General case: Full Jacobi iteration (<1% of calls) ─── */
+    /* ─── General case: Full Jacobi iteration (<0.5% of calls) ─── */
 
     for (int sweep = 0; sweep < 30; sweep++) {  /* L7: 30 max (Probe 8: converges in 6-29) */
         /* LAYER 7: Kahan compensated summation for off-diagonal norm.
@@ -280,6 +316,7 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
             }
         }
     }
+
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
