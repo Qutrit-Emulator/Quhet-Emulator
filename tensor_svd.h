@@ -87,7 +87,7 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
              } else {
                  tau = gap / (2.0 * mag);
              }
-             double t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau) + hypot(1.0, tau));
+             double t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau) + sqrt(1.0 + tau*tau));
              double c = born_fast_isqrt(1.0 + t*t);
              double s = t * c;
 
@@ -321,20 +321,14 @@ static void tsvd_mgs(double *Q_re, double *Q_im, int rows, int cols)
     for (int j = 0; j < cols; j++) {
         /* Orthogonalize column j against 0..j-1 */
         for (int k = 0; k < j; k++) {
-            /* LAYER 4 UPGRADE: Kahan compensated inner product.
-             * Probe 7 showed associativity fractures at 10^16 ratio.
-             * In MGS, columns can have wildly different magnitudes after
-             * successive orthogonalization. Kahan summation preserves
-             * ~30 extra bits, pushing the fracture horizon from 10^16
-             * to effectively 10^31 — beyond double precision limits. */
+            /* LAYER 4 UPGRADE: FMA-aware inner product.
+             * Uses fma() for single-rounding precision. */
             double dr = 0, di = 0;
-            double cr = 0, ci = 0;  /* Kahan compensation */
             for (int i = 0; i < rows; i++) {
-                double yr, yi, tr, ti;
-                yr = (Q_re[i*cols+k]*Q_re[i*cols+j] + Q_im[i*cols+k]*Q_im[i*cols+j]) - cr;
-                tr = dr + yr; cr = (tr - dr) - yr; dr = tr;
-                yi = (Q_re[i*cols+k]*Q_im[i*cols+j] - Q_im[i*cols+k]*Q_re[i*cols+j]) - ci;
-                ti = di + yi; ci = (ti - di) - yi; di = ti;
+                dr = fma(Q_re[i*cols+k], Q_re[i*cols+j], dr);
+                dr = fma(Q_im[i*cols+k], Q_im[i*cols+j], dr);
+                di = fma(Q_re[i*cols+k], Q_im[i*cols+j], di);
+                di = fma(-Q_im[i*cols+k], Q_re[i*cols+j], di);
             }
             /* col_j -= inner * col_k */
             for (int i = 0; i < rows; i++) {
