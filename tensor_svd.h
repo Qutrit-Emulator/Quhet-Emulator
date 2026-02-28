@@ -19,10 +19,17 @@
  *   • Dead sigma skip: break U/V† reconstruction at first zero σ
  *   • Frobenius pre-check: skip entire SVD for zero-effect gates
  *
- * ── Layer 4 Substrate Probe Upgrades ──
- *   • FMA dot products: fma() for single-rounding precision in M†M & U recon
- *   • FMA MGS inner products: prevents associativity fracture in orthogonalization
- *   • Dead sigma early-break in dense SVD U-reconstruction
+ * ── Layer 5 Hardware Fabric Upgrades ──
+ *   • 8-load speculation: 4-way unrolled sparse MatVec (8 loads/iter)
+ *   • FMA sparse MatVec: fma() in the hottest inner loops
+ *   • FMA norm accumulation in MGS
+ *
+ * ── Measured Substrate Parameters (from probes) ──
+ *   Timing quantum:     39 ns   (Layer 4)
+ *   FPU dispatch width: 4-wide  (Layer 3)   Speculation depth: 8 loads (Layer 5)
+ *   Cache line:         64 B    (Layer 5)   L1 cliff: ~2 KB (Layer 5)
+ *   Effective freq:     0.44 GHz (Layer 5)  Peak: 1.8 GFLOP/s
+ *   PRNG quality:       clean   (Layer 3)   Born constant: flat basin (Layer 3)
  */
 
 #ifndef TENSOR_SVD_H
@@ -265,7 +272,10 @@ static inline double tsvd_lcg(uint64_t *s) {
     return (double)((int64_t)(*s >> 1)) * 1.0842e-19;  /* ~uniform [-1, 1] */
 }
 
-/* ── Sparse A × dense X:  Y[m×k] = A × X[n×k]  ── */
+/* ── Sparse A × dense X:  Y[m×k] = A × X[n×k]  ──
+ * LAYER 5: 4-way unrolled + FMA inner loop.
+ * Speculation depth is 8 loads. Each unrolled iteration does 2 loads
+ * (xr, xi) = 8 loads per 4 iterations, exactly filling the pipeline. */
 static void tsvd_sp_ax(const TsvdSparseEntry *sp, int nnz,
                         int m, int k,
                         const double *X_re, const double *X_im,
@@ -276,15 +286,30 @@ static void tsvd_sp_ax(const TsvdSparseEntry *sp, int nnz,
     for (int e = 0; e < nnz; e++) {
         int r = sp[e].row, c = sp[e].col;
         double ar = sp[e].re, ai = sp[e].im;
-        for (int j = 0; j < k; j++) {
-            double xr = X_re[c*k+j], xi = X_im[c*k+j];
-            Y_re[r*k+j] += ar*xr - ai*xi;
-            Y_im[r*k+j] += ar*xi + ai*xr;
+        double *yr = Y_re + r*k, *yi = Y_im + r*k;
+        const double *xr_base = X_re + c*k, *xi_base = X_im + c*k;
+        int j = 0;
+        /* 4-way unrolled: 8 loads per iteration = speculation depth */
+        for (; j + 3 < k; j += 4) {
+            yr[j]   = fma(ar, xr_base[j],   fma(-ai, xi_base[j],   yr[j]));
+            yi[j]   = fma(ar, xi_base[j],   fma( ai, xr_base[j],   yi[j]));
+            yr[j+1] = fma(ar, xr_base[j+1], fma(-ai, xi_base[j+1], yr[j+1]));
+            yi[j+1] = fma(ar, xi_base[j+1], fma( ai, xr_base[j+1], yi[j+1]));
+            yr[j+2] = fma(ar, xr_base[j+2], fma(-ai, xi_base[j+2], yr[j+2]));
+            yi[j+2] = fma(ar, xi_base[j+2], fma( ai, xr_base[j+2], yi[j+2]));
+            yr[j+3] = fma(ar, xr_base[j+3], fma(-ai, xi_base[j+3], yr[j+3]));
+            yi[j+3] = fma(ar, xi_base[j+3], fma( ai, xr_base[j+3], yi[j+3]));
+        }
+        /* Remainder */
+        for (; j < k; j++) {
+            yr[j] = fma(ar, xr_base[j], fma(-ai, xi_base[j], yr[j]));
+            yi[j] = fma(ar, xi_base[j], fma( ai, xr_base[j], yi[j]));
         }
     }
 }
 
-/* ── Sparse A† × dense X:  Y[n×k] = A† × X[m×k]  ── */
+/* ── Sparse A† × dense X:  Y[n×k] = A† × X[m×k]  ──
+ * LAYER 5: 4-way unrolled + FMA, matching tsvd_sp_ax. */
 static void tsvd_sp_ahx(const TsvdSparseEntry *sp, int nnz,
                           int n, int k,
                           const double *X_re, const double *X_im,
@@ -295,10 +320,22 @@ static void tsvd_sp_ahx(const TsvdSparseEntry *sp, int nnz,
     for (int e = 0; e < nnz; e++) {
         int r = sp[e].row, c = sp[e].col;
         double ar = sp[e].re, ai = -sp[e].im;  /* conjugate transpose */
-        for (int j = 0; j < k; j++) {
-            double xr = X_re[r*k+j], xi = X_im[r*k+j];
-            Y_re[c*k+j] += ar*xr - ai*xi;
-            Y_im[c*k+j] += ar*xi + ai*xr;
+        double *yr = Y_re + c*k, *yi = Y_im + c*k;
+        const double *xr_base = X_re + r*k, *xi_base = X_im + r*k;
+        int j = 0;
+        for (; j + 3 < k; j += 4) {
+            yr[j]   = fma(ar, xr_base[j],   fma(-ai, xi_base[j],   yr[j]));
+            yi[j]   = fma(ar, xi_base[j],   fma( ai, xr_base[j],   yi[j]));
+            yr[j+1] = fma(ar, xr_base[j+1], fma(-ai, xi_base[j+1], yr[j+1]));
+            yi[j+1] = fma(ar, xi_base[j+1], fma( ai, xr_base[j+1], yi[j+1]));
+            yr[j+2] = fma(ar, xr_base[j+2], fma(-ai, xi_base[j+2], yr[j+2]));
+            yi[j+2] = fma(ar, xi_base[j+2], fma( ai, xr_base[j+2], yi[j+2]));
+            yr[j+3] = fma(ar, xr_base[j+3], fma(-ai, xi_base[j+3], yr[j+3]));
+            yi[j+3] = fma(ar, xi_base[j+3], fma( ai, xr_base[j+3], yi[j+3]));
+        }
+        for (; j < k; j++) {
+            yr[j] = fma(ar, xr_base[j], fma(-ai, xi_base[j], yr[j]));
+            yi[j] = fma(ar, xi_base[j], fma( ai, xr_base[j], yi[j]));
         }
     }
 }
@@ -324,10 +361,11 @@ static void tsvd_mgs(double *Q_re, double *Q_im, int rows, int cols)
                 Q_im[i*cols+j] -= dr*Q_im[i*cols+k] - di*Q_re[i*cols+k];
             }
         }
-        /* Normalize */
+        /* Normalize — LAYER 5: FMA norm accumulation */
         double norm = 0;
         for (int i = 0; i < rows; i++)
-            norm += Q_re[i*cols+j]*Q_re[i*cols+j] + Q_im[i*cols+j]*Q_im[i*cols+j];
+            norm = fma(Q_re[i*cols+j], Q_re[i*cols+j],
+                   fma(Q_im[i*cols+j], Q_im[i*cols+j], norm));
         if (norm > 1e-30) {
             double inv = born_fast_isqrt(norm);
             for (int i = 0; i < rows; i++) {
