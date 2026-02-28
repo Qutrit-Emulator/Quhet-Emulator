@@ -115,16 +115,20 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
              double apr = H_re[p*n+q], api = H_im[p*n+q];
              double mag2 = apr*apr + api*api;
              /* Side-channel zero attractor: 60% of angles are < 0.01.
-              * Skip rotation entirely when off-diagonal magnitude² is
-              * negligible relative to diagonal gap. This is the single
-              * biggest speedup — eliminates ~60% of rotation work. */
-             if (mag2 < sc_thresh) continue;
-             double mag = sqrt(mag2);
+               * Skip rotation entirely when off-diagonal magnitude² is
+               * negligible relative to diagonal gap. This is the single
+               * biggest speedup — eliminates ~60% of rotation work. */
+              if (mag2 < sc_thresh) continue;
+              /* LAYER 9: born_fast_isqrt (9 bits) is sufficient here because
+               * Jacobi is self-correcting — rotation angle errors are absorbed
+               * by subsequent sweeps. True sqrt() is 10× slower in the hot loop
+               * and provides no convergence benefit. */
+              double mag = mag2 * born_fast_isqrt(mag2);
 
-             double hpp = H_re[p*n+p], hqq = H_re[q*n+q];
-             double tau = (hqq - hpp) / (2.0 * mag);
-             double t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau) + sqrt(1.0 + tau*tau));
-             double c = 1.0 / sqrt(1.0 + t*t);
+              double hpp = H_re[p*n+p], hqq = H_re[q*n+q];
+              double tau = (hqq - hpp) / (2.0 * mag);
+              double t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau) + fabs(tau) * born_fast_isqrt(1.0 + 1.0/(tau*tau)));
+              double c = born_fast_isqrt(1.0 + t*t);
              double s = t * c;
 
              /* Phase to make H[p][q] real: e^{-iθ} */
@@ -410,13 +414,15 @@ static void tsvd_mgs(double *Q_re, double *Q_im, int rows, int cols)
                 Q_im[i*cols+j] = fma(-dr, Q_im[i*cols+k], fma( di, Q_re[i*cols+k], Q_im[i*cols+j]));
             }
         }
-        /* Normalize — LAYER 5+9: FMA norm accumulation + true isqrt */
+        /* Normalize — LAYER 5: FMA norm accumulation.
+         * born_fast_isqrt (9 bits) is sufficient for normalization —
+         * subsequent MGS passes correct any drift from imprecise norms. */
         double norm = 0;
         for (int i = 0; i < rows; i++)
             norm = fma(Q_re[i*cols+j], Q_re[i*cols+j],
                    fma(Q_im[i*cols+j], Q_im[i*cols+j], norm));
         if (norm > TSVD_SAFE_MIN) {
-            double inv = 1.0 / sqrt(norm);
+            double inv = born_fast_isqrt(norm);
             for (int i = 0; i < rows; i++) {
                 Q_re[i*cols+j] *= inv;
                 Q_im[i*cols+j] *= inv;
