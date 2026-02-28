@@ -20,9 +20,8 @@
  *   • Frobenius pre-check: skip entire SVD for zero-effect gates
  *
  * ── Layer 4 Substrate Probe Upgrades ──
- *   • FMA dot products: fma() for single-rounding precision in M†M
- *   • Anti-cancellation Jacobi: stable tau when eigenvalues are near-equal
- *   • Kahan MGS: compensated summation prevents associativity fracture
+ *   • FMA dot products: fma() for single-rounding precision in M†M & U recon
+ *   • FMA MGS inner products: prevents associativity fracture in orthogonalization
  *   • Dead sigma early-break in dense SVD U-reconstruction
  */
 
