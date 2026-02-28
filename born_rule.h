@@ -102,6 +102,52 @@ static inline double born_fast_recip(double x) {
 }
 
 /* ═══════════════════════════════════════════════════════════
+ * LAYER 9: PRECISE INVERSE SQRT — SSE rsqrtss + 2 Newton
+ *
+ * Sidechannel probe (substrate_probe_isqrt.c) showed:
+ *   • SSE rsqrtss gives 12-bit initial guess via HARDWARE
+ *   • 2 Newton iterations: 12→24→46 bits (quadratic convergence)
+ *   • Cost: 4.3 cycles — SAME speed as the 9-bit Quake hack!
+ *   • On i7-14700: libm 1/sqrt = 5.4cy, Quake = 4.2cy, SSE+2N = 4.3cy
+ *
+ * Use this for ONE-SHOT precision paths (σ computation, normalization).
+ * Keep born_fast_isqrt for self-correcting Jacobi inner loops.
+ * ═══════════════════════════════════════════════════════════ */
+
+static inline double born_precise_isqrt(double x) {
+    float xf = (float)x;
+    float yf;
+    __asm__ volatile ("rsqrtss %1, %0" : "=x"(yf) : "x"(xf));
+    double y = (double)yf;
+    /* Newton refinement 1: 12 → 24 bits */
+    y = y * (1.5 - 0.5 * x * y * y);
+    /* Newton refinement 2: 24 → 46 bits */
+    y = y * (1.5 - 0.5 * x * y * y);
+    return y;
+}
+
+/* ═══════════════════════════════════════════════════════════
+ * LAYER 9: PRECISE RECIPROCAL — SSE rcpss + 2 Newton
+ *
+ * Sidechannel probe showed born_fast_recip (6 bits) saves
+ * ZERO cycles vs hardware 1/x (both 4.3cy on i7-14700).
+ * SSE rcpss gives 12-bit seed → 2 Newton → 46 bits.
+ * Same speed, 40 more bits of precision.
+ * ═══════════════════════════════════════════════════════════ */
+
+static inline double born_precise_recip(double x) {
+    float xf = (float)x;
+    float yf;
+    __asm__ volatile ("rcpss %1, %0" : "=x"(yf) : "x"(xf));
+    double y = (double)yf;
+    /* Newton refinement 1: 12 → 24 bits */
+    y = y * (2.0 - x * y);
+    /* Newton refinement 2: 24 → 46 bits */
+    y = y * (2.0 - x * y);
+    return y;
+}
+
+/* ═══════════════════════════════════════════════════════════
  * BORN SAMPLING — Complete measurement implementation
  *
  * Given an array of complex amplitudes and a random double
