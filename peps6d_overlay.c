@@ -270,7 +270,21 @@ static void tns6d_gate_2site_generic(Tns6dGrid *g, int sA, int sB,
     double *Vr=(double*)calloc((size_t)chi*sdB,sizeof(double));
     double *Vi=(double*)calloc((size_t)chi*sdB,sizeof(double));
 
-    tsvd_truncated_sparse(T2r,T2i,sdA,sdB,chi,Ur,Ui,sig,Vr,Vi);
+    /* Rayleigh-seeded SVD: V lives on the bond weight */
+    size_t nsq = (size_t)sdB * sdB;
+    double *Vfull_re = (double *)malloc(nsq * sizeof(double));
+    double *Vfull_im = (double *)malloc(nsq * sizeof(double));
+    const double *Vs_re = (bw->V_re && bw->V_n == sdB) ? bw->V_re : NULL;
+    const double *Vs_im = (bw->V_im && bw->V_n == sdB) ? bw->V_im : NULL;
+    tsvd_truncated_rayleigh(T2r,T2i,sdA,sdB,chi,Ur,Ui,sig,Vr,Vi,
+                             Vs_re,Vs_im,Vfull_re,Vfull_im);
+    /* Store V on bond for next Trotter step */
+    if (bw->V_re && bw->V_n != sdB) { free(bw->V_re); free(bw->V_im); bw->V_re=NULL; }
+    if (!bw->V_re) { bw->V_re=(double*)malloc(nsq*sizeof(double)); bw->V_im=(double*)malloc(nsq*sizeof(double)); }
+    memcpy(bw->V_re,Vfull_re,nsq*sizeof(double));
+    memcpy(bw->V_im,Vfull_im,nsq*sizeof(double));
+    bw->V_n = sdB;
+    free(Vfull_re); free(Vfull_im);
     free(T2r);free(T2i);
 
     int rank=chi<sdB?chi:sdB; if(rank>sdA) rank=sdA;
