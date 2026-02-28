@@ -50,7 +50,10 @@ typedef struct {
 } Tns5dTensor;
 
 typedef struct {
-    double *w;  /* Heap-allocated: χ singular values */
+    double *w;     /* Heap-allocated: χ singular values */
+    double *V_re;  /* Cached eigenvectors (n×n, NULL until first SVD) */
+    double *V_im;
+    int     V_n;   /* Dimension of cached V (0 = no cache) */
 } Tns5dBondWeight;
 
 typedef struct {
