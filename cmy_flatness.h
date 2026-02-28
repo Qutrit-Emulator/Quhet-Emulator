@@ -223,7 +223,7 @@ static void cmy_triple_svd(const double *M_re[3], const double *M_im[3],
         int rank = chi < n ? chi : n;
         if (rank > m) rank = m;
         for (int i = 0; i < rank; i++)
-            sigma[ax][i] = eig_ax[i] > 0 ? sc_magic_sqrt(eig_ax[i]) : 0;
+            sigma[ax][i] = eig_ax[i] > 0 ? eig_ax[i] * born_fast_isqrt(eig_ax[i]) : 0;
 
         /* Rank-adaptive truncation */
         if (rank > 1 && sigma[ax][0] > 1e-30) {
@@ -237,7 +237,7 @@ static void cmy_triple_svd(const double *M_re[3], const double *M_im[3],
         memset(U_im[ax], 0, (size_t)m * rank * sizeof(double));
         for (int j = 0; j < rank; j++) {
             if (sigma[ax][j] < 1e-100) continue;
-            double inv = sc_magic_recip(sigma[ax][j]);
+            double inv = born_fast_recip(sigma[ax][j]);
             for (int i = 0; i < m; i++) {
                 double sr = 0, si = 0;
                 for (int kk = 0; kk < n; kk++) {
