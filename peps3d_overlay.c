@@ -404,8 +404,21 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
     double *Vc_re = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
     double *Vc_im = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
 
-    tsvd_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B, chi,
-                   U_re, U_im, sig, Vc_re, Vc_im);
+    /* Rayleigh-seeded SVD: V lives on the bond weight */
+    size_t nsq = (size_t)svddim_B * svddim_B;
+    double *Vfull_re = (double *)malloc(nsq * sizeof(double));
+    double *Vfull_im = (double *)malloc(nsq * sizeof(double));
+    const double *Vs_re = (shared_bw->V_re && shared_bw->V_n == svddim_B) ? shared_bw->V_re : NULL;
+    const double *Vs_im = (shared_bw->V_im && shared_bw->V_n == svddim_B) ? shared_bw->V_im : NULL;
+    tsvd_truncated_rayleigh(Th2_re, Th2_im, svddim_A, svddim_B, chi,
+                   U_re, U_im, sig, Vc_re, Vc_im, Vs_re, Vs_im, Vfull_re, Vfull_im);
+    /* Store V on bond for next Trotter step */
+    if (shared_bw->V_re && shared_bw->V_n != svddim_B) { free(shared_bw->V_re); free(shared_bw->V_im); shared_bw->V_re = NULL; }
+    if (!shared_bw->V_re) { shared_bw->V_re = (double*)malloc(nsq*sizeof(double)); shared_bw->V_im = (double*)malloc(nsq*sizeof(double)); }
+    memcpy(shared_bw->V_re, Vfull_re, nsq * sizeof(double));
+    memcpy(shared_bw->V_im, Vfull_im, nsq * sizeof(double));
+    shared_bw->V_n = svddim_B;
+    free(Vfull_re); free(Vfull_im);
     free(Th2_re); free(Th2_im);
 
     int rank = chi < svddim_B ? chi : svddim_B;
