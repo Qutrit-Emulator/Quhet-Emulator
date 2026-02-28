@@ -11,6 +11,13 @@
  *   • Zero attractor: 60% of Jacobi angles < 0.01 → aggressive skip
  *   • Early sweep termination via relative off-diagonal check
  *   • 1/6 spectrum awareness: contraction σ → 1/√D
+ *
+ * ── Simulation Hypothesis Upgrades ──
+ *   • Trivial matrix fast exit: nnz ≤ 36 → direct Gram-Jacobi (skip pipeline)
+ *   • Rank-1 O(1) path: single NNZ → no matrix ops at all
+ *   • Adaptive power iterations: q=1/2/3 based on sparsity ratio
+ *   • Dead sigma skip: break U/V† reconstruction at first zero σ
+ *   • Frobenius pre-check: skip entire SVD for zero-effect gates
  */
 
 #ifndef TENSOR_SVD_H
@@ -346,6 +353,82 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
 
     if (nnz == 0 || rank == 0) return;
 
+    /* ══════════ UPGRADE 2: Rank-1 O(1) Fast Path ══════════
+     * Simulation finding: light-cone confinement means many bonds
+     * carry exactly 1 nonzero entry. Return directly — zero matrix ops.
+     * Cost: O(1) vs O(nnz × ℓ × 8) for the full pipeline. */
+    if (nnz == 1) {
+        double mag2 = sp[0].re * sp[0].re + sp[0].im * sp[0].im;
+        if (mag2 > 1e-30) {
+            double mag = mag2 * born_fast_isqrt(mag2);
+            sigma[0] = mag;
+            double inv = born_fast_recip(mag);
+            U_re[sp[0].row * rank] = sp[0].re * inv;
+            U_im[sp[0].row * rank] = sp[0].im * inv;
+            Vc_re[sp[0].col] = 1.0;
+            Vc_im[sp[0].col] = 0.0;
+        }
+        return;
+    }
+
+    /* ══════════ UPGRADE 1: Trivial Matrix Fast Exit ══════════
+     * Simulation finding: self-compression drops NNZ to ~2/site.
+     * For nnz ≤ 36 (= D²), build nnz×nnz Gram matrix directly and
+     * Jacobi-diagonalize. Bypasses coordinate compression, random
+     * projection, and power iteration entirely.
+     * Cost: O(nnz²) vs O(nnz × ℓ × 8) with ℓ ≈ 20. */
+    if (nnz <= 36) {
+        /* Build G = sp† × sp  (nnz × nnz Gram matrix in COO-col space) */
+        /* Each entry sp[i] is (row_i, col_i, val_i). G[i][j] = conj(val_i)*val_j
+         * if col_i == col_j, weighted by row overlap. But simpler: form M (mr × mc)
+         * directly as dense since nnz is tiny. */
+        int mr = 0, mc = 0;
+        int rows[36], cols[36];
+        /* Extract unique rows and cols */
+        for (int e = 0; e < nnz; e++) {
+            int found_r = 0, found_c = 0;
+            for (int i = 0; i < mr; i++) if (rows[i] == sp[e].row) { found_r = 1; break; }
+            if (!found_r) rows[mr++] = sp[e].row;
+            for (int i = 0; i < mc; i++) if (cols[i] == sp[e].col) { found_c = 1; break; }
+            if (!found_c) cols[mc++] = sp[e].col;
+        }
+        /* Build small dense matrix (mr × mc) */
+        int dm = mr < 36 ? mr : 36, dn = mc < 36 ? mc : 36;
+        double Md_re[36*36] = {0}, Md_im[36*36] = {0};
+        for (int e = 0; e < nnz; e++) {
+            int ri = -1, ci = -1;
+            for (int i = 0; i < dm; i++) if (rows[i] == sp[e].row) { ri = i; break; }
+            for (int i = 0; i < dn; i++) if (cols[i] == sp[e].col) { ci = i; break; }
+            if (ri >= 0 && ci >= 0) {
+                Md_re[ri*dn+ci] += sp[e].re;
+                Md_im[ri*dn+ci] += sp[e].im;
+            }
+        }
+        /* Dense truncated SVD on the tiny matrix */
+        int trank = rank < dn ? rank : dn;
+        if (trank > dm) trank = dm;
+        double *tU_re = (double *)calloc((size_t)dm * trank, sizeof(double));
+        double *tU_im = (double *)calloc((size_t)dm * trank, sizeof(double));
+        double *tS    = (double *)calloc(trank, sizeof(double));
+        double *tV_re = (double *)calloc((size_t)trank * dn, sizeof(double));
+        double *tV_im = (double *)calloc((size_t)trank * dn, sizeof(double));
+        tsvd_truncated(Md_re, Md_im, dm, dn, trank, tU_re, tU_im, tS, tV_re, tV_im);
+        /* Scatter back to original coordinates */
+        for (int j = 0; j < trank && j < rank; j++) {
+            sigma[j] = tS[j];
+            for (int i = 0; i < dm; i++) {
+                U_re[rows[i]*rank + j] = tU_re[i*trank+j];
+                U_im[rows[i]*rank + j] = tU_im[i*trank+j];
+            }
+            for (int i = 0; i < dn; i++) {
+                Vc_re[j*n + cols[i]] = tV_re[j*dn+i];
+                Vc_im[j*n + cols[i]] = tV_im[j*dn+i];
+            }
+        }
+        free(tU_re); free(tU_im); free(tS); free(tV_re); free(tV_im);
+        return;
+    }
+
     /* ══════════ Magic Pointer Coordinate Compression ══════════
      * Extract unique row/col indices from sparse entries.
      * Map m-dimensional rows → mr-dimensional compressed rows (mr ≤ nnz).
@@ -441,7 +524,13 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
     tsvd_sp_ax(csp, nnz, mr, ell, Om_re, Om_im, Y_re, Y_im);
     free(Om_re); free(Om_im);
 
-    int q = 3;
+    /* UPGRADE 3: Adaptive power iterations
+     * Simulation finding: 10^48:1 compression = huge spectral gaps.
+     * q=1 suffices for very sparse inputs. */
+    int q;
+    if (nnz <= c_rank * 2)       q = 1;  /* very sparse: gap is huge */
+    else if (nnz <= c_rank * 10) q = 2;  /* moderate sparsity */
+    else                          q = 3;  /* dense: need full amplification */
     for (int qi = 0; qi < q; qi++) {
         tsvd_mgs(Y_re, Y_im, mr, ell);
         tsvd_sp_ahx(csp, nnz, mc, ell, Y_re, Y_im, T_re, T_im);
@@ -501,7 +590,9 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
      * Then scatter back to original m, n coordinates via row_map, col_map */
 
     /* U: compute in compressed space, scatter to original rows */
+    /* UPGRADE 4: Dead sigma skip — break at first zero σ (they're sorted) */
     for (int j = 0; j < c_rank && j < rank; j++) {
+        if (sigma[j] < 1e-30) break;  /* all subsequent σ are smaller */
         for (int i = 0; i < mr; i++) {
             double sr = 0, si = 0;
             for (int k = 0; k < ell; k++) {
@@ -516,7 +607,9 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
     }
 
     /* V†: compute in compressed space, scatter to original cols */
+    /* UPGRADE 4 continued: dead sigma skip */
     for (int j = 0; j < c_rank && j < rank; j++) {
+        if (sigma[j] < 1e-30) break;
         if (sigma[j] < 1e-100) continue;
         double inv = born_fast_recip(sigma[j]);
         for (int i = 0; i < mc; i++) {
@@ -553,13 +646,17 @@ static void tsvd_truncated_sparse(const double *M_re, const double *M_im,
                                    double *sigma,
                                    double *Vc_re, double *Vc_im)
 {
-    /* Count nonzeros */
+    /* UPGRADE 5: Frobenius norm pre-check
+     * Simulation finding: self-compressed states make many gates no-ops.
+     * Skip entire SVD if total energy is negligible. */
+    double fnorm2 = 0;
     int nnz = 0;
     for (int i = 0; i < m; i++)
         for (int j = 0; j < n; j++) {
             double mag2 = M_re[i*n+j]*M_re[i*n+j] + M_im[i*n+j]*M_im[i*n+j];
-            if (mag2 > 1e-30) nnz++;
+            if (mag2 > 1e-30) { nnz++; fnorm2 += mag2; }
         }
+    if (fnorm2 < 1e-20) return;  /* Gate has no effect — zero cost exit */
 
     /* Build COO */
     TsvdSparseEntry *sp = (TsvdSparseEntry *)malloc(
