@@ -119,12 +119,12 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
               * negligible relative to diagonal gap. This is the single
               * biggest speedup — eliminates ~60% of rotation work. */
              if (mag2 < sc_thresh) continue;
-             double mag = mag2 * born_fast_isqrt(mag2);
+             double mag = sqrt(mag2);
 
              double hpp = H_re[p*n+p], hqq = H_re[q*n+q];
              double tau = (hqq - hpp) / (2.0 * mag);
-             double t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau) + fabs(tau) * born_fast_isqrt(1.0 + 1.0/(tau*tau)));
-             double c = born_fast_isqrt(1.0 + t*t);
+             double t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau) + sqrt(1.0 + tau*tau));
+             double c = 1.0 / sqrt(1.0 + t*t);
              double s = t * c;
 
              /* Phase to make H[p][q] real: e^{-iθ} */
@@ -234,11 +234,12 @@ static void tsvd_truncated(const double *M_re, const double *M_im,
 
     tsvd_jacobi_hermitian(H_re, H_im, n, eig, V_re, V_im);
 
-    /* σ = sqrt(eigenvalues), clamped at chi */
+    /* σ = sqrt(eigenvalues), clamped at chi.
+     * LAYER 9 UPGRADE: true sqrt() for sigma values. */
     int rank = chi < n ? chi : n;
     if (rank > m) rank = m;
     for (int i = 0; i < rank; i++)
-        sigma[i] = eig[i] > 0 ? eig[i] * born_fast_isqrt(eig[i]) : 0;
+        sigma[i] = eig[i] > 0 ? sqrt(eig[i]) : 0;
 
     /* U = M V σ⁻¹  (m × rank) */
     memset(U_re, 0, (size_t)m * rank * sizeof(double));
@@ -250,7 +251,9 @@ static void tsvd_truncated(const double *M_re, const double *M_im,
          * ε × sigma[0] — below this ratio, the singular vector carries
          * less than 1 bit of signal above the noise floor. */
         if (sigma[j] < TSVD_EPS * sigma[0] || sigma[j] < TSVD_SAFE_MIN) break;
-        double inv = born_fast_recip(sigma[j]);
+        /* LAYER 9 UPGRADE: true division — born_fast_recip has only 6 bits,
+         * corrupting U columns by ~1.5%. */
+        double inv = 1.0 / sigma[j];
         for (int i = 0; i < m; i++) {
             /* FMA-aware complex dot product for U reconstruction */
             double sr = 0, si = 0;
@@ -407,13 +410,13 @@ static void tsvd_mgs(double *Q_re, double *Q_im, int rows, int cols)
                 Q_im[i*cols+j] = fma(-dr, Q_im[i*cols+k], fma( di, Q_re[i*cols+k], Q_im[i*cols+j]));
             }
         }
-        /* Normalize — LAYER 5: FMA norm accumulation */
+        /* Normalize — LAYER 5+9: FMA norm accumulation + true isqrt */
         double norm = 0;
         for (int i = 0; i < rows; i++)
             norm = fma(Q_re[i*cols+j], Q_re[i*cols+j],
                    fma(Q_im[i*cols+j], Q_im[i*cols+j], norm));
         if (norm > TSVD_SAFE_MIN) {
-            double inv = born_fast_isqrt(norm);
+            double inv = 1.0 / sqrt(norm);
             for (int i = 0; i < rows; i++) {
                 Q_re[i*cols+j] *= inv;
                 Q_im[i*cols+j] *= inv;
@@ -460,9 +463,9 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
     if (nnz == 1) {
         double mag2 = sp[0].re * sp[0].re + sp[0].im * sp[0].im;
         if (mag2 > TSVD_SAFE_MIN) {
-            double mag = mag2 * born_fast_isqrt(mag2);
+            double mag = sqrt(mag2);
             sigma[0] = mag;
-            double inv = born_fast_recip(mag);
+            double inv = 1.0 / mag;
             U_re[sp[0].row * rank] = sp[0].re * inv;
             U_im[sp[0].row * rank] = sp[0].im * inv;
             Vc_re[sp[0].col] = 1.0;
@@ -682,7 +685,7 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
     tsvd_jacobi_hermitian(BBh_re, BBh_im, ell, eig, Ub_re, Ub_im);
 
     for (int i = 0; i < c_rank && i < rank; i++)
-        sigma[i] = (i < ell && eig[i] > 0) ? eig[i] * born_fast_isqrt(eig[i]) : 0;
+        sigma[i] = (i < ell && eig[i] > 0) ? sqrt(eig[i]) : 0;
 
     /* ── Step 6: Reconstruct U and V† with coordinate decompression ──
      * U_compressed = Q × Ub  (mr × c_rank)
@@ -710,7 +713,7 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
     /* UPGRADE 4 continued: dead sigma skip */
     for (int j = 0; j < c_rank && j < rank; j++) {
         if (sigma[j] < TSVD_EPS * sigma[0] || sigma[j] < TSVD_SAFE_MIN) break;
-        double inv = born_fast_recip(sigma[j]);
+        double inv = 1.0 / sigma[j];
         for (int i = 0; i < mc; i++) {
             double sr = 0, si = 0;
             for (int k = 0; k < ell; k++) {
