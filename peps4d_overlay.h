@@ -71,7 +71,10 @@ typedef struct {
 } Tns4dTensor;
 
 typedef struct {
-    double *w;  /* Heap-allocated: χ singular values on this bond */
+    double *w;     /* Heap-allocated: χ singular values on this bond */
+    double *V_re;  /* Cached eigenvectors (n×n, NULL until first SVD) */
+    double *V_im;
+    int     V_n;   /* Dimension of cached V (0 = no cache) */
 } Tns4dBondWeight;
 
 typedef struct {
