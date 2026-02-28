@@ -437,8 +437,20 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
     double *Vc_re = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
     double *Vc_im = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
 
-    tsvd_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B, chi,
-                   U_re, U_im, sig, Vc_re, Vc_im);
+    /* Rayleigh-seeded SVD: V lives on the bond weight */
+    { size_t nsq = (size_t)svddim_B * svddim_B;
+    double *Vfull_re = (double *)malloc(nsq * sizeof(double));
+    double *Vfull_im = (double *)malloc(nsq * sizeof(double));
+    const double *Vs_re = (hb_shared->V_re && hb_shared->V_n == svddim_B) ? hb_shared->V_re : NULL;
+    const double *Vs_im = (hb_shared->V_im && hb_shared->V_n == svddim_B) ? hb_shared->V_im : NULL;
+    tsvd_truncated_rayleigh(Th2_re, Th2_im, svddim_A, svddim_B, chi,
+                   U_re, U_im, sig, Vc_re, Vc_im, Vs_re, Vs_im, Vfull_re, Vfull_im);
+    if (hb_shared->V_re && hb_shared->V_n != svddim_B) { free(hb_shared->V_re); free(hb_shared->V_im); hb_shared->V_re = NULL; }
+    if (!hb_shared->V_re) { hb_shared->V_re = (double*)malloc(nsq*sizeof(double)); hb_shared->V_im = (double*)malloc(nsq*sizeof(double)); }
+    memcpy(hb_shared->V_re, Vfull_re, nsq * sizeof(double));
+    memcpy(hb_shared->V_im, Vfull_im, nsq * sizeof(double));
+    hb_shared->V_n = svddim_B;
+    free(Vfull_re); free(Vfull_im); }
     free(Th2_re); free(Th2_im);
 
     /* ── 5. Update bond weight ── */
@@ -709,8 +721,20 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
     double *Vc_re = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
     double *Vc_im = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
 
-    tsvd_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B, chi,
-                   U_re, U_im, sig, Vc_re, Vc_im);
+    /* Rayleigh-seeded SVD: V lives on the bond weight */
+    { size_t nsq = (size_t)svddim_B * svddim_B;
+    double *Vfull_re = (double *)malloc(nsq * sizeof(double));
+    double *Vfull_im = (double *)malloc(nsq * sizeof(double));
+    const double *Vs_re = (vb_shared->V_re && vb_shared->V_n == svddim_B) ? vb_shared->V_re : NULL;
+    const double *Vs_im = (vb_shared->V_im && vb_shared->V_n == svddim_B) ? vb_shared->V_im : NULL;
+    tsvd_truncated_rayleigh(Th2_re, Th2_im, svddim_A, svddim_B, chi,
+                   U_re, U_im, sig, Vc_re, Vc_im, Vs_re, Vs_im, Vfull_re, Vfull_im);
+    if (vb_shared->V_re && vb_shared->V_n != svddim_B) { free(vb_shared->V_re); free(vb_shared->V_im); vb_shared->V_re = NULL; }
+    if (!vb_shared->V_re) { vb_shared->V_re = (double*)malloc(nsq*sizeof(double)); vb_shared->V_im = (double*)malloc(nsq*sizeof(double)); }
+    memcpy(vb_shared->V_re, Vfull_re, nsq * sizeof(double));
+    memcpy(vb_shared->V_im, Vfull_im, nsq * sizeof(double));
+    vb_shared->V_n = svddim_B;
+    free(Vfull_re); free(Vfull_im); }
     free(Th2_re); free(Th2_im);
 
     /* ── 5. Update bond weight ── */
