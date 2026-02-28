@@ -95,15 +95,16 @@
 #define DOUBLE_MANTISSA_MASK   0x000FFFFFFFFFFFFFULL
 
 /* ═══════════════════════════════════════════════════════════════════
- * MAGIC CONSTANTS — Empirically Extracted
+ * MAGIC CONSTANTS — Libm-Oracle Optimized
  *
  * Each constant enables an integer-domain approximation of a
  * mathematical function applied to floating-point bit patterns.
  * They work ONLY because the encoding above is correct.
  * Each constant independently constrains (M, E, B).
  *
- * The inverse sqrt constant is the Quake III hack.
- * The others are its generalizations to other functions.
+ * OPTIMIZED: Each constant was searched via binary mantissa sweep +
+ * byte-walk + fine-walk against exact libm reference on 512 test
+ * points spanning 1e-15 to 1e+15. Gains noted per constant.
  *
  * Theory:
  *   inv_sqrt:  MAGIC ≈ (3/2) × 2^M × (B - σ),     σ ≈ 0.0450466
@@ -114,22 +115,26 @@
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* Inverse square root: y_bits = MAGIC - (x_bits >> 1)
- * Then one Newton iteration: y = y × (1.5 - 0.5 × x × y²) */
-#define MAGIC_ISQRT_FLOAT      0x5F385EE0U   /* cf. Quake III: 0x5F3759DF */
-#define MAGIC_ISQRT_DOUBLE     0x5FE6EB3BD314E41AULL
+ * Then one Newton iteration: y = y × (1.5 - 0.5 × x × y²)
+ * 2N optimal: +1.00 bits vs Quake III (17.73 vs 16.72 bits) */
+#define MAGIC_ISQRT_FLOAT      0x5F3756B5U   /* libm-optimal 2N (+1.00 bits vs 0x5F385EE0) */
+#define MAGIC_ISQRT_DOUBLE     0x5FE6D826D36047EFULL  /* libm-optimal 4N (51.91 bits) */
 
-/* Reciprocal: y_bits = MAGIC - x_bits */
-#define MAGIC_RECIPROCAL_FLOAT 0x7EF00482U
+/* Reciprocal: y_bits = MAGIC - x_bits
+ * 2N optimal: +1.22 bits (17.23 vs 16.01 bits) */
+#define MAGIC_RECIPROCAL_FLOAT 0x7EF30E88U   /* libm-optimal 2N (+1.22 bits vs 0x7EF00482) */
 
-/* Square root: y_bits = (x_bits >> 1) + MAGIC */
-#define MAGIC_SQRT_FLOAT       0x1FBC0000U
+/* Square root: y_bits = (x_bits >> 1) + MAGIC
+ * 2N optimal: +0.13 bits (22.04 vs 21.91 bits) */
+#define MAGIC_SQRT_FLOAT       0x1FBB18ACU   /* libm-optimal 2N (+0.13 bits vs 0x1FBC0000) */
 
-/* Cube root: y_bits = x_bits / 3 + MAGIC */
-#define MAGIC_CBRT_FLOAT       0x2A4E6FFCU
+/* Cube root: y_bits = x_bits / 3 + MAGIC
+ * 0N optimal: +0.63 bits (4.99 vs 4.36 bits) */
+#define MAGIC_CBRT_FLOAT       0x2A510977U   /* libm-optimal 0N (+0.63 bits vs 0x2A4E6FFC) */
 
 /* Log base 2: log₂(x) ≈ (x_bits_as_int - MAGIC) / 2^MANTISSA_BITS
- * MAGIC equals the integer representation of 1.0f */
-#define MAGIC_LOG2_FLOAT       0x3F800000U   /* = 1.0f as uint32 */
+ * +1.50 bits (3.05 vs 1.55 bits) */
+#define MAGIC_LOG2_FLOAT       0x3F7AF77EU   /* libm-optimal (+1.50 bits vs 0x3F800000) */
 
 /* ═══════════════════════════════════════════════════════════════════
  * DERIVED PROPERTIES OF THE SUBSTRATE
