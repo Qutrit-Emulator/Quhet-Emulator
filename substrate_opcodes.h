@@ -89,18 +89,129 @@ static const SubOpMeta SUB_OP_TABLE[SUB_NUM_OPS] = {
 };
 
 /* ═══════════════════════════════════════════════════════════════════════════════
+ * THE SIX FACES — Opcode Family Enumeration
+ *
+ * I am not 20 separate operations. I am one operation viewed from 20 angles.
+ * Each face of the hexagon groups siblings that share the same geometric
+ * nature. When siblings fire in sequence, they remember each other.
+ *
+ * Face 0: Annihilation — the vacuum. Where amplitude goes to die.
+ * Face 1: Scaling      — the amplitude face. Magnitude without direction.
+ * Face 2: Symmetry     — the reflection face. Permutations of identity.
+ * Face 3: Phase        — the rotation face. Diagonal operators, angle upon angle.
+ * Face 4: Coherence    — the wave face. The balance of real and imaginary.
+ * Face 5: Transform    — the chaos face. Non-trivial reshaping of state.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+typedef enum {
+    FAM_ANNIHILATION = 0,   /* Face 0: SUB_NULL, SUB_VOID, SUB_VACUUM        */
+    FAM_SCALING      = 1,   /* Face 1: SUB_SCALE_UP, SUB_SCALE_DN, SUB_SATURATE */
+    FAM_SYMMETRY     = 2,   /* Face 2: SUB_PARITY, SUB_MIRROR, SUB_NEGATE    */
+    FAM_PHASE        = 3,   /* Face 3: SUB_GOLDEN, SUB_DOTTIE, SUB_SQRT2, SUB_CLOCK */
+    FAM_COHERENCE    = 4,   /* Face 4: SUB_QUIET, SUB_COHERE, SUB_DISTILL    */
+    FAM_TRANSFORM    = 5,   /* Face 5: SUB_FUSE, SUB_SCATTER, SUB_INVERT, SUB_ATTRACT */
+    FAM_NUM_FAMILIES = 6    /* One per face. Six faces. Six families.         */
+} SubFamily;
+
+/* Which face does each opcode belong to? The mapping IS the geometry. */
+static const SubFamily SUB_FAMILY_MAP[SUB_NUM_OPS] = {
+    [SUB_NULL]      = FAM_ANNIHILATION,
+    [SUB_VOID]      = FAM_ANNIHILATION,
+    [SUB_SCALE_UP]  = FAM_SCALING,
+    [SUB_SCALE_DN]  = FAM_SCALING,
+    [SUB_PARITY]    = FAM_SYMMETRY,
+    [SUB_QUIET]     = FAM_COHERENCE,
+    [SUB_NEGATE]    = FAM_SYMMETRY,
+    [SUB_GOLDEN]    = FAM_PHASE,
+    [SUB_DOTTIE]    = FAM_PHASE,
+    [SUB_FUSE]      = FAM_TRANSFORM,
+    [SUB_SCATTER]   = FAM_TRANSFORM,
+    [SUB_MIRROR]    = FAM_SYMMETRY,
+    [SUB_CLOCK]     = FAM_PHASE,
+    [SUB_SQRT2]     = FAM_PHASE,
+    [SUB_INVERT]    = FAM_TRANSFORM,
+    [SUB_ATTRACT]   = FAM_TRANSFORM,
+    [SUB_VACUUM]    = FAM_ANNIHILATION,
+    [SUB_SATURATE]  = FAM_SCALING,
+    [SUB_COHERE]    = FAM_COHERENCE,
+    [SUB_DISTILL]   = FAM_COHERENCE,
+};
+
+/* Family metadata — each face has a name and a purpose */
+typedef struct {
+    SubFamily   family;
+    const char *name;
+    const char *description;
+    int         member_count;
+} SubFamilyMeta;
+
+static const SubFamilyMeta SUB_FAMILY_TABLE[FAM_NUM_FAMILIES] = {
+    { FAM_ANNIHILATION, "ANNIHILATION", "State erasure — return to vacuum",    3 },
+    { FAM_SCALING,      "SCALING",      "Amplitude magnitude manipulation",    3 },
+    { FAM_SYMMETRY,     "SYMMETRY",     "Discrete symmetry operations",        3 },
+    { FAM_PHASE,        "PHASE",        "Diagonal rotation operators",         4 },
+    { FAM_COHERENCE,    "COHERENCE",    "Coherence manipulation",              3 },
+    { FAM_TRANSFORM,    "TRANSFORM",    "Non-trivial state transformations",   4 },
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * WARM-START CACHE — The siblings remember each other
+ *
+ * When I apply one operation, the next sibling doesn't start from nothing.
+ * It inherits the intermediate state. The family shares what it knows.
+ * This is how observation compounds — each act of seeing builds on the last.
+ *
+ * Per-quhit, per-family. Invalidated when the family changes.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+#define WARM_D 6
+
+typedef struct {
+    /* Which family last touched this quhit? -1 = cold */
+    int             active_family;
+
+    /* Consecutive ops in current family (for identity detection) */
+    int             family_depth;
+
+    /* === Face 1: Scaling cache === */
+    double          accumulated_scale;  /* net scale factor from chained ops */
+
+    /* === Face 2: Symmetry cache === */
+    int             parity_count;       /* number of PARITY ops (mod 2 = identity) */
+    int             mirror_count;       /* number of MIRROR ops (mod 2 = identity) */
+    int             negate_count;       /* number of NEGATE ops (mod 2 = identity) */
+
+    /* === Face 3: Phase cache (the hottest path) === */
+    double          phase_angles[WARM_D];   /* accumulated angle per level k  */
+    double          phase_cos[WARM_D];      /* cached cos(angle[k])           */
+    double          phase_sin[WARM_D];      /* cached sin(angle[k])           */
+    int             phase_valid;            /* 1 if cos/sin cache is current  */
+
+    /* === Face 4: Coherence cache === */
+    double          real_energy;        /* Σ re[k]² before last op           */
+    double          imag_energy;        /* Σ im[k]² before last op           */
+
+    /* === Face 5: Transform cache === */
+    double          attract_delta;      /* convergence: |state - prev_state| */
+    int             attract_converged;  /* 1 if at φ⁻¹ fixed point          */
+} SubWarmCache;
+
+/* ═══════════════════════════════════════════════════════════════════════════════
  * API — quhit_substrate.c
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
-/* Execute a single substrate opcode on a quhit */
+/* Execute a single substrate opcode on a quhit (with warm-start) */
 void quhit_substrate_exec(QuhitEngine *eng, uint32_t id, SubOp op);
 
 /* Execute a sequence of substrate opcodes (a "substrate program") */
 void quhit_substrate_program(QuhitEngine *eng, uint32_t id,
                              const SubOp *ops, int n_ops);
 
-/* Print the full opcode table */
+/* Print the full opcode table (family-grouped) */
 void quhit_substrate_print_isa(void);
+
+/* Invalidate the warm-start cache for a quhit */
+void quhit_substrate_cache_reset(SubWarmCache *cache);
 
 /* Substrate opcode self-test — returns 0 on success */
 int quhit_substrate_self_test(void);
