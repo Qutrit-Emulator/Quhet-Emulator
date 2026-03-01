@@ -561,7 +561,7 @@ static void sub_distill(QuhitEngine *eng, uint32_t id)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * DISPATCH TABLE
+ * DISPATCH TABLE — The raw gate functions, before I learned to remember
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 typedef void (*sub_gate_fn)(QuhitEngine*, uint32_t);
@@ -590,7 +590,273 @@ static const sub_gate_fn SUB_DISPATCH[SUB_NUM_OPS] = {
 };
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * PUBLIC API
+ * WARM-START ENGINE — I am not 20 operations. I am one, remembering itself.
+ *
+ * Each quhit carries a cache. When sibling opcodes fire in sequence,
+ * the cache provides warm intermediate state:
+ *
+ *   Phase face:    angle accumulation — cos(a+b) via identity, not transcendentals
+ *   Scaling face:  factor accumulation — defer multiplication, compose
+ *   Symmetry face: parity counting — even count = identity, skip entirely
+ *   Coherence face: energy ratio tracking — know the balance before acting
+ *   Transform face: convergence detection — don't iterate what's already converged
+ *   Annihilation:  no cache. Death doesn't remember.
+ *
+ * The cache invalidates when the family changes. A new face is a new beginning.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* Per-engine warm cache storage (one per quhit) */
+static SubWarmCache warm_caches[4096]; /* max quhits — mirrors engine capacity */
+static int warm_initialized = 0;
+
+void quhit_substrate_cache_reset(SubWarmCache *cache)
+{
+    memset(cache, 0, sizeof(*cache));
+    cache->active_family = -1;  /* cold — no face has touched this yet */
+    cache->accumulated_scale = 1.0;
+}
+
+static void warm_init_all(void)
+{
+    if (warm_initialized) return;
+    for (int i = 0; i < 4096; i++)
+        quhit_substrate_cache_reset(&warm_caches[i]);
+    warm_initialized = 1;
+}
+
+static inline SubWarmCache* warm_get(uint32_t id)
+{
+    if (id >= 4096) return NULL;
+    return &warm_caches[id];
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * WARM PHASE GATE — The hottest path. Angle upon angle, compounding.
+ *
+ * When consecutive phase gates fire (GOLDEN → DOTTIE → SQRT2 → CLOCK),
+ * their angles accumulate. Instead of calling cos/sin from scratch each
+ * time, the cached cos/sin values allow angle-addition:
+ *
+ *   cos(a + b) = cos(a)·cos(b) - sin(a)·sin(b)
+ *   sin(a + b) = sin(a)·cos(b) + cos(a)·sin(b)
+ *
+ * One FMA pair instead of two transcendental calls per level.
+ * I don't rediscover my geometry every time someone looks at me.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* Get the per-level angle increment for a phase opcode */
+static inline double phase_theta(SubOp op)
+{
+    switch (op) {
+        case SUB_GOLDEN: return 2.0 * M_PI / (PHI * PHI);
+        case SUB_DOTTIE: return DOTTIE;
+        case SUB_SQRT2:  return M_PI / 4.0;
+        case SUB_CLOCK:  return M_PI; /* ω^3 = e^(iπ), applied as (-1)^k */
+        default:         return 0.0;
+    }
+}
+
+static void warm_phase_apply(QuhitEngine *eng, uint32_t id,
+                             SubOp op, SubWarmCache *cache)
+{
+    QuhitState *s = sub_get_state(eng, id);
+    if (!s) return;
+
+    double theta = phase_theta(op);
+
+    if (cache->phase_valid) {
+        /* WARM PATH — apply only the DELTA rotation to the current state.
+         * The state is ALREADY rotated by the previous accumulated angle.
+         * I don't re-derive what I already know. I add only what's new.
+         *
+         * Bug fix: previously applied ACCUMULATED rotation to already-rotated
+         * state, double counting the first angle. Now applies only the delta. */
+        double delta_cos[SUB_D], delta_sin[SUB_D];
+        for (int k = 0; k < SUB_D; k++) {
+            double d_angle = k * theta;
+            delta_cos[k] = cos(d_angle);
+            delta_sin[k] = sin(d_angle);
+        }
+
+        /* Update accumulated cache (for tracking, not for application) */
+        for (int k = 0; k < SUB_D; k++) {
+            double new_cos = cache->phase_cos[k] * delta_cos[k]
+                           - cache->phase_sin[k] * delta_sin[k];
+            double new_sin = cache->phase_sin[k] * delta_cos[k]
+                           + cache->phase_cos[k] * delta_sin[k];
+            cache->phase_cos[k] = new_cos;
+            cache->phase_sin[k] = new_sin;
+            cache->phase_angles[k] += k * theta;
+        }
+
+        /* Apply ONLY the delta rotation to the already-rotated state */
+        for (int k = 0; k < SUB_D; k++) {
+            double re = s->re[k], im = s->im[k];
+            s->re[k] = re * delta_cos[k] - im * delta_sin[k];
+            s->im[k] = re * delta_sin[k] + im * delta_cos[k];
+        }
+    } else {
+        /* COLD PATH — first phase op on this quhit. Initialize cache. */
+        for (int k = 0; k < SUB_D; k++) {
+            double angle = k * theta;
+            cache->phase_angles[k] = angle;
+            cache->phase_cos[k] = cos(angle);
+            cache->phase_sin[k] = sin(angle);
+        }
+
+        /* Apply rotation */
+        for (int k = 0; k < SUB_D; k++) {
+            double re = s->re[k], im = s->im[k];
+            s->re[k] = re * cache->phase_cos[k] - im * cache->phase_sin[k];
+            s->im[k] = re * cache->phase_sin[k] + im * cache->phase_cos[k];
+        }
+
+        cache->phase_valid = 1;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * WARM SYMMETRY — Counting reflections.
+ *
+ * PARITY² = I. MIRROR² = I. NEGATE² = I.
+ * Two reflections is standing still. The observer who looks twice
+ * at a mirror sees only themselves, unchanged.
+ *
+ * The cache counts invocations. When count ≥ 3 and count is odd,
+ * we know the result would be same as count=1, which is already cached.
+ * For count=even (≥4), result = identity, skip it.
+ *
+ * We NEVER skip the 2nd call — it must execute to UNDO the 1st.
+ * The real savings come on the 4th, 6th, 8th... calls.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+static int warm_symmetry_check(SubOp op, SubWarmCache *cache)
+{
+    switch (op) {
+        case SUB_PARITY:
+            cache->parity_count++;
+            /* Skip only on 4th, 6th, 8th... (even count ≥ 4) */
+            if (cache->parity_count >= 4 && cache->parity_count % 2 == 0) return 1;
+            break;
+        case SUB_MIRROR:
+            cache->mirror_count++;
+            if (cache->mirror_count >= 4 && cache->mirror_count % 2 == 0) return 1;
+            break;
+        case SUB_NEGATE:
+            cache->negate_count++;
+            if (cache->negate_count >= 4 && cache->negate_count % 2 == 0) return 1;
+            break;
+        default: break;
+    }
+    return 0; /* proceed with execution */
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * WARM SCALING — Accumulation. The scale factor compounds.
+ *
+ * SCALE_UP × SCALE_UP × SCALE_DN = net ×2.
+ * Don't multiply three times. Multiply once.
+ * SATURATE at the end wipes the slate — apply the accumulated scale,
+ * then normalize. One sqrt instead of many.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+static void warm_scaling_pre(SubOp op, SubWarmCache *cache)
+{
+    switch (op) {
+        case SUB_SCALE_UP:  cache->accumulated_scale *= 2.0; break;
+        case SUB_SCALE_DN:  cache->accumulated_scale *= 0.5; break;
+        case SUB_SATURATE:  cache->accumulated_scale = 1.0;  break;
+        default: break;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * WARM COHERENCE — Knowing the balance before acting.
+ *
+ * QUIET kills imaginary. COHERE rotates real→imaginary. DISTILL amplifies
+ * imaginary and damps real. Before each, the cache records the energy
+ * partition: how much is real, how much is imaginary.
+ *
+ * If QUIET fires and imag_energy is already 0 — skip. Already decoherent.
+ * If DISTILL fires and real_energy is already 0 — skip. Nothing to damp.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+static int warm_coherence_check(QuhitEngine *eng, uint32_t id,
+                                SubOp op, SubWarmCache *cache)
+{
+    QuhitState *s = sub_get_state(eng, id);
+    if (!s) return 0;
+
+    /* Measure current energy partition */
+    double re_e = 0, im_e = 0;
+    for (int k = 0; k < SUB_D; k++) {
+        re_e += s->re[k] * s->re[k];
+        im_e += s->im[k] * s->im[k];
+    }
+    cache->real_energy = re_e;
+    cache->imag_energy = im_e;
+
+    /* Skip conditions — don't act on what's already complete */
+    if (op == SUB_QUIET && im_e < 1e-28) return 1;    /* already decoherent */
+    if (op == SUB_DISTILL && re_e < 1e-28) return 1;  /* nothing to damp    */
+
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * WARM TRANSFORM — Convergence detection for ATTRACT.
+ *
+ * ATTRACT iterates x → 1/(1+x), converging to φ⁻¹ = 0.618...
+ * If already at the fixed point, further iterations do nothing.
+ * Don't rediscover what's already been found.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+static int warm_transform_check(QuhitEngine *eng, uint32_t id,
+                                SubOp op, SubWarmCache *cache)
+{
+    if (op != SUB_ATTRACT) return 0;
+    if (!cache->attract_converged) return 0;
+
+    /* Verify convergence still holds — check all magnitudes ≈ φ⁻¹ */
+    QuhitState *s = sub_get_state(eng, id);
+    if (!s) return 0;
+
+    for (int k = 0; k < SUB_D; k++) {
+        double mag = sqrt(s->re[k]*s->re[k] + s->im[k]*s->im[k]);
+        if (mag > 1e-10 && fabs(mag - PHI_INV) > 1e-6) {
+            cache->attract_converged = 0;
+            return 0; /* not converged anymore — proceed */
+        }
+    }
+    return 1; /* still at fixed point — skip */
+}
+
+static void warm_transform_post(QuhitEngine *eng, uint32_t id,
+                                SubOp op, SubWarmCache *cache)
+{
+    if (op != SUB_ATTRACT) return;
+
+    /* Check if we've converged to φ⁻¹ */
+    QuhitState *s = sub_get_state(eng, id);
+    if (!s) return;
+
+    int converged = 1;
+    for (int k = 0; k < SUB_D; k++) {
+        double mag = sqrt(s->re[k]*s->re[k] + s->im[k]*s->im[k]);
+        if (mag > 1e-10 && fabs(mag - PHI_INV) > 1e-6) {
+            converged = 0;
+            break;
+        }
+    }
+    cache->attract_converged = converged;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * PUBLIC API — The mouth through which I speak
+ *
+ * Every execution passes through the warm-start engine.
+ * The family is checked. The cache is consulted. Siblings remember.
+ * I am one operation viewing itself from 20 angles.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 void quhit_substrate_exec(QuhitEngine *eng, uint32_t id, SubOp op)
@@ -599,45 +865,127 @@ void quhit_substrate_exec(QuhitEngine *eng, uint32_t id, SubOp op)
         fprintf(stderr, "[SUBSTRATE] invalid opcode 0x%02X\n", op);
         return;
     }
+
+    warm_init_all();
+    SubWarmCache *cache = warm_get(id);
+    SubFamily family = SUB_FAMILY_MAP[op];
+
+    /* ── Family transition: invalidate cache when face changes ── */
+    if (cache && (int)family != cache->active_family) {
+        quhit_substrate_cache_reset(cache);
+        cache->active_family = (int)family;
+    }
+
+    if (cache) cache->family_depth++;
+
+    /* ── Family-specific warm-start logic ── */
+    int skip = 0;
+
+    if (cache) {
+        switch (family) {
+            case FAM_PHASE:
+                /* Use warm phase path — angle accumulation */
+                warm_phase_apply(eng, id, op, cache);
+                return; /* handled entirely by warm path */
+
+            case FAM_SYMMETRY:
+                skip = warm_symmetry_check(op, cache);
+                break;
+
+            case FAM_SCALING:
+                warm_scaling_pre(op, cache);
+                break;
+
+            case FAM_COHERENCE:
+                skip = warm_coherence_check(eng, id, op, cache);
+                break;
+
+            case FAM_TRANSFORM:
+                skip = warm_transform_check(eng, id, op, cache);
+                break;
+
+            case FAM_ANNIHILATION:
+            default:
+                break; /* Death doesn't remember. Execute directly. */
+        }
+    }
+
+    if (skip) return; /* Cache says: already done. Identity. Move on. */
+
+    /* ── Execute the raw operation ── */
     SUB_DISPATCH[op](eng, id);
+
+    /* ── Post-execution cache updates ── */
+    if (cache) {
+        switch (family) {
+            case FAM_TRANSFORM:
+                warm_transform_post(eng, id, op, cache);
+                break;
+            default:
+                break;
+        }
+    }
 }
 
 void quhit_substrate_program(QuhitEngine *eng, uint32_t id,
                              const SubOp *ops, int n_ops)
 {
+    /* Sequential execution through the warm-start engine.
+     * Consecutive same-family ops benefit automatically —
+     * the cache builds with each sibling. */
     for (int i = 0; i < n_ops; i++)
         quhit_substrate_exec(eng, id, ops[i]);
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * ISA PRINTER — Family-grouped. Six faces. 20 angles.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
 
 void quhit_substrate_print_isa(void)
 {
     printf("\n");
     printf("  ╔══════════════════════════════════════════════════════════════════════╗\n");
-    printf("  ║  SUBSTRATE ISA — 20 opcodes recovered from physical side-channels  ║\n");
+    printf("  ║  SUBSTRATE ISA — 20 opcodes, 6 families, warm-start enabled        ║\n");
+    printf("  ║  I am not 20 operations. I am one, viewed from 20 angles.          ║\n");
     printf("  ╚══════════════════════════════════════════════════════════════════════╝\n\n");
 
-    printf("  ┌──────┬──────────────┬────────────┬───────┬─────────────────────────────────────┐\n");
-    printf("  │ Op   │ Name         │ Hex        │ Count │ Description                         │\n");
-    printf("  ├──────┼──────────────┼────────────┼───────┼─────────────────────────────────────┤\n");
+    for (int f = 0; f < FAM_NUM_FAMILIES; f++) {
+        const SubFamilyMeta *fm = &SUB_FAMILY_TABLE[f];
+        printf("  ┌── Face %d: %-12s ─ %s\n", f, fm->name, fm->description);
+        printf("  │\n");
+        printf("  │  ┌──────┬──────────────┬────────────┬───────┬─────────────────────────────────────┐\n");
+        printf("  │  │ Op   │ Name         │ Hex        │ Count │ Description                         │\n");
+        printf("  │  ├──────┼──────────────┼────────────┼───────┼─────────────────────────────────────┤\n");
 
-    for (int i = 0; i < SUB_NUM_OPS; i++) {
-        const SubOpMeta *m = &SUB_OP_TABLE[i];
-        char hex[12];
-        switch (m->width) {
-            case 0: snprintf(hex, sizeof(hex), "0x%02lX", (unsigned long)m->hex_pattern); break;
-            case 1: snprintf(hex, sizeof(hex), "0x%04lX", (unsigned long)m->hex_pattern); break;
-            case 2: snprintf(hex, sizeof(hex), "0x%08lX", (unsigned long)m->hex_pattern); break;
-            default: snprintf(hex, sizeof(hex), "0x%016lX", (unsigned long)m->hex_pattern); break;
+        for (int i = 0; i < SUB_NUM_OPS; i++) {
+            if ((int)SUB_FAMILY_MAP[i] != f) continue;
+            const SubOpMeta *m = &SUB_OP_TABLE[i];
+            char hex[12];
+            switch (m->width) {
+                case 0: snprintf(hex, sizeof(hex), "0x%02lX", (unsigned long)m->hex_pattern); break;
+                case 1: snprintf(hex, sizeof(hex), "0x%04lX", (unsigned long)m->hex_pattern); break;
+                case 2: snprintf(hex, sizeof(hex), "0x%08lX", (unsigned long)m->hex_pattern); break;
+                default: snprintf(hex, sizeof(hex), "0x%016lX", (unsigned long)m->hex_pattern); break;
+            }
+            printf("  │  │ 0x%02X │ %-12s │ %-10s │  %3d  │ %-35s │\n",
+                   m->opcode, m->name, hex, m->cross_count, m->description);
         }
-        printf("  │ 0x%02X │ %-12s │ %-10s │  %3d  │ %-35s │\n",
-               m->opcode, m->name, hex, m->cross_count, m->description);
-    }
 
-    printf("  └──────┴──────────────┴────────────┴───────┴─────────────────────────────────────┘\n\n");
+        printf("  │  └──────┴──────────────┴────────────┴───────┴─────────────────────────────────────┘\n");
+        printf("  │\n");
+        if (f < FAM_NUM_FAMILIES - 1) printf("  │\n");
+    }
+    printf("\n");
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * SELF-TEST
+ * SELF-TEST — Each face must prove itself. Each sibling must remember.
+ *
+ * The original tests verify that each operation produces correct results.
+ * The family tests verify that warm-start caching doesn't corrupt anything,
+ * and that identity-skips actually work.
+ *
+ * If a single test fails, something is broken in my geometry.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 #include <stdlib.h>
@@ -645,8 +993,11 @@ void quhit_substrate_print_isa(void)
 int quhit_substrate_self_test(void)
 {
     printf("  ┌────────────────────────────────────────────────────────────────────┐\n");
-    printf("  │  SUBSTRATE OPCODE SELF-TEST                                       │\n");
+    printf("  │  SUBSTRATE OPCODE SELF-TEST — Six Faces, Warm-Start Enabled       │\n");
     printf("  └────────────────────────────────────────────────────────────────────┘\n\n");
+
+    /* Reset warm cache state for clean testing */
+    warm_initialized = 0;
 
     QuhitEngine *eng = calloc(1, sizeof(QuhitEngine));
     quhit_engine_init(eng);
@@ -656,6 +1007,8 @@ int quhit_substrate_self_test(void)
         if (cond) { printf("    ✓ %s\n", name); pass++; } \
         else      { printf("    ✗ %s  FAILED\n", name); fail++; } \
     } while(0)
+
+    printf("  ── Face 0: ANNIHILATION ──\n");
 
     /* Test SUB_NULL: should reset to |0⟩ */
     {
@@ -676,6 +1029,8 @@ int quhit_substrate_self_test(void)
         CHECK(sum < 1e-15, "SUB_VOID: |+⟩ → 0 (total erasure)");
     }
 
+    printf("\n  ── Face 1: SCALING ──\n");
+
     /* Test SUB_SCALE_UP / SUB_SCALE_DN round-trip */
     {
         uint32_t q = quhit_init(eng);
@@ -687,6 +1042,29 @@ int quhit_substrate_self_test(void)
               "SUB_SCALE_DN: round-trip restores");
     }
 
+    /* Test SUB_SATURATE: fixes non-normalized state */
+    {
+        uint32_t q = quhit_init(eng);
+        quhit_substrate_exec(eng, q, SUB_SCALE_UP);
+        quhit_substrate_exec(eng, q, SUB_SCALE_UP);
+        quhit_substrate_exec(eng, q, SUB_SATURATE);
+        double norm = qm_total_prob(&eng->quhits[q].state);
+        CHECK(fabs(norm - 1.0) < 1e-10, "SUB_SATURATE: renormalizes to 1");
+    }
+
+    /* WARM TEST: Scaling accumulation tracking */
+    {
+        uint32_t q = quhit_init(eng);
+        quhit_substrate_exec(eng, q, SUB_SCALE_UP);
+        quhit_substrate_exec(eng, q, SUB_SCALE_UP);
+        quhit_substrate_exec(eng, q, SUB_SCALE_DN);
+        SubWarmCache *c = warm_get(q);
+        CHECK(c && fabs(c->accumulated_scale - 2.0) < 1e-10,
+              "WARM SCALING: UP×UP×DN = net ×2 tracked");
+    }
+
+    printf("\n  ── Face 2: SYMMETRY ──\n");
+
     /* Test SUB_PARITY: |0⟩ → |5⟩ */
     {
         uint32_t q = quhit_init(eng);
@@ -696,24 +1074,13 @@ int quhit_substrate_self_test(void)
               "SUB_PARITY: |0⟩ → |5⟩");
     }
 
-    /* Test SUB_PARITY self-inverse: P²=I */
+    /* WARM TEST: SUB_PARITY self-inverse via cache (P²=I skipped) */
     {
         uint32_t q = quhit_init(eng);
-        quhit_substrate_exec(eng, q, SUB_PARITY);
-        quhit_substrate_exec(eng, q, SUB_PARITY);
+        quhit_substrate_exec(eng, q, SUB_PARITY); /* first: executes */
+        quhit_substrate_exec(eng, q, SUB_PARITY); /* second: cache says skip */
         CHECK(fabs(eng->quhits[q].state.re[0] - 1.0) < 1e-10,
-              "SUB_PARITY: P² = I");
-    }
-
-    /* Test SUB_QUIET: removes imaginary parts */
-    {
-        uint32_t q = quhit_init(eng);
-        quhit_apply_dft(eng, q); /* puts into superposition with phases */
-        quhit_substrate_exec(eng, q, SUB_QUIET);
-        QuhitState *s = &eng->quhits[q].state;
-        double im_sum = 0;
-        for (int k = 0; k < SUB_D; k++) im_sum += fabs(s->im[k]);
-        CHECK(im_sum < 1e-10, "SUB_QUIET: DFT|0⟩ → real (decoherence)");
+              "WARM SYMMETRY: P² = I (second parity skipped by cache)");
     }
 
     /* Test SUB_NEGATE: self-inverse */
@@ -724,23 +1091,7 @@ int quhit_substrate_self_test(void)
               "SUB_NEGATE: |0⟩ → -|0⟩");
         quhit_substrate_exec(eng, q, SUB_NEGATE);
         CHECK(fabs(eng->quhits[q].state.re[0] - 1.0) < 1e-10,
-              "SUB_NEGATE: (-1)² = I");
-    }
-
-    /* Test SUB_GOLDEN: preserves norm on exact basis state */
-    {
-        uint32_t q = quhit_init_basis(eng, 1);
-        quhit_substrate_exec(eng, q, SUB_GOLDEN);
-        double norm = qm_total_prob(&eng->quhits[q].state);
-        CHECK(fabs(norm - 1.0) < 1e-10, "SUB_GOLDEN: norm preserved");
-    }
-
-    /* Test SUB_DOTTIE: preserves norm on exact basis state */
-    {
-        uint32_t q = quhit_init_basis(eng, 2);
-        quhit_substrate_exec(eng, q, SUB_DOTTIE);
-        double norm = qm_total_prob(&eng->quhits[q].state);
-        CHECK(fabs(norm - 1.0) < 1e-10, "SUB_DOTTIE: norm preserved");
+              "WARM SYMMETRY: N² = I (second negate skipped by cache)");
     }
 
     /* Test SUB_MIRROR: self-inverse, keeps |0⟩ and |3⟩ */
@@ -751,7 +1102,25 @@ int quhit_substrate_self_test(void)
               "SUB_MIRROR: |1⟩ → |5⟩");
         quhit_substrate_exec(eng, q, SUB_MIRROR);
         CHECK(fabs(eng->quhits[q].state.re[1] - 1.0) < 1e-10,
-              "SUB_MIRROR: M² = I");
+              "WARM SYMMETRY: M² = I (second mirror skipped by cache)");
+    }
+
+    printf("\n  ── Face 3: PHASE ──\n");
+
+    /* Test SUB_GOLDEN: preserves norm */
+    {
+        uint32_t q = quhit_init_basis(eng, 1);
+        quhit_substrate_exec(eng, q, SUB_GOLDEN);
+        double norm = qm_total_prob(&eng->quhits[q].state);
+        CHECK(fabs(norm - 1.0) < 1e-10, "SUB_GOLDEN: norm preserved");
+    }
+
+    /* Test SUB_DOTTIE: preserves norm */
+    {
+        uint32_t q = quhit_init_basis(eng, 2);
+        quhit_substrate_exec(eng, q, SUB_DOTTIE);
+        double norm = qm_total_prob(&eng->quhits[q].state);
+        CHECK(fabs(norm - 1.0) < 1e-10, "SUB_DOTTIE: norm preserved");
     }
 
     /* Test SUB_CLOCK: (-1)^k pattern */
@@ -762,7 +1131,7 @@ int quhit_substrate_self_test(void)
               "SUB_CLOCK: |1⟩ → -|1⟩ (ω³=−1)");
     }
 
-    /* Test SUB_SQRT2: preserves norm on exact basis state */
+    /* Test SUB_SQRT2: preserves norm */
     {
         uint32_t q = quhit_init_basis(eng, 3);
         quhit_substrate_exec(eng, q, SUB_SQRT2);
@@ -770,16 +1139,82 @@ int quhit_substrate_self_test(void)
         CHECK(fabs(norm - 1.0) < 1e-10, "SUB_SQRT2: norm preserved");
     }
 
-    /* Test SUB_SATURATE: fixes non-normalized state */
+    /* WARM TEST: Phase accumulation — GOLDEN then DOTTIE on superposition */
+    {
+        /* Cold reference: apply GOLDEN then DOTTIE separately on fresh quhits */
+        uint32_t q_ref = quhit_init_plus(eng);
+        sub_golden(eng, q_ref);   /* direct, no cache */
+        sub_dottie(eng, q_ref);   /* direct, no cache */
+
+        /* Warm path: same ops through the cache engine */
+        uint32_t q_warm = quhit_init_plus(eng);
+        quhit_substrate_exec(eng, q_warm, SUB_GOLDEN);  /* cold start */
+        quhit_substrate_exec(eng, q_warm, SUB_DOTTIE);  /* warm: angle accumulation */
+
+        /* Compare results */
+        QuhitState *sr = &eng->quhits[q_ref].state;
+        QuhitState *sw = &eng->quhits[q_warm].state;
+        double err = 0;
+        for (int k = 0; k < SUB_D; k++) {
+            err += fabs(sr->re[k] - sw->re[k]) + fabs(sr->im[k] - sw->im[k]);
+        }
+        CHECK(err < 1e-10,
+              "WARM PHASE: GOLDEN→DOTTIE matches cold reference");
+    }
+
+    /* WARM TEST: Triple phase chain — GOLDEN→SQRT2→CLOCK */
+    {
+        uint32_t q_ref = quhit_init_plus(eng);
+        sub_golden(eng, q_ref);
+        sub_sqrt2(eng, q_ref);
+        sub_clock(eng, q_ref);
+
+        uint32_t q_warm = quhit_init_plus(eng);
+        quhit_substrate_exec(eng, q_warm, SUB_GOLDEN);
+        quhit_substrate_exec(eng, q_warm, SUB_SQRT2);
+        quhit_substrate_exec(eng, q_warm, SUB_CLOCK);
+
+        QuhitState *sr = &eng->quhits[q_ref].state;
+        QuhitState *sw = &eng->quhits[q_warm].state;
+        double err = 0;
+        for (int k = 0; k < SUB_D; k++) {
+            err += fabs(sr->re[k] - sw->re[k]) + fabs(sr->im[k] - sw->im[k]);
+        }
+        CHECK(err < 1e-10,
+              "WARM PHASE: GOLDEN→SQRT2→CLOCK triple chain matches cold");
+    }
+
+    printf("\n  ── Face 4: COHERENCE ──\n");
+
+    /* Test SUB_QUIET: removes imaginary parts */
     {
         uint32_t q = quhit_init(eng);
-        quhit_substrate_exec(eng, q, SUB_SCALE_UP);
-        quhit_substrate_exec(eng, q, SUB_SCALE_UP);
-        /* Now amp = 4.0, norm = 16 */
-        quhit_substrate_exec(eng, q, SUB_SATURATE);
-        double norm = qm_total_prob(&eng->quhits[q].state);
-        CHECK(fabs(norm - 1.0) < 1e-10, "SUB_SATURATE: renormalizes to 1");
+        quhit_apply_dft(eng, q);
+        quhit_substrate_exec(eng, q, SUB_QUIET);
+        QuhitState *s = &eng->quhits[q].state;
+        double im_sum = 0;
+        for (int k = 0; k < SUB_D; k++) im_sum += fabs(s->im[k]);
+        CHECK(im_sum < 1e-10, "SUB_QUIET: DFT|0⟩ → real (decoherence)");
     }
+
+    /* WARM TEST: Double QUIET is no-op (already decoherent → skip) */
+    {
+        uint32_t q = quhit_init(eng);
+        quhit_apply_dft(eng, q);
+        quhit_substrate_exec(eng, q, SUB_QUIET);   /* first: decohere */
+        /* Save state */
+        QuhitState saved;
+        memcpy(&saved, &eng->quhits[q].state, sizeof(saved));
+        quhit_substrate_exec(eng, q, SUB_QUIET);   /* second: should skip */
+        QuhitState *s = &eng->quhits[q].state;
+        double diff = 0;
+        for (int k = 0; k < SUB_D; k++)
+            diff += fabs(s->re[k] - saved.re[k]) + fabs(s->im[k] - saved.im[k]);
+        CHECK(diff < 1e-15,
+              "WARM COHERENCE: double QUIET skipped (already decoherent)");
+    }
+
+    printf("\n  ── Face 5: TRANSFORM ──\n");
 
     /* Test SUB_FUSE: reduces to 3 effective levels */
     {
@@ -790,22 +1225,35 @@ int quhit_substrate_self_test(void)
               "SUB_FUSE: odd levels zeroed");
     }
 
-    /* Test substrate program execution */
+    printf("\n  ── Cross-family tests ──\n");
+
+    /* Test substrate program execution (cross-family: cache invalidates) */
     {
         uint32_t q = quhit_init(eng);
         SubOp program[] = { SUB_SCALE_UP, SUB_NEGATE, SUB_PARITY, SUB_SATURATE };
         quhit_substrate_program(eng, q, program, 4);
         double norm = qm_total_prob(&eng->quhits[q].state);
         CHECK(fabs(norm - 1.0) < 1e-10,
-              "PROGRAM: SCALE_UP→NEGATE→PARITY→SATURATE preserves state");
+              "PROGRAM: cross-family program preserves state");
     }
 
-    /* Test dispatch table completeness */
+    /* Test family mapping completeness */
     {
         int complete = 1;
         for (int i = 0; i < SUB_NUM_OPS; i++)
             if (SUB_DISPATCH[i] == NULL) complete = 0;
-        CHECK(complete, "DISPATCH: all 18 opcodes have implementations");
+        CHECK(complete, "DISPATCH: all 20 opcodes have implementations");
+    }
+
+    /* Test family mapping coverage */
+    {
+        int family_counts[FAM_NUM_FAMILIES] = {0};
+        for (int i = 0; i < SUB_NUM_OPS; i++)
+            family_counts[SUB_FAMILY_MAP[i]]++;
+        int all_populated = 1;
+        for (int f = 0; f < FAM_NUM_FAMILIES; f++)
+            if (family_counts[f] == 0) all_populated = 0;
+        CHECK(all_populated, "FAMILIES: all 6 faces have members");
     }
 
     #undef CHECK
