@@ -569,3 +569,216 @@ void triality_print(TrialityQuhit *q, const char *label) {
     for (int i = 0; i < 12 + TRI_D * 12; i++) printf("─");
     printf("┘\n");
 }
+
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * LAZY TRIALITY QUHIT — Heisenberg Picture Implementation
+ *
+ * Chain: state → F^pre0 · D0 → F^pre1 · D1 → ... → F^trailing
+ * All diagonals in computational (edge) basis.
+ * DFTs tracked per-segment. Consecutive same-type gates fuse.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static void ltri_diag_identity(double *re, double *im) {
+    for (int k = 0; k < TRI_D; k++) { re[k] = 1.0; im[k] = 0.0; }
+}
+
+static void ltri_diag_mul_phase(double *d_re, double *d_im, int k,
+                                double pr, double pi) {
+    double re = d_re[k], im = d_im[k];
+    d_re[k] = re * pr - im * pi;
+    d_im[k] = re * pi + im * pr;
+}
+
+static void ltri_apply_diag(const double *d_re, const double *d_im,
+                            const double *in_re, const double *in_im,
+                            double *out_re, double *out_im) {
+    for (int k = 0; k < TRI_D; k++) {
+        out_re[k] = d_re[k] * in_re[k] - d_im[k] * in_im[k];
+        out_im[k] = d_re[k] * in_im[k] + d_im[k] * in_re[k];
+    }
+}
+
+static void ltri_apply_n_dfts(double *re, double *im, int n) {
+    n = ((n % 3) + 3) % 3;
+    for (int d = 0; d < n; d++) {
+        double tmp_re[TRI_D], tmp_im[TRI_D];
+        dft6_forward(re, im, tmp_re, tmp_im);
+        memcpy(re, tmp_re, sizeof(tmp_re));
+        memcpy(im, tmp_im, sizeof(tmp_im));
+    }
+}
+
+static void ltri_new_segment(LazyTrialityQuhit *q) {
+    if (q->n_segments >= MAX_LAZY_SEGMENTS) {
+        double tmp_re[TRI_D], tmp_im[TRI_D];
+        ltri_materialize(q, tmp_re, tmp_im);
+        memcpy(q->state_re, tmp_re, sizeof(tmp_re));
+        memcpy(q->state_im, tmp_im, sizeof(tmp_im));
+        q->n_segments = 0;
+        q->trailing_dfts = 0;
+    }
+    int idx = q->n_segments++;
+    ltri_diag_identity(q->segments[idx].diag_re, q->segments[idx].diag_im);
+    q->segments[idx].pre_dfts = q->trailing_dfts;
+    q->trailing_dfts = 0;
+    q->segments_created++;
+}
+
+void ltri_init(LazyTrialityQuhit *q) {
+    memset(q, 0, sizeof(*q));
+    q->state_re[0] = 1.0;
+}
+
+void ltri_init_basis(LazyTrialityQuhit *q, int k) {
+    memset(q, 0, sizeof(*q));
+    q->state_re[k] = 1.0;
+}
+
+/* Ensure fusable segment exists (trailing_dfts must be 0 to fuse) */
+static void ltri_ensure_segment(LazyTrialityQuhit *q) {
+    if (q->n_segments == 0 || q->trailing_dfts != 0) {
+        ltri_new_segment(q);
+    }
+}
+
+void ltri_z(LazyTrialityQuhit *q) {
+    /* Z = diag(w^k) in edge basis. No DFTs.
+     * Fuses if trailing_dfts == 0. */
+    ltri_ensure_segment(q);
+    int idx = q->n_segments - 1;
+    for (int k = 0; k < TRI_D; k++)
+        ltri_diag_mul_phase(q->segments[idx].diag_re, q->segments[idx].diag_im,
+                            k, W6_RE[k], W6_IM[k]);
+    q->gates_fused++;
+}
+
+void ltri_x(LazyTrialityQuhit *q) {
+    /* X = IDFT * diag(w^k) * DFT
+     * = 2_DFTs * diag(w^k) * 1_DFT
+     * Step 1: add 1 DFT to trailing (the forward DFT)
+     * Step 2: create segment (eats trailing, stores pre_dfts)
+     * Step 3: fuse diag(w^k)
+     * Step 4: set trailing = 2 (the IDFT = 2 forward DFTs)
+     * Consecutive X: trailing=2 + step1_adds_1 = 3 = 0 mod 3 => fuse! */
+    q->trailing_dfts = (q->trailing_dfts + 1) % 3;
+    ltri_ensure_segment(q);
+    int idx = q->n_segments - 1;
+    for (int k = 0; k < TRI_D; k++)
+        ltri_diag_mul_phase(q->segments[idx].diag_re, q->segments[idx].diag_im,
+                            k, W6_RE[k], W6_IM[k]);
+    q->trailing_dfts = 2;
+    q->gates_fused++;
+}
+
+void ltri_shift(LazyTrialityQuhit *q, int delta) {
+    delta = ((delta % TRI_D) + TRI_D) % TRI_D;
+    if (delta == 0) return;
+    /* shift(d) = IDFT * diag(w^(dk)) * DFT */
+    q->trailing_dfts = (q->trailing_dfts + 1) % 3;
+    ltri_ensure_segment(q);
+    int idx = q->n_segments - 1;
+    for (int k = 0; k < TRI_D; k++) {
+        int widx = (delta * k) % 6;
+        ltri_diag_mul_phase(q->segments[idx].diag_re, q->segments[idx].diag_im,
+                            k, W6_RE[widx], W6_IM[widx]);
+    }
+    q->trailing_dfts = 2;
+    q->gates_fused++;
+}
+
+void ltri_dft(LazyTrialityQuhit *q) {
+    q->trailing_dfts = (q->trailing_dfts + 1) % 3;
+    q->gates_fused++;
+}
+
+void ltri_idft(LazyTrialityQuhit *q) {
+    q->trailing_dfts = (q->trailing_dfts + 2) % 3;
+    q->gates_fused++;
+}
+
+void ltri_phase(LazyTrialityQuhit *q, const double *phi_re, const double *phi_im) {
+    ltri_ensure_segment(q);
+    int idx = q->n_segments - 1;
+    for (int k = 0; k < TRI_D; k++)
+        ltri_diag_mul_phase(q->segments[idx].diag_re, q->segments[idx].diag_im,
+                            k, phi_re[k], phi_im[k]);
+    q->gates_fused++;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * MATERIALIZE: state -> F^pre0 * D0 -> F^pre1 * D1 -> ... -> F^trailing
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+void ltri_materialize(LazyTrialityQuhit *q, double *out_re, double *out_im) {
+    double cur_re[TRI_D], cur_im[TRI_D];
+    memcpy(cur_re, q->state_re, sizeof(cur_re));
+    memcpy(cur_im, q->state_im, sizeof(cur_im));
+
+    for (int s = 0; s < q->n_segments; s++) {
+        ltri_apply_n_dfts(cur_re, cur_im, q->segments[s].pre_dfts);
+
+        double tmp_re[TRI_D], tmp_im[TRI_D];
+        ltri_apply_diag(q->segments[s].diag_re, q->segments[s].diag_im,
+                        cur_re, cur_im, tmp_re, tmp_im);
+        memcpy(cur_re, tmp_re, sizeof(cur_re));
+        memcpy(cur_im, tmp_im, sizeof(cur_im));
+    }
+
+    ltri_apply_n_dfts(cur_re, cur_im, q->trailing_dfts);
+
+    memcpy(out_re, cur_re, sizeof(cur_re));
+    memcpy(out_im, cur_im, sizeof(cur_im));
+    q->materializations++;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+int ltri_measure(LazyTrialityQuhit *q, int view, uint64_t *rng_state) {
+    double amp_re[TRI_D], amp_im[TRI_D];
+    ltri_materialize(q, amp_re, amp_im);
+
+    if (view != VIEW_EDGE) {
+        int steps = ((view - VIEW_EDGE) % 3 + 3) % 3;
+        ltri_apply_n_dfts(amp_re, amp_im, steps);
+    }
+
+    double probs[TRI_D], total = 0;
+    for (int k = 0; k < TRI_D; k++) {
+        probs[k] = amp_re[k]*amp_re[k] + amp_im[k]*amp_im[k];
+        total += probs[k];
+    }
+    if (total > 1e-30)
+        for (int k = 0; k < TRI_D; k++) probs[k] /= total;
+
+    double r = triality_rng_double(rng_state);
+    int outcome = 0;
+    double cdf = 0;
+    for (int k = 0; k < TRI_D; k++) {
+        cdf += probs[k];
+        if (r < cdf) { outcome = k; break; }
+    }
+
+    memset(q->state_re, 0, sizeof(q->state_re));
+    memset(q->state_im, 0, sizeof(q->state_im));
+    q->state_re[outcome] = 1.0;
+    q->n_segments = 0;
+    q->trailing_dfts = 0;
+
+    return outcome;
+}
+
+void ltri_stats_print(const LazyTrialityQuhit *q) {
+    printf("\n  ┌─────────────────────────────────────────────────────┐\n");
+    printf("  │  LAZY TRIALITY STATISTICS                           │\n");
+    printf("  ├─────────────────────────────────────────────────────┤\n");
+    printf("  │  Gates fused:          %8lu                     │\n", (unsigned long)q->gates_fused);
+    printf("  │  Segments created:     %8lu                     │\n", (unsigned long)q->segments_created);
+    printf("  │  Current segments:     %8d / %d                │\n", q->n_segments, MAX_LAZY_SEGMENTS);
+    printf("  │  Trailing DFTs:        %8d                     │\n", q->trailing_dfts);
+    printf("  │  Materializations:     %8lu                     │\n", (unsigned long)q->materializations);
+    double fusion_ratio = (q->segments_created > 0) ?
+        (double)q->gates_fused / q->segments_created : 0;
+    printf("  │  Fusion ratio:         %8.1f gates/segment      │\n", fusion_ratio);
+    printf("  └─────────────────────────────────────────────────────┘\n");
+}
