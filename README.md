@@ -90,6 +90,38 @@ The empirical model encoded in this engine:
 
 This means N quhits with P entangled pairs consume `N × 96 + P × 576` bytes — **always linear in N**.
 
+### Three-Body Entanglement (V3.3)
+
+V3.3 extends monogamous pairwise entanglement to **genuine three-body (tripartite) entanglement** via `quhit_triadic.h/.c`. Three quhits share a joint state of D×D×D = 216 complex amplitudes:
+
+```c
+typedef struct {
+    double re[216];   // re[a*36 + b*6 + c]
+    double im[216];   // Three-quhit joint state
+} TriadicJoint;       // 3456 bytes
+```
+
+The D=6 basis decomposes into three **CMY channels**, each a qubit subspace:
+
+| Channel | Basis States | Color |
+|---|---|---|
+| **C** (Cyan) | {0, 1} | Binary face |
+| **M** (Magenta) | {2, 3} | Middle ring |
+| **Y** (Yellow) | {4, 5} | Hot ring |
+
+Key operations:
+
+| Function | Description |
+|---|---|
+| `quhit_triadic_bell` | Triadic Bell: (1/√6) Σ\|k,k,k⟩ — all three collapse identically |
+| `quhit_triadic_product` | Product: \|ψ_a⟩ ⊗ \|ψ_b⟩ ⊗ \|ψ_c⟩ — separable until entangled |
+| `quhit_triadic_cz3` | Three-body CZ: \|a,b,c⟩ → ω^(a·b·c) \|a,b,c⟩ |
+| `quhit_triadic_channel_cz` | Per-channel CZ within one CMY channel |
+| `quhit_triadic_apply_dft` | DFT₆ on one leg of the triple |
+| `quhit_triadic_disentangle` | Dissolve triple, extract marginals |
+
+Memory cost: **3456 bytes per triple** — still O(N), still fits in L1 cache.
+
 ### Memory Model
 
 ```
@@ -206,8 +238,6 @@ The sparse power-iteration SVD operates directly on sparse register entries via 
 V3.3 introduces a **6-component optimization engine** that collectively enables simulations on Hilbert spaces of 10³⁹⁸ dimensions using a single CPU core. Each optimization is independent but composable — enabling them together produces multiplicative speedups.
 
 ### Optimization #1 — Substrate Opcode Warm-Starting
-
-**File**: `quhit_triadic.h/.c`
 
 The substrate ISA's 20 opcodes generate frequently-reused unitary matrices. Warm-starting caches these matrices across Trotter steps, eliminating redundant gate construction.
 
@@ -926,7 +956,10 @@ HexState-main/
 ├── quhit_svd_gate.h/.c   Gate-aware SVD short-circuit + gate log
 ├── quhit_peps_grow.h/.c  Adaptive PEPS bond dimension growth
 ├── quhit_dyn_integrate.h/.c  DynChain: active region tracking (1D–6D)
-├── quhit_triadic.h/.c    Substrate opcode warm-starting + triadic ops
+│  └────────────────────────────────────────────────────────────┘
+│
+│  ┌─ Three-Body Entanglement ───────────────────────────────────┐
+├── quhit_triadic.h/.c    Tripartite (3-body) entanglement with CMY channels
 │  └────────────────────────────────────────────────────────────┘
 │
 │  ┌─ V3 Analytical Engines ─────────────────────────────────────┐
