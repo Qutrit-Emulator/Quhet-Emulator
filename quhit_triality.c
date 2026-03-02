@@ -696,18 +696,7 @@ static void ltri_ensure_segment(LazyTrialityQuhit *q) {
         /* Same view — fuse directly (already in segment) */
         return;
     }
-    if (q->trailing_dfts == 2) {
-        /* HORIZON PARITY: F² = reversal. Don't create new segment.
-         * Instead, reverse the current diagonal entries and keep fusing.
-         * D_new · F² · D_old  =  D_new · perm(D_old)
-         * We reverse the existing diagonal so new phases multiply onto
-         * the reversed version. */
-        int idx = q->n_segments - 1;
-        ltri_diag_reverse(q->segments[idx].diag_re, q->segments[idx].diag_im);
-        q->trailing_dfts = 0;
-        return;
-    }
-    /* trailing = 1 or 3: genuine horizon crossing, new segment required */
+    /* Any nonzero trailing: genuine horizon crossing, new segment */
     ltri_new_segment(q);
 }
 
@@ -770,11 +759,12 @@ void ltri_phase(LazyTrialityQuhit *q, const double *phi_re, const double *phi_im
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- * CHAIN COMPACTION: merge adjacent segments with even pre_dfts
+ * CHAIN COMPACTION: merge adjacent segments where DFTs between them cancel
  *
- * If seg[i+1].pre_dfts == 0: D_{i+1} · D_i  (direct multiply)
- * If seg[i+1].pre_dfts == 2: D_{i+1} · F² · D_i = D_{i+1} · rev(D_i)
- * Only pre_dfts == 1 or 3 are irreducible (real horizon crossings).
+ * If seg[i+1].pre_dfts == 0: diagonals multiply directly.
+ * For pre_dfts == 2: use F²·D = rev(D)·F² to merge diag into prev,
+ *   but the F² stays (reduces segment count, not DFT count).
+ * Only pre_dfts == 0 eliminates both segment AND DFT.
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static void ltri_compact_chain(LazyTrialityQuhit *q) {
@@ -782,16 +772,11 @@ static void ltri_compact_chain(LazyTrialityQuhit *q) {
     int dst = 0;
     for (int src = 1; src < q->n_segments; src++) {
         if (q->segments[src].pre_dfts == 0) {
-            /* Direct fusion: multiply diagonals */
-            ltri_diag_mul(q->segments[dst].diag_re, q->segments[dst].diag_im,
-                          q->segments[src].diag_re, q->segments[src].diag_im);
-        } else if (q->segments[src].pre_dfts == 2) {
-            /* F² reversal fusion: reverse dst, then multiply */
-            ltri_diag_reverse(q->segments[dst].diag_re, q->segments[dst].diag_im);
+            /* Direct fusion: multiply diagonals, no DFT between them */
             ltri_diag_mul(q->segments[dst].diag_re, q->segments[dst].diag_im,
                           q->segments[src].diag_re, q->segments[src].diag_im);
         } else {
-            /* Odd crossing — cannot compact, advance dst */
+            /* Any nonzero pre_dfts: cannot eliminate, advance dst */
             dst++;
             if (dst != src) {
                 memcpy(&q->segments[dst], &q->segments[src], sizeof(q->segments[0]));
