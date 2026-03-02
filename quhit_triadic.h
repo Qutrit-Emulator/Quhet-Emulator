@@ -644,4 +644,107 @@ static inline void triad_channel_phase_a(TriadicJoint *j, int channel, double th
     triad_channel_gate_a(j, channel, U);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * FACE SWITCHING — Rotate the cube to present a different face
+ *
+ * Channel permutation: C→M→Y→C (cycle forward) or C→Y→M→C (cycle backward).
+ * This is a cube rotation of 120° around the body diagonal.
+ *
+ * Cost: ZERO multiplies. O(N) index remap — the cheapest possible gate.
+ *
+ * Geometrically: you're picking up the cube and showing a different face
+ * to the readout quhit without changing any amplitudes or phases.
+ *
+ * In the QNN context, this lets the network choose which "face" of
+ * its internal representation to present for classification.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* Rotate channels of quhit A forward: C→M→Y→C
+ * |0⟩→|2⟩, |1⟩→|3⟩, |2⟩→|4⟩, |3⟩→|5⟩, |4⟩→|0⟩, |5⟩→|1⟩ */
+static inline void triad_face_rotate_a(TriadicJoint *j)
+{
+    TriadicJoint tmp;
+    for (int a = 0; a < TRIAD_D; a++)
+    for (int b = 0; b < TRIAD_D; b++)
+    for (int c = 0; c < TRIAD_D; c++) {
+        int a_new = (a + 2) % TRIAD_D;  /* Shift by 2 = one channel forward */
+        int idx_old = TRIAD_IDX(a, b, c);
+        int idx_new = TRIAD_IDX(a_new, b, c);
+        tmp.re[idx_new] = j->re[idx_old];
+        tmp.im[idx_new] = j->im[idx_old];
+    }
+    for (int i = 0; i < TRIAD_D3; i++) {
+        j->re[i] = tmp.re[i];
+        j->im[i] = tmp.im[i];
+    }
+}
+
+/* Rotate channels of quhit A backward: C→Y→M→C
+ * |0⟩→|4⟩, |1⟩→|5⟩, |2⟩→|0⟩, |3⟩→|1⟩, |4⟩→|2⟩, |5⟩→|3⟩ */
+static inline void triad_face_rotate_back_a(TriadicJoint *j)
+{
+    TriadicJoint tmp;
+    for (int a = 0; a < TRIAD_D; a++)
+    for (int b = 0; b < TRIAD_D; b++)
+    for (int c = 0; c < TRIAD_D; c++) {
+        int a_new = (a + 4) % TRIAD_D;  /* Shift by 4 = one channel backward */
+        int idx_old = TRIAD_IDX(a, b, c);
+        int idx_new = TRIAD_IDX(a_new, b, c);
+        tmp.re[idx_new] = j->re[idx_old];
+        tmp.im[idx_new] = j->im[idx_old];
+    }
+    for (int i = 0; i < TRIAD_D3; i++) {
+        j->re[i] = tmp.re[i];
+        j->im[i] = tmp.im[i];
+    }
+}
+
+/* Swap two channels of quhit A: face_a ↔ face_b
+ * This is a 90° rotation of the cube around the axis perpendicular
+ * to the two swapped faces. Also zero multiplies. */
+static inline void triad_face_swap_a(TriadicJoint *j, int face_a, int face_b)
+{
+    int sa0 = face_a * 2, sa1 = face_a * 2 + 1;
+    int sb0 = face_b * 2, sb1 = face_b * 2 + 1;
+
+    for (int b = 0; b < TRIAD_D; b++)
+    for (int c = 0; c < TRIAD_D; c++) {
+        int ia0 = TRIAD_IDX(sa0, b, c), ia1 = TRIAD_IDX(sa1, b, c);
+        int ib0 = TRIAD_IDX(sb0, b, c), ib1 = TRIAD_IDX(sb1, b, c);
+
+        /* Swap |sa0⟩ ↔ |sb0⟩ */
+        double tr, ti;
+        tr = j->re[ia0]; ti = j->im[ia0];
+        j->re[ia0] = j->re[ib0]; j->im[ia0] = j->im[ib0];
+        j->re[ib0] = tr; j->im[ib0] = ti;
+
+        /* Swap |sa1⟩ ↔ |sb1⟩ */
+        tr = j->re[ia1]; ti = j->im[ia1];
+        j->re[ia1] = j->re[ib1]; j->im[ia1] = j->im[ib1];
+        j->re[ib1] = tr; j->im[ib1] = ti;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * MULTI-FACE READOUT — Average marginals from all 3 quhits
+ *
+ * Instead of reading only quhit A, average the measurement probabilities
+ * across A, B, and C. This is like looking at the cube from all three
+ * axis directions and combining what you see.
+ *
+ * Gives a more stable readout that's less sensitive to which quhit
+ * happens to be "A" vs "B" vs "C".
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+static inline void triad_multiface_readout(const TriadicJoint *j, double *probs)
+{
+    double pa[TRIAD_D], pb[TRIAD_D], pc[TRIAD_D];
+    triad_marginal_a(j, pa);
+    triad_marginal_b(j, pb);
+    triad_marginal_c(j, pc);
+
+    for (int k = 0; k < TRIAD_D; k++)
+        probs[k] = (pa[k] + pb[k] + pc[k]) / 3.0;
+}
+
 #endif /* QUHIT_TRIADIC_H */
