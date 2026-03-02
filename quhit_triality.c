@@ -38,6 +38,7 @@ static const double W6I_IM[6] = {
 };
 
 static const double INV_SQRT6 = 0.40824829046386301637;  /* 1/√6 */
+static const double INV_SQRT2 = 0.70710678118654752440;  /* 1/√2 */
 
 /* ═══════════════════════════════════════════════════════════════════════
  * STATISTICS
@@ -49,34 +50,7 @@ void triality_stats_reset(void) {
     memset(&triality_stats, 0, sizeof(triality_stats));
 }
 
-void triality_stats_print(void) {
-    printf("\n  ┌─────────────────────────────────────────────────────┐\n");
-    printf("  │  TRIALITY QUHIT STATISTICS                          │\n");
-    printf("  ├─────────────────────────────────────────────────────┤\n");
-    printf("  │  View conversions:                                  │\n");
-    printf("  │    Edge→Vertex:    %8lu                         │\n", triality_stats.edge_to_vertex);
-    printf("  │    Edge→Diagonal:  %8lu                         │\n", triality_stats.edge_to_diag);
-    printf("  │    Vertex→Edge:    %8lu                         │\n", triality_stats.vertex_to_edge);
-    printf("  │    Vertex→Diag:    %8lu                         │\n", triality_stats.vertex_to_diag);
-    printf("  │    Diag→Edge:      %8lu                         │\n", triality_stats.diag_to_edge);
-    printf("  │    Diag→Vertex:    %8lu                         │\n", triality_stats.diag_to_vertex);
-    printf("  │  Gates by view:                                     │\n");
-    printf("  │    Edge (phase):   %8lu   O(D) each             │\n", triality_stats.gates_edge);
-    printf("  │    Vertex (shift): %8lu   O(D) each             │\n", triality_stats.gates_vertex);
-    printf("  │    Diagonal:       %8lu   O(D) each             │\n", triality_stats.gates_diag);
-    printf("  │  Triality rotations (O(1)):  %8lu               │\n", triality_stats.rotations);
-    uint64_t total_conv = triality_stats.edge_to_vertex + triality_stats.edge_to_diag +
-                          triality_stats.vertex_to_edge + triality_stats.vertex_to_diag +
-                          triality_stats.diag_to_edge + triality_stats.diag_to_vertex;
-    uint64_t total_gates = triality_stats.gates_edge + triality_stats.gates_vertex +
-                           triality_stats.gates_diag;
-    printf("  │  Total: %lu gates, %lu conversions             │\n", total_gates, total_conv);
-    if (total_gates > 0) {
-        double avg = (total_gates * 6.0 + total_conv * 36.0) / total_gates;
-        printf("  │  Avg ops/gate: %.1f (vs 36.0 standard)           │\n", avg);
-    }
-    printf("  └─────────────────────────────────────────────────────┘\n");
-}
+
 
 /* ═══════════════════════════════════════════════════════════════════════
  * DFT₆ PRIMITIVES — The view conversion engine
@@ -123,22 +97,34 @@ static void dft6_inverse(const double *in_re, const double *in_im,
 void triality_init(TrialityQuhit *q) {
     memset(q, 0, sizeof(*q));
     q->edge_re[0] = 1.0;       /* |0⟩ in computational basis */
-    q->vertex_re[0] = 1.0;     /* DFT₆|0⟩ = (1/√6)(1,1,1,1,1,1) ... */
+    q->vertex_re[0] = 1.0;
     q->diag_re[0] = 1.0;
 
     /* Actually compute the correct views of |0⟩ */
     dft6_forward(q->edge_re, q->edge_im, q->vertex_re, q->vertex_im);
     dft6_forward(q->vertex_re, q->vertex_im, q->diag_re, q->diag_im);
 
-    q->dirty = 0;
+    q->dirty = DIRTY_FOLDED;
     q->primary = VIEW_EDGE;
+
+    /* Enhancement flags */
+    q->eigenstate_class = -1;
+    q->active_mask  = 0x01;   /* only |0⟩ is active */
+    q->active_count = 1;
+    q->real_valued  = 1;      /* |0⟩ is real */
 }
 
 void triality_init_basis(TrialityQuhit *q, int k) {
     memset(q, 0, sizeof(*q));
     q->edge_re[k] = 1.0;
     q->primary = VIEW_EDGE;
-    q->dirty = DIRTY_VERTEX | DIRTY_DIAGONAL;
+    q->dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+
+    /* Enhancement flags */
+    q->eigenstate_class = -1;
+    q->active_mask  = (uint8_t)(1 << k);
+    q->active_count = 1;
+    q->real_valued  = 1;
 }
 
 void triality_copy(TrialityQuhit *dst, const TrialityQuhit *src) {
@@ -162,6 +148,7 @@ static double *view_re(TrialityQuhit *q, int v) {
         case VIEW_EDGE:     return q->edge_re;
         case VIEW_VERTEX:   return q->vertex_re;
         case VIEW_DIAGONAL: return q->diag_re;
+        case VIEW_FOLDED:   return q->folded_re;
     }
     return q->edge_re;
 }
@@ -171,6 +158,7 @@ static double *view_im(TrialityQuhit *q, int v) {
         case VIEW_EDGE:     return q->edge_im;
         case VIEW_VERTEX:   return q->vertex_im;
         case VIEW_DIAGONAL: return q->diag_im;
+        case VIEW_FOLDED:   return q->folded_im;
     }
     return q->edge_im;
 }
@@ -179,12 +167,125 @@ static int view_dirty_bit(int v) {
     return 1 << v;
 }
 
+/* ── Antipodal fold primitives (Stage 1 of Cooley-Tukey DFT₆) ── */
+
+/* Forward fold: pair (k, k+3) into vesica (sum) and wave (difference)
+ * folded[k]   = (edge[k] + edge[k+3]) / √2   for k=0,1,2  (vesica)
+ * folded[k+3] = (edge[k] - edge[k+3]) / √2   for k=0,1,2  (wave) */
+static void fold_forward(const double *in_re, const double *in_im,
+                         double *out_re, double *out_im)
+{
+    for (int k = 0; k < 3; k++) {
+        double a_re = in_re[k],     a_im = in_im[k];
+        double b_re = in_re[k + 3], b_im = in_im[k + 3];
+        out_re[k]     = INV_SQRT2 * (a_re + b_re);
+        out_im[k]     = INV_SQRT2 * (a_im + b_im);
+        out_re[k + 3] = INV_SQRT2 * (a_re - b_re);
+        out_im[k + 3] = INV_SQRT2 * (a_im - b_im);
+    }
+}
+
+/* Inverse fold: reconstruct edge from folded (vesica + wave) */
+static void fold_inverse(const double *in_re, const double *in_im,
+                         double *out_re, double *out_im)
+{
+    for (int k = 0; k < 3; k++) {
+        double v_re = in_re[k],     v_im = in_im[k];
+        double w_re = in_re[k + 3], w_im = in_im[k + 3];
+        out_re[k]     = INV_SQRT2 * (v_re + w_re);
+        out_im[k]     = INV_SQRT2 * (v_im + w_im);
+        out_re[k + 3] = INV_SQRT2 * (v_re - w_re);
+        out_im[k + 3] = INV_SQRT2 * (v_im - w_im);
+    }
+}
+
+/* Folded → Vertex: apply twiddle + DFT₃ (Stages 2-3 of Cooley-Tukey)
+ * This completes DFT₆ from the folded intermediate. Cost: O(12). */
+static void folded_to_vertex(const double *fold_re, const double *fold_im,
+                             double *vert_re, double *vert_im)
+{
+    static const double w3_re = -0.5;
+    static const double w3_im = 0.86602540378443864676;
+    static const double n3 = 0.57735026918962576451; /* 1/√3 */
+
+    /* Stage 2: twiddle ω₆^(s·p) — only affects p=1 entries (indices 3,4,5) */
+    double tw_re[6], tw_im[6];
+    memcpy(tw_re, fold_re, 6 * sizeof(double));
+    memcpy(tw_im, fold_im, 6 * sizeof(double));
+    /* s=1,p=1 (index 4): multiply by ω₆^1 */
+    {
+        double r = tw_re[4], i = tw_im[4];
+        tw_re[4] = W6_RE[1] * r - W6_IM[1] * i;
+        tw_im[4] = W6_RE[1] * i + W6_IM[1] * r;
+    }
+    /* s=2,p=1 (index 5): multiply by ω₆^2 */
+    {
+        double r = tw_re[5], i = tw_im[5];
+        tw_re[5] = W6_RE[2] * r - W6_IM[2] * i;
+        tw_im[5] = W6_RE[2] * i + W6_IM[2] * r;
+    }
+
+    /* Stage 3: DFT₃ ⊗ I₂ per parity */
+    for (int p = 0; p < 2; p++) {
+        double a_re = tw_re[0 + p*3], a_im = tw_im[0 + p*3];
+        double b_re = tw_re[1 + p*3], b_im = tw_im[1 + p*3];
+        double c_re = tw_re[2 + p*3], c_im = tw_im[2 + p*3];
+
+        /* j=0: (a + b + c) / √3 */
+        vert_re[p]     = n3 * (a_re + b_re + c_re);
+        vert_im[p]     = n3 * (a_im + b_im + c_im);
+
+        /* j=1: (a + ω₃·b + ω₃²·c) / √3 */
+        double wb_re = w3_re * b_re - w3_im * b_im;
+        double wb_im = w3_re * b_im + w3_im * b_re;
+        double wc_re = w3_re * c_re + w3_im * c_im;
+        double wc_im = w3_re * c_im - w3_im * c_re;
+        vert_re[2 + p] = n3 * (a_re + wb_re + wc_re);
+        vert_im[2 + p] = n3 * (a_im + wb_im + wc_im);
+
+        /* j=2: (a + ω₃²·b + ω₃·c) / √3 */
+        double w2b_re = w3_re * b_re + w3_im * b_im;
+        double w2b_im = w3_re * b_im - w3_im * b_re;
+        double w2c_re = w3_re * c_re - w3_im * c_im;
+        double w2c_im = w3_re * c_im + w3_im * c_re;
+        vert_re[4 + p] = n3 * (a_re + w2b_re + w2c_re);
+        vert_im[4 + p] = n3 * (a_im + w2b_im + w2c_im);
+    }
+}
+
 static void convert_view(TrialityQuhit *q, int from, int to) {
     double *src_re = view_re(q, from), *src_im = view_im(q, from);
     double *dst_re = view_re(q, to),   *dst_im = view_im(q, to);
 
-    /* Determine how many DFT₆ steps from 'from' to 'to' */
-    int steps = (to - from + 3) % 3;  /* 1 = one DFT₆, 2 = two DFT₆ = one IDFT₆ */
+    /* Handle folded view conversions */
+    if (from <= VIEW_DIAGONAL && to == VIEW_FOLDED) {
+        /* Need edge view first */
+        if (from != VIEW_EDGE) {
+            triality_ensure_view(q, VIEW_EDGE);
+            src_re = q->edge_re; src_im = q->edge_im;
+        }
+        fold_forward(src_re, src_im, dst_re, dst_im);
+        triality_stats.edge_to_folded++;
+        return;
+    }
+    if (from == VIEW_FOLDED && to == VIEW_EDGE) {
+        fold_inverse(src_re, src_im, dst_re, dst_im);
+        return;
+    }
+    if (from == VIEW_FOLDED && to == VIEW_VERTEX) {
+        folded_to_vertex(src_re, src_im, dst_re, dst_im);
+        triality_stats.folded_to_vertex++;
+        return;
+    }
+    if (from == VIEW_FOLDED) {
+        /* Folded → anything else: go via edge */
+        triality_ensure_view(q, VIEW_EDGE);
+        convert_view(q, VIEW_EDGE, to);
+        return;
+    }
+
+    /* Standard 3-view conversion */
+    int steps = (to - from + 3) % 3;  /* 1 = one DFT₆, 2 = one IDFT₆ */
 
     if (steps == 1) {
         dft6_forward(src_re, src_im, dst_re, dst_im);
@@ -204,16 +305,80 @@ static void convert_view(TrialityQuhit *q, int from, int to) {
 void triality_ensure_view(TrialityQuhit *q, int view) {
     if (!(q->dirty & view_dirty_bit(view))) return;  /* Already clean */
 
+    /* ── Enhancement 2: Eigenstate shortcut ──
+     * DFT₆ eigenstates are identical in all views (up to eigenvalue phase).
+     * F|ψ⟩ = λ|ψ⟩, so vertex = λ·edge, diag = λ²·edge.
+     * Eigenvalues: {1, -1, i, -i} indexed 0..3. */
+    if (q->eigenstate_class >= 0 && view <= VIEW_DIAGONAL) {
+        /* Compute λ^steps where steps = (view - primary + 3) % 3 */
+        int source = q->primary;
+        if (source > VIEW_DIAGONAL) source = VIEW_EDGE; /* folded → use edge */
+        int steps = (view - source + 3) % 3;
+        if (steps == 0) {
+            /* Same view — just copy */
+            memcpy(view_re(q, view), view_re(q, source), TRI_D * sizeof(double));
+            memcpy(view_im(q, view), view_im(q, source), TRI_D * sizeof(double));
+        } else {
+            /* λ^steps: eigenvalue raised to power */
+            /* eigenvalue table: class 0=1, 1=-1, 2=i, 3=-i */
+            static const double EV_RE[4] = {1.0, -1.0,  0.0,  0.0};
+            static const double EV_IM[4] = {0.0,  0.0,  1.0, -1.0};
+            double lr = EV_RE[q->eigenstate_class];
+            double li = EV_IM[q->eigenstate_class];
+            /* raise to 'steps' power */
+            double pr = 1.0, pi = 0.0;
+            for (int s = 0; s < steps; s++) {
+                double tr = pr * lr - pi * li;
+                double ti = pr * li + pi * lr;
+                pr = tr; pi = ti;
+            }
+            /* dst = pr*src + pi*i*src */
+            const double *sr = view_re(q, source), *si = view_im(q, source);
+            double *dr = view_re(q, view), *di = view_im(q, view);
+            for (int k = 0; k < TRI_D; k++) {
+                dr[k] = pr * sr[k] - pi * si[k];
+                di[k] = pr * si[k] + pi * sr[k];
+            }
+        }
+        q->dirty &= ~view_dirty_bit(view);
+        triality_stats.eigenstate_skips++;
+        return;
+    }
+
     /* Find a clean view to convert from */
     int source = q->primary;
     if (q->dirty & view_dirty_bit(source)) {
         /* Primary is dirty — find any clean view */
-        for (int v = 0; v < 3; v++) {
+        for (int v = 0; v < 4; v++) {
             if (!(q->dirty & view_dirty_bit(v))) {
                 source = v;
                 break;
             }
         }
+    }
+
+    /* ── Enhancement 1: Route through folded view when cheaper ──
+     * Edge→Vertex via Folded: fold O(6) + twiddle+DFT₃ O(12) = O(18)
+     * vs direct DFT₆ O(36). Use folded path when both endpoints are
+     * edge and vertex, and folded view is clean or cheaply obtainable. */
+    if (source == VIEW_EDGE && view == VIEW_VERTEX) {
+        if (!(q->dirty & DIRTY_FOLDED)) {
+            /* Folded is clean — just do Stages 2-3 */
+            folded_to_vertex(q->folded_re, q->folded_im,
+                            q->vertex_re, q->vertex_im);
+            q->dirty &= ~DIRTY_VERTEX;
+            triality_stats.folded_to_vertex++;
+            return;
+        }
+        /* Folded is dirty but edge is clean — fold first, then convert */
+        fold_forward(q->edge_re, q->edge_im, q->folded_re, q->folded_im);
+        q->dirty &= ~DIRTY_FOLDED;
+        triality_stats.edge_to_folded++;
+        folded_to_vertex(q->folded_re, q->folded_im,
+                        q->vertex_re, q->vertex_im);
+        q->dirty &= ~DIRTY_VERTEX;
+        triality_stats.folded_to_vertex++;
+        return;
     }
 
     convert_view(q, source, view);
@@ -243,24 +408,52 @@ const double *triality_view_im(TrialityQuhit *q, int view) {
 /* Phase gate: |k⟩ → e^{iφₖ}|k⟩ — DIAGONAL in edge view, O(D) */
 void triality_phase(TrialityQuhit *q, const double *phi_re, const double *phi_im) {
     triality_ensure_view(q, VIEW_EDGE);
+    if (q->real_valued) {
+        /* Enhancement 4: real fast path — fewer multiplies */
+        int all_real_phases = 1;
+        for (int k = 0; k < TRI_D; k++)
+            if (fabs(phi_im[k]) > 1e-15) { all_real_phases = 0; break; }
+        if (all_real_phases) {
+            for (int k = 0; k < TRI_D; k++) {
+                if (!(q->active_mask & (1 << k))) continue; /* Enhancement 3 */
+                q->edge_re[k] *= phi_re[k];
+            }
+            triality_stats.real_fast_path++;
+            triality_stats.gates_edge++;
+            q->primary = VIEW_EDGE;
+            q->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+            return;
+        }
+    }
     for (int k = 0; k < TRI_D; k++) {
+        if (!(q->active_mask & (1 << k))) { /* Enhancement 3 */
+            triality_stats.mask_skips++;
+            continue;
+        }
         double re = q->edge_re[k], im = q->edge_im[k];
         q->edge_re[k] = re * phi_re[k] - im * phi_im[k];
         q->edge_im[k] = re * phi_im[k] + im * phi_re[k];
     }
+    /* Phase gate may introduce imaginary parts */
+    q->real_valued = 0;
     q->primary = VIEW_EDGE;
-    q->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL;
+    q->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
     triality_stats.gates_edge++;
 }
 
 /* Single-phase: one basis state only — O(1) */
 void triality_phase_single(TrialityQuhit *q, int k, double phi_re, double phi_im) {
     triality_ensure_view(q, VIEW_EDGE);
+    if (!(q->active_mask & (1 << k))) {
+        triality_stats.mask_skips++;
+        return; /* Enhancement 3: skip if this basis state is zero */
+    }
     double re = q->edge_re[k], im = q->edge_im[k];
     q->edge_re[k] = re * phi_re - im * phi_im;
     q->edge_im[k] = re * phi_im + im * phi_re;
+    if (fabs(phi_im) > 1e-15) q->real_valued = 0;
     q->primary = VIEW_EDGE;
-    q->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL;
+    q->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
     triality_stats.gates_edge++;
 }
 
@@ -268,14 +461,22 @@ void triality_phase_single(TrialityQuhit *q, int k, double phi_re, double phi_im
 void triality_z(TrialityQuhit *q) {
     triality_ensure_view(q, VIEW_EDGE);
     for (int k = 0; k < TRI_D; k++) {
+        if (!(q->active_mask & (1 << k))) { /* Enhancement 3 */
+            triality_stats.mask_skips++;
+            continue;
+        }
         double wr = W6_RE[k], wi = W6_IM[k];
         double re = q->edge_re[k], im = q->edge_im[k];
         q->edge_re[k] = re * wr - im * wi;
         q->edge_im[k] = re * wi + im * wr;
     }
+    q->real_valued = 0;   /* Z introduces complex phases (ω has imaginary part) */
     q->primary = VIEW_EDGE;
-    q->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL;
+    q->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
     triality_stats.gates_edge++;
+    /* Z preserves eigenstate_class: Z|ψ⟩ scales by ω per component,
+     * but if ψ is a DFT₆ eigenstate, Z|ψ⟩ = X|ψ⟩ rotated... clear it. */
+    q->eigenstate_class = -1;
 }
 
 /* Shift: |k⟩ → |k+δ mod D⟩ — this is DIAGONAL in vertex view!
@@ -293,9 +494,12 @@ void triality_shift(TrialityQuhit *q, int delta) {
         q->vertex_re[j] = re * wr - im * wi;
         q->vertex_im[j] = re * wi + im * wr;
     }
+    q->real_valued = 0;
+    q->eigenstate_class = -1; /* Shift breaks eigenstate */
     q->primary = VIEW_VERTEX;
-    q->dirty |= DIRTY_EDGE | DIRTY_DIAGONAL;
+    q->dirty |= DIRTY_EDGE | DIRTY_DIAGONAL | DIRTY_FOLDED;
     triality_stats.gates_vertex++;
+    /* After shift, active_mask changes (permuted) — recompute later */
 }
 
 /* X = shift by 1 */
@@ -307,24 +511,18 @@ void triality_x(TrialityQuhit *q) {
  * This converts edge→vertex, vertex→diag, diag→edge.
  * If the destination view is already cached, it's essentially FREE. */
 void triality_dft(TrialityQuhit *q) {
-    /* Sync all views first */
     triality_sync_all(q);
 
-    /* Relabel: old_vertex becomes new_edge, etc.
-     * This is because DFT₆ maps computational→Fourier,
-     * and our views cycle: edge→vertex→diag→edge */
     double tmp_re[TRI_D], tmp_im[TRI_D];
-
-    /* Save old edge */
     memcpy(tmp_re, q->edge_re, sizeof(tmp_re));
     memcpy(tmp_im, q->edge_im, sizeof(tmp_im));
 
-    /* new edge = old vertex (DFT₆ maps old comp→Fourier, Fourier is vertex) */
-    /* Actually: DFT₆|ψ⟩ in comp basis = |ψ⟩ in Fourier basis
-     * So the NEW computational-basis amplitudes are the DFT₆ of the old ones */
     dft6_forward(tmp_re, tmp_im, q->edge_re, q->edge_im);
     q->primary = VIEW_EDGE;
-    q->dirty = DIRTY_VERTEX | DIRTY_DIAGONAL;
+    q->dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+    q->real_valued = 0;  /* DFT introduces complex amplitudes */
+    q->eigenstate_class = -1;  /* Clear (might still be eigenstate but need re-detect) */
+    q->active_mask = 0x3F; q->active_count = 6; /* DFT spreads to all states */
     triality_stats.gates_edge++;
 }
 
@@ -336,7 +534,10 @@ void triality_idft(TrialityQuhit *q) {
     memcpy(tmp_im, q->edge_im, sizeof(tmp_im));
     dft6_inverse(tmp_re, tmp_im, q->edge_re, q->edge_im);
     q->primary = VIEW_EDGE;
-    q->dirty = DIRTY_VERTEX | DIRTY_DIAGONAL;
+    q->dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+    q->real_valued = 0;
+    q->eigenstate_class = -1;
+    q->active_mask = 0x3F; q->active_count = 6;
     triality_stats.gates_edge++;
 }
 
@@ -358,6 +559,9 @@ void triality_unitary(TrialityQuhit *q, int view,
     memcpy(v_im, out_im, sizeof(out_im));
     q->primary = view;
     q->dirty = DIRTY_ALL & ~view_dirty_bit(view);
+    q->real_valued = 0;
+    q->eigenstate_class = -1;
+    q->active_mask = 0x3F; q->active_count = 6; /* Unitary may spread */
 
     if (view == VIEW_EDGE)     triality_stats.gates_edge++;
     if (view == VIEW_VERTEX)   triality_stats.gates_vertex++;
@@ -378,43 +582,48 @@ void triality_cz(TrialityQuhit *a, TrialityQuhit *b) {
     triality_ensure_view(a, VIEW_EDGE);
     triality_ensure_view(b, VIEW_EDGE);
 
-    /* For product states, CZ imprints partner-dependent phases.
-     * Full CZ on joint state: joint[j*D+k] *= ω^(jk)
-     * On separable states, we condition on the partner's state:
-     *   a[j] *= Σ_k |b[k]|² × ω^(jk)   (effective phase from b)
-     *   b[k] *= Σ_j |a[j]|² × ω^(jk)   (effective phase from a) */
+    /* Enhancement 3: skip inactive basis states in the CZ inner loop.
+     * This is the biggest win — D_eff × D_eff iterations instead of 36. */
+    uint8_t ma = a->active_mask, mb = b->active_mask;
 
     /* Compute effective phases from partner */
     double eff_a_re[TRI_D] = {0}, eff_a_im[TRI_D] = {0};
     double eff_b_re[TRI_D] = {0}, eff_b_im[TRI_D] = {0};
 
     for (int j = 0; j < TRI_D; j++) {
+        if (!(ma & (1 << j))) continue;  /* a[j] is zero */
+        double aprob = a->edge_re[j]*a->edge_re[j] + a->edge_im[j]*a->edge_im[j];
         for (int k = 0; k < TRI_D; k++) {
+            if (!(mb & (1 << k))) continue;  /* b[k] is zero */
             int idx = (j * k) % 6;
             double bprob = b->edge_re[k]*b->edge_re[k] + b->edge_im[k]*b->edge_im[k];
             eff_a_re[j] += bprob * W6_RE[idx];
             eff_a_im[j] += bprob * W6_IM[idx];
-
-            double aprob = a->edge_re[j]*a->edge_re[j] + a->edge_im[j]*a->edge_im[j];
             eff_b_re[k] += aprob * W6_RE[idx];
             eff_b_im[k] += aprob * W6_IM[idx];
         }
     }
 
+    int skipped = 0;
     /* Apply effective phases */
     for (int j = 0; j < TRI_D; j++) {
+        if (!(ma & (1 << j))) { skipped++; continue; }
         double re = a->edge_re[j], im = a->edge_im[j];
         a->edge_re[j] = re * eff_a_re[j] - im * eff_a_im[j];
         a->edge_im[j] = re * eff_a_im[j] + im * eff_a_re[j];
     }
     for (int k = 0; k < TRI_D; k++) {
+        if (!(mb & (1 << k))) { skipped++; continue; }
         double re = b->edge_re[k], im = b->edge_im[k];
         b->edge_re[k] = re * eff_b_re[k] - im * eff_b_im[k];
         b->edge_im[k] = re * eff_b_im[k] + im * eff_b_re[k];
     }
+    triality_stats.mask_skips += skipped;
 
-    a->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL;
-    b->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL;
+    a->real_valued = 0; b->real_valued = 0; /* CZ introduces complex phases */
+    a->eigenstate_class = -1; b->eigenstate_class = -1;
+    a->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+    b->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
     triality_stats.gates_edge += 2;
 }
 
@@ -465,18 +674,26 @@ int triality_measure(TrialityQuhit *q, int view, uint64_t *rng_state) {
     triality_ensure_view(q, view);
     double *v_re = view_re(q, view), *v_im = view_im(q, view);
 
-    double norm2 = v_re[outcome]*v_re[outcome] + v_im[outcome]*v_im[outcome];
+    /* Save the phase of the winning amplitude before zeroing */
+    double win_re = v_re[outcome], win_im = v_im[outcome];
+    double norm2 = win_re*win_re + win_im*win_im;
     double scale = (norm2 > 1e-30) ? 1.0 / sqrt(norm2) : 0.0;
 
     for (int k = 0; k < TRI_D; k++) {
         v_re[k] = 0;
         v_im[k] = 0;
     }
-    v_re[outcome] = (v_re[outcome] != 0 ? v_re[outcome] : 1.0) * scale;
-    /* Keep the phase of the original amplitude */
+    v_re[outcome] = win_re * scale;
+    v_im[outcome] = win_im * scale;
 
     q->primary = view;
     q->dirty = DIRTY_ALL & ~view_dirty_bit(view);
+
+    /* Post-collapse enhancement flags */
+    q->active_mask  = (uint8_t)(1 << outcome);
+    q->active_count = 1;
+    q->real_valued  = (fabs(v_im[outcome]) < 1e-15) ? 1 : 0;
+    q->eigenstate_class = -1;
 
     return outcome;
 }
@@ -490,9 +707,6 @@ int triality_measure(TrialityQuhit *q, int view, uint64_t *rng_state) {
  * ═══════════════════════════════════════════════════════════════════════ */
 
 void triality_rotate(TrialityQuhit *q) {
-    /* Cycle: edge→vertex→diagonal→edge
-     * Old edge becomes new vertex, old vertex becomes new diag,
-     * old diag becomes new edge */
     double tmp_re[TRI_D], tmp_im[TRI_D];
 
     /* Save old diagonal */
@@ -511,9 +725,11 @@ void triality_rotate(TrialityQuhit *q) {
     memcpy(q->edge_re, tmp_re, sizeof(tmp_re));
     memcpy(q->edge_im, tmp_im, sizeof(tmp_im));
 
-    /* Rotate dirty bits: bit0→bit1→bit2→bit0 */
+    /* Rotate dirty bits: bit0→bit1→bit2→bit0 (preserve bit3 = folded) */
     uint8_t d = q->dirty;
-    q->dirty = ((d & 1) << 1) | ((d & 2) << 1) | ((d & 4) >> 2);
+    uint8_t lo3 = d & 0x7;
+    uint8_t folded = d & DIRTY_FOLDED;
+    q->dirty = (((lo3 & 1) << 1) | ((lo3 & 2) << 1) | ((lo3 & 4) >> 2)) | folded | DIRTY_FOLDED;
 
     /* Rotate primary: 0→1→2→0 */
     q->primary = (q->primary + 1) % 3;
@@ -560,16 +776,174 @@ void triality_print(TrialityQuhit *q, const char *label) {
         }
         printf("│\n");
     }
-    printf("  │ Primary: %s │ Dirty: %c%c%c │\n",
-           names[q->primary],
+    printf("  | Primary: %s | Dirty: %c%c%c%c | Eigen: %d | Mask: 0x%02X (%d) | Real: %d |\n",
+           names[q->primary > 2 ? 0 : q->primary],
            (q->dirty & DIRTY_EDGE) ? 'E' : '·',
            (q->dirty & DIRTY_VERTEX) ? 'V' : '·',
-           (q->dirty & DIRTY_DIAGONAL) ? 'D' : '·');
+           (q->dirty & DIRTY_DIAGONAL) ? 'D' : '·',
+           (q->dirty & DIRTY_FOLDED) ? 'F' : '·',
+           q->eigenstate_class,
+           q->active_mask, q->active_count,
+           q->real_valued);
     printf("  └");
     for (int i = 0; i < 12 + TRI_D * 12; i++) printf("─");
     printf("┘\n");
 }
 
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * GEOMETRIC COSMOLOGY ENHANCEMENT FUNCTIONS
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* ── Enhancement 1: Folded View API ── */
+
+void triality_fold(TrialityQuhit *q) {
+    triality_ensure_view(q, VIEW_EDGE);
+    fold_forward(q->edge_re, q->edge_im, q->folded_re, q->folded_im);
+    q->dirty &= ~DIRTY_FOLDED;
+    triality_stats.edge_to_folded++;
+}
+
+void triality_unfold(TrialityQuhit *q) {
+    if (q->dirty & DIRTY_FOLDED) {
+        triality_fold(q);  /* Ensure folded is up to date */
+    }
+    fold_inverse(q->folded_re, q->folded_im, q->edge_re, q->edge_im);
+    q->dirty &= ~DIRTY_EDGE;
+    q->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL;
+}
+
+void triality_ensure_view_via_fold(TrialityQuhit *q, int target_view) {
+    if (target_view == VIEW_FOLDED) {
+        if (q->dirty & DIRTY_FOLDED) triality_fold(q);
+        return;
+    }
+    if (target_view == VIEW_VERTEX) {
+        /* Edge → Folded → Vertex: O(18) vs O(36) direct */
+        if (q->dirty & DIRTY_FOLDED) triality_fold(q);
+        folded_to_vertex(q->folded_re, q->folded_im,
+                        q->vertex_re, q->vertex_im);
+        q->dirty &= ~DIRTY_VERTEX;
+        triality_stats.folded_to_vertex++;
+        return;
+    }
+    /* For other views, fall back to standard */
+    triality_ensure_view(q, target_view);
+}
+
+/* ── Enhancement 2: Eigenstate Detection ── */
+
+int triality_detect_eigenstate(TrialityQuhit *q) {
+    triality_ensure_view(q, VIEW_EDGE);
+
+    /* Compute DFT₆|ψ⟩ and check if F|ψ⟩ = λ|ψ⟩ for some λ ∈ {1,-1,i,-i} */
+    double f_re[TRI_D], f_im[TRI_D];
+    dft6_forward(q->edge_re, q->edge_im, f_re, f_im);
+
+    /* Find a non-zero component to determine the candidate eigenvalue */
+    int ref = -1;
+    for (int k = 0; k < TRI_D; k++) {
+        double mag = q->edge_re[k]*q->edge_re[k] + q->edge_im[k]*q->edge_im[k];
+        if (mag > 1e-20) { ref = k; break; }
+    }
+    if (ref < 0) { q->eigenstate_class = -1; return -1; } /* zero state */
+
+    /* Candidate λ = F|ψ⟩[ref] / |ψ⟩[ref] */
+    double sr = q->edge_re[ref], si = q->edge_im[ref];
+    double fr = f_re[ref], fi = f_im[ref];
+    double denom = sr*sr + si*si;
+    double lr = (fr*sr + fi*si) / denom;
+    double li = (fi*sr - fr*si) / denom;
+
+    /* Check which eigenvalue class it matches: {1,-1,i,-i} */
+    static const double EV_RE[4] = {1.0, -1.0,  0.0,  0.0};
+    static const double EV_IM[4] = {0.0,  0.0,  1.0, -1.0};
+    int cls = -1;
+    for (int c = 0; c < 4; c++) {
+        if (fabs(lr - EV_RE[c]) < 1e-10 && fabs(li - EV_IM[c]) < 1e-10) {
+            cls = c; break;
+        }
+    }
+    if (cls < 0) { q->eigenstate_class = -1; return -1; }
+
+    /* Verify ALL components satisfy F|ψ⟩[k] = λ · |ψ⟩[k] */
+    for (int k = 0; k < TRI_D; k++) {
+        double expected_re = EV_RE[cls] * q->edge_re[k] - EV_IM[cls] * q->edge_im[k];
+        double expected_im = EV_RE[cls] * q->edge_im[k] + EV_IM[cls] * q->edge_re[k];
+        if (fabs(f_re[k] - expected_re) > 1e-10 ||
+            fabs(f_im[k] - expected_im) > 1e-10) {
+            q->eigenstate_class = -1;
+            return -1;
+        }
+    }
+
+    q->eigenstate_class = (int8_t)cls;
+    return cls;
+}
+
+void triality_clear_eigenstate(TrialityQuhit *q) {
+    q->eigenstate_class = -1;
+}
+
+/* ── Enhancement 3: Subspace Confinement ── */
+
+void triality_update_mask(TrialityQuhit *q) {
+    triality_ensure_view(q, VIEW_EDGE);
+    uint8_t mask = 0;
+    int count = 0;
+    for (int k = 0; k < TRI_D; k++) {
+        double mag2 = q->edge_re[k]*q->edge_re[k] + q->edge_im[k]*q->edge_im[k];
+        if (mag2 > 1e-30) {
+            mask |= (uint8_t)(1 << k);
+            count++;
+        }
+    }
+    q->active_mask = mask;
+    q->active_count = (uint8_t)count;
+}
+
+/* ── Enhancement 4: Real-Valued Detection ── */
+
+void triality_detect_real(TrialityQuhit *q) {
+    triality_ensure_view(q, VIEW_EDGE);
+    q->real_valued = 1;
+    for (int k = 0; k < TRI_D; k++) {
+        if (fabs(q->edge_im[k]) > 1e-15) {
+            q->real_valued = 0;
+            return;
+        }
+    }
+}
+
+/* ── Combined refresh ── */
+
+void triality_refresh_flags(TrialityQuhit *q) {
+    triality_update_mask(q);
+    triality_detect_real(q);
+    triality_detect_eigenstate(q);
+}
+
+void triality_stats_print(void) {
+    printf("\n  ── Triality Statistics ──\n");
+    printf("  View conversions:\n");
+    printf("    Edge→Vertex:   %llu\n", (unsigned long long)triality_stats.edge_to_vertex);
+    printf("    Edge→Diag:     %llu\n", (unsigned long long)triality_stats.edge_to_diag);
+    printf("    Vertex→Edge:   %llu\n", (unsigned long long)triality_stats.vertex_to_edge);
+    printf("    Vertex→Diag:   %llu\n", (unsigned long long)triality_stats.vertex_to_diag);
+    printf("    Diag→Edge:     %llu\n", (unsigned long long)triality_stats.diag_to_edge);
+    printf("    Diag→Vertex:   %llu\n", (unsigned long long)triality_stats.diag_to_vertex);
+    printf("    Edge→Folded:   %llu\n", (unsigned long long)triality_stats.edge_to_folded);
+    printf("    Folded→Vertex: %llu\n", (unsigned long long)triality_stats.folded_to_vertex);
+    printf("  Gates:\n");
+    printf("    Edge view:     %llu\n", (unsigned long long)triality_stats.gates_edge);
+    printf("    Vertex view:   %llu\n", (unsigned long long)triality_stats.gates_vertex);
+    printf("    Diag view:     %llu\n", (unsigned long long)triality_stats.gates_diag);
+    printf("    Rotations:     %llu\n", (unsigned long long)triality_stats.rotations);
+    printf("  Enhancements:\n");
+    printf("    Eigenstate skips:  %llu\n", (unsigned long long)triality_stats.eigenstate_skips);
+    printf("    Mask skips:        %llu\n", (unsigned long long)triality_stats.mask_skips);
+    printf("    Real fast path:    %llu\n", (unsigned long long)triality_stats.real_fast_path);
+}
 
 /* ═══════════════════════════════════════════════════════════════════════
  * LAZY TRIALITY QUHIT — Heisenberg Picture with Event Horizon Shortcuts
