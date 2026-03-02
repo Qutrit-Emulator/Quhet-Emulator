@@ -373,3 +373,4 @@ int main(void)
     printf("══════════════════════════════════════════════════════════════\n");
     return 0;
 }
+#endif /* REALITY_SCALED_NO_MAIN */
