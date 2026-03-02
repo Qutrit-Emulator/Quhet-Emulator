@@ -572,22 +572,21 @@ void triality_print(TrialityQuhit *q, const char *label) {
 
 
 /* ═══════════════════════════════════════════════════════════════════════
- * LAZY TRIALITY QUHIT — Heisenberg Picture Implementation
+ * LAZY TRIALITY QUHIT — Heisenberg Picture with Event Horizon Shortcuts
  *
  * Chain: state → F^pre0 · D0 → F^pre1 · D1 → ... → F^trailing
  * All diagonals in computational (edge) basis.
  * DFTs tracked per-segment. F^4 = I, so counts are mod 4.
  * IDFT = F^3 (= F^-1 since F^4 = I).
  *
- * Z gate:    edge diagonal, no DFTs
- * X gate:    F^1 · diag(w^k) · F^3  (DFT, multiply, IDFT)
- * Shift(d):  F^1 · diag(w^dk) · F^3
- * DFT:       trailing_dfts += 1
- * IDFT:      trailing_dfts += 3
+ * EVENT HORIZON SHORTCUTS:
+ *   F² = reversal:  DFT²|k⟩ = |(-k) mod 6⟩.  O(D) not O(D²).
+ *   Parity fusion:  Even DFT counts (0,2) allow segment fusion.
+ *                   trailing=2 → reverse diagonal entries + fuse.
+ *   Chain compact:  Adjacent segments with even pre_dfts merge.
  *
- * Consecutive same-type gates fuse because:
- *   Z+Z: both trailing=0, fuse directly
- *   X+X: trailing=3+1=4≡0 mod 4, fuse directly 
+ * Only ODD horizon crossings (pre_dfts = 1 or 3) are real.
+ * Even crossings are mirrors — the vertex bounces back.
  * ═══════════════════════════════════════════════════════════════════════ */
 
 #define DFT_ORDER 4  /* DFT_6^4 = I */
@@ -612,11 +611,51 @@ static void ltri_apply_diag(const double *d_re, const double *d_im,
     }
 }
 
+/* F² reversal: DFT₆²|k⟩ = |(-k) mod 6⟩.  O(D) swap, not O(D²) DFT. */
+static void ltri_apply_reversal(double *re, double *im) {
+    for (int k = 1; k < (TRI_D + 1) / 2; k++) {
+        int j = TRI_D - k;  /* j = (-k) mod 6 */
+        double tr = re[k]; re[k] = re[j]; re[j] = tr;
+        double ti = im[k]; im[k] = im[j]; im[j] = ti;
+    }
+}
+
+/* Reverse a diagonal's entries: d[k] ↔ d[(-k) mod 6] */
+static void ltri_diag_reverse(double *d_re, double *d_im) {
+    for (int k = 1; k < (TRI_D + 1) / 2; k++) {
+        int j = TRI_D - k;
+        double tr = d_re[k]; d_re[k] = d_re[j]; d_re[j] = tr;
+        double ti = d_im[k]; d_im[k] = d_im[j]; d_im[j] = ti;
+    }
+}
+
+/* Multiply two diagonals: a[k] *= b[k] */
+static void ltri_diag_mul(double *a_re, double *a_im,
+                          const double *b_re, const double *b_im) {
+    for (int k = 0; k < TRI_D; k++) {
+        double ar = a_re[k], ai = a_im[k];
+        a_re[k] = ar * b_re[k] - ai * b_im[k];
+        a_im[k] = ar * b_im[k] + ai * b_re[k];
+    }
+}
+
 static void ltri_apply_n_dfts(double *re, double *im, int n) {
     n = ((n % DFT_ORDER) + DFT_ORDER) % DFT_ORDER;
-    for (int d = 0; d < n; d++) {
+    if (n == 0) return;
+    if (n == 2) {
+        /* F² = reversal.  O(D) not O(D²). */
+        ltri_apply_reversal(re, im);
+        return;
+    }
+    /* n == 1 or n == 3: actual DFT(s) */
+    if (n == 1) {
         double tmp_re[TRI_D], tmp_im[TRI_D];
         dft6_forward(re, im, tmp_re, tmp_im);
+        memcpy(re, tmp_re, sizeof(tmp_re));
+        memcpy(im, tmp_im, sizeof(tmp_im));
+    } else { /* n == 3 = inverse DFT = F³ */
+        double tmp_re[TRI_D], tmp_im[TRI_D];
+        dft6_inverse(re, im, tmp_re, tmp_im);
         memcpy(re, tmp_re, sizeof(tmp_re));
         memcpy(im, tmp_im, sizeof(tmp_im));
     }
@@ -649,9 +688,27 @@ void ltri_init_basis(LazyTrialityQuhit *q, int k) {
 }
 
 static void ltri_ensure_segment(LazyTrialityQuhit *q) {
-    if (q->n_segments == 0 || q->trailing_dfts != 0) {
+    if (q->n_segments == 0) {
         ltri_new_segment(q);
+        return;
     }
+    if (q->trailing_dfts == 0) {
+        /* Same view — fuse directly (already in segment) */
+        return;
+    }
+    if (q->trailing_dfts == 2) {
+        /* HORIZON PARITY: F² = reversal. Don't create new segment.
+         * Instead, reverse the current diagonal entries and keep fusing.
+         * D_new · F² · D_old  =  D_new · perm(D_old)
+         * We reverse the existing diagonal so new phases multiply onto
+         * the reversed version. */
+        int idx = q->n_segments - 1;
+        ltri_diag_reverse(q->segments[idx].diag_re, q->segments[idx].diag_im);
+        q->trailing_dfts = 0;
+        return;
+    }
+    /* trailing = 1 or 3: genuine horizon crossing, new segment required */
+    ltri_new_segment(q);
 }
 
 void ltri_z(LazyTrialityQuhit *q) {
@@ -713,10 +770,45 @@ void ltri_phase(LazyTrialityQuhit *q, const double *phi_re, const double *phi_im
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- * MATERIALIZE: state -> F^pre0 * D0 -> F^pre1 * D1 -> ... -> F^trailing
+ * CHAIN COMPACTION: merge adjacent segments with even pre_dfts
+ *
+ * If seg[i+1].pre_dfts == 0: D_{i+1} · D_i  (direct multiply)
+ * If seg[i+1].pre_dfts == 2: D_{i+1} · F² · D_i = D_{i+1} · rev(D_i)
+ * Only pre_dfts == 1 or 3 are irreducible (real horizon crossings).
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static void ltri_compact_chain(LazyTrialityQuhit *q) {
+    if (q->n_segments <= 1) return;
+    int dst = 0;
+    for (int src = 1; src < q->n_segments; src++) {
+        if (q->segments[src].pre_dfts == 0) {
+            /* Direct fusion: multiply diagonals */
+            ltri_diag_mul(q->segments[dst].diag_re, q->segments[dst].diag_im,
+                          q->segments[src].diag_re, q->segments[src].diag_im);
+        } else if (q->segments[src].pre_dfts == 2) {
+            /* F² reversal fusion: reverse dst, then multiply */
+            ltri_diag_reverse(q->segments[dst].diag_re, q->segments[dst].diag_im);
+            ltri_diag_mul(q->segments[dst].diag_re, q->segments[dst].diag_im,
+                          q->segments[src].diag_re, q->segments[src].diag_im);
+        } else {
+            /* Odd crossing — cannot compact, advance dst */
+            dst++;
+            if (dst != src) {
+                memcpy(&q->segments[dst], &q->segments[src], sizeof(q->segments[0]));
+            }
+        }
+    }
+    q->n_segments = dst + 1;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * MATERIALIZE: compact → state → F^pre0 · D0 → ... → F^trailing
  * ═══════════════════════════════════════════════════════════════════════ */
 
 void ltri_materialize(LazyTrialityQuhit *q, double *out_re, double *out_im) {
+    /* Compact chain: fuse even-DFT segments */
+    ltri_compact_chain(q);
+
     double cur_re[TRI_D], cur_im[TRI_D];
     memcpy(cur_re, q->state_re, sizeof(cur_re));
     memcpy(cur_im, q->state_im, sizeof(cur_im));
