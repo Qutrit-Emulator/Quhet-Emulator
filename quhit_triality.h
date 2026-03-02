@@ -202,6 +202,15 @@ typedef struct {
     int n_segments;
     int trailing_dfts;          /* DFTs after the last segment (accumulated) */
 
+    /* Oracle: cross-batch composite matrix.
+     * When segments overflow, instead of materializing, the Oracle
+     * compiles the chain into a 6×6 matrix and absorbs it here.
+     * At final materialize: state = oracle_M · initial_state, then
+     * any remaining segments are applied on top. */
+    double oracle_M_re[TRI_D][TRI_D];
+    double oracle_M_im[TRI_D][TRI_D];
+    int oracle_active;          /* 1 if oracle_M contains data */
+
     /* Stats */
     uint64_t gates_fused;       /* Gates absorbed into existing segment */
     uint64_t segments_created;  /* New segments started */
