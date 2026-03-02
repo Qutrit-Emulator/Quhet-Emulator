@@ -145,6 +145,11 @@ typedef struct {
     uint8_t  *site_allocated;
     uint8_t  *site_dirty;
 
+    /*  #10: Per-site pending 1-site gate for eager fusion */
+    double   *pending_1site_re;   /* n_sites × D² */
+    double   *pending_1site_im;   /* n_sites × D² */
+    uint8_t  *pending_1site_valid; /* n_sites × 1 */
+
     LazyStats stats;
 } MpsLazyChain;
 
