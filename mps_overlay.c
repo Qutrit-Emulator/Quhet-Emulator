@@ -345,125 +345,239 @@ void mps_gate_1site(QuhitEngine *eng, uint32_t *quhits, int n,
 /* ═══════════════════════════════════════════════════════════════════════════════
  * 2-SITE GATE — Register-Based SVD Contraction
  *
- * Side-channel optimized (tns_contraction_probe.c findings):
+ *  Optimizations V3.4:
+ *   #7  Memory pool: static scratch buffers, no per-gate malloc/free
+ *   #8  Diagonal fast-path: in-place O(D²χ²) for CZ/Potts gates
+ *   #9  γ-bucketing: pre-sort register B by shared bond index
+ *   #11 √σ pre-compute: one sqrt per singular value, not per entry
+ *
+ * Original V3.3 findings preserved:
  *   • Zero attractor → skip negligible Θ entries via mag² (no sqrt)
  *   • Gate sparsity → skip via mag² (no fabs)
  *   • 1.0 attractor → norm always converges to 1.0
  *   • 1/6 spectrum → σ values converge to equal weights at D=6
- *
- * Temporary memory: ~4 × DCHI² × 8 bytes ≈ 37 MB at χ=128
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 #include "tensor_svd.h"
 
 #define DCHI (MPS_PHYS * MPS_CHI)
 
+/* ──  #7: Static scratch pool ──
+ * Pre-allocated buffers reused across all gate calls.
+ * Eliminates 14 malloc/free round-trips per gate. */
+static double *g2_Th_re, *g2_Th_im;
+static double *g2_Th2_re, *g2_Th2_im;
+static double *g2_U_re, *g2_U_im, *g2_sig;
+static double *g2_Vc_re, *g2_Vc_im;
+static int g2_pool_init = 0;
+
+static void g2_pool_ensure(void) {
+    if (g2_pool_init) return;
+    size_t dchi = DCHI;
+    size_t dchi2 = dchi * dchi;
+    size_t chi = MPS_CHI;
+    g2_Th_re  = (double *)malloc(dchi2 * sizeof(double));
+    g2_Th_im  = (double *)malloc(dchi2 * sizeof(double));
+    g2_Th2_re = (double *)malloc(dchi2 * sizeof(double));
+    g2_Th2_im = (double *)malloc(dchi2 * sizeof(double));
+    g2_U_re   = (double *)malloc(dchi * chi * sizeof(double));
+    g2_U_im   = (double *)malloc(dchi * chi * sizeof(double));
+    g2_sig    = (double *)malloc(chi * sizeof(double));
+    g2_Vc_re  = (double *)malloc(chi * dchi * sizeof(double));
+    g2_Vc_im  = (double *)malloc(chi * dchi * sizeof(double));
+    g2_pool_init = 1;
+}
+
+/* ──  #8: Diagonal gate detection ── */
+static int gate_is_diagonal(const double *G_re, const double *G_im, int D2) {
+    for (int i = 0; i < D2; i++)
+        for (int j = 0; j < D2; j++)
+            if (i != j) {
+                if (G_re[i*D2+j] != 0.0 || G_im[i*D2+j] != 0.0)
+                    return 0;
+            }
+    return 1;
+}
+
+/* ──  #9: γ-bucket structure for sparse contraction ── */
+typedef struct {
+    uint16_t *indices;  /* entry indices per bucket */
+    uint16_t *counts;   /* count per gamma value */
+    uint16_t *offsets;  /* start offset per gamma value */
+} GammaBuckets;
+
+static GammaBuckets gb_cache = {0};
+
+static void gb_ensure(int chi, int max_entries) {
+    if (!gb_cache.indices) {
+        gb_cache.indices = (uint16_t *)malloc(max_entries * sizeof(uint16_t));
+        gb_cache.counts  = (uint16_t *)malloc(chi * sizeof(uint16_t));
+        gb_cache.offsets = (uint16_t *)malloc(chi * sizeof(uint16_t));
+    }
+}
+
+static void gb_build(GammaBuckets *gb, QuhitRegister *reg, int chi) {
+    memset(gb->counts, 0, chi * sizeof(uint16_t));
+    /* Count entries per gamma */
+    for (uint32_t e = 0; e < reg->num_nonzero; e++) {
+        double ar = reg->entries[e].amp_re, ai = reg->entries[e].amp_im;
+        if (ar*ar + ai*ai < 1e-10) continue;
+        int gamma = (int)(reg->entries[e].basis_state % chi);
+        if (gamma < chi) gb->counts[gamma]++;
+    }
+    /* Compute offsets */
+    uint16_t off = 0;
+    for (int g = 0; g < chi; g++) {
+        gb->offsets[g] = off;
+        off += gb->counts[g];
+    }
+    /* Fill index array */
+    uint16_t *pos = (uint16_t *)alloca(chi * sizeof(uint16_t));
+    memcpy(pos, gb->offsets, chi * sizeof(uint16_t));
+    for (uint32_t e = 0; e < reg->num_nonzero; e++) {
+        double ar = reg->entries[e].amp_re, ai = reg->entries[e].amp_im;
+        if (ar*ar + ai*ai < 1e-10) continue;
+        int gamma = (int)(reg->entries[e].basis_state % chi);
+        if (gamma < chi)
+            gb->indices[pos[gamma]++] = (uint16_t)e;
+    }
+}
+
 void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                     int site, const double *G_re, const double *G_im)
 {
     int sA = site, sB = site + 1;
     int D = MPS_PHYS, chi = MPS_CHI;
-    int dchi = D * chi;  /* DCHI = 768 at χ=128 */
+    int dchi = D * chi;
     int chi2 = chi * chi;
     size_t dchi2 = (size_t)dchi * dchi;
+    int D2 = D * D;
 
-    /* ── Step 1+2: Build Θ from SPARSE register entries ──
-     * Register basis: k*χ² + α*χ + β
-     * Contract: Θ[(kA,α),(kB,β)] = Σ_γ A[kA,α,γ] × B[kB,γ,β]
-     * Iterate over nnzA × nnzB pairs matching on γ. */
-
-    double *Th_re = (double *)calloc(dchi2, sizeof(double));
-    double *Th_im = (double *)calloc(dchi2, sizeof(double));
+    /*  #7: Ensure scratch pool */
+    g2_pool_ensure();
+    memset(g2_Th_re, 0, dchi2 * sizeof(double));
+    memset(g2_Th_im, 0, dchi2 * sizeof(double));
 
     QuhitRegister *regA = &eng->registers[mps_store[sA].reg_idx];
     QuhitRegister *regB = &eng->registers[mps_store[sB].reg_idx];
+
+    /* ── Step 1+2: Build Θ —  #9: γ-bucketed contraction ──
+     * Pre-sort register B entries by shared bond γ.
+     * Then for each regA entry, only iterate matching γ bucket. */
+    gb_ensure(chi, 8192);
+    gb_build(&gb_cache, regB, chi);
 
     for (uint32_t eA = 0; eA < regA->num_nonzero; eA++) {
         basis_t bsA = regA->entries[eA].basis_state;
         double arA = regA->entries[eA].amp_re;
         double aiA = regA->entries[eA].amp_im;
-        /* Side-channel: use mag² directly, skip sqrt for threshold check */
         if (arA*arA + aiA*aiA < 1e-10) continue;
 
         int kA = (int)(bsA / chi2);
         int alpha = (int)((bsA / chi) % chi);
-        int gamma_A = (int)(bsA % chi);  /* shared bond */
-
+        int gamma_A = (int)(bsA % chi);
         int row = kA * chi + alpha;
 
-        for (uint32_t eB = 0; eB < regB->num_nonzero; eB++) {
+        /* Only iterate register B entries with matching gamma */
+        uint16_t start = gb_cache.offsets[gamma_A];
+        uint16_t count = gb_cache.counts[gamma_A];
+        for (uint16_t bi = 0; bi < count; bi++) {
+            uint16_t eB = gb_cache.indices[start + bi];
             basis_t bsB = regB->entries[eB].basis_state;
             double arB = regB->entries[eB].amp_re;
             double aiB = regB->entries[eB].amp_im;
-            if (arB*arB + aiB*aiB < 1e-10) continue;
 
-            int kB = (int)(bsB / chi2);
-            int gamma_B = (int)((bsB / chi) % chi);  /* shared bond */
+            int kB   = (int)(bsB / chi2);
             int beta = (int)(bsB % chi);
+            int col  = kB * chi + beta;
 
-            if (gamma_A != gamma_B) continue;
-
-            int col = kB * chi + beta;
-            Th_re[row * dchi + col] += arA*arB - aiA*aiB;
-            Th_im[row * dchi + col] += arA*aiB + aiA*arB;
+            g2_Th_re[row * dchi + col] += arA*arB - aiA*aiB;
+            g2_Th_im[row * dchi + col] += arA*aiB + aiA*arB;
         }
     }
 
-    /* ── Step 3: Apply gate G to physical indices ── */
-    double *Th2_re = (double *)calloc(dchi2, sizeof(double));
-    double *Th2_im = (double *)calloc(dchi2, sizeof(double));
+    /* ── Step 3: Apply gate —  #8: diagonal fast-path ── */
+    int is_diag = gate_is_diagonal(G_re, G_im, D2);
 
-    int D2 = D * D;
-    for (int kAp = 0; kAp < D; kAp++)
-     for (int kBp = 0; kBp < D; kBp++) {
-         int gr = kAp * D + kBp;
-         for (int kA = 0; kA < D; kA++)
-          for (int kB = 0; kB < D; kB++) {
-              int gc = kA * D + kB;
-              double gre = G_re[gr * D2 + gc];
-              double gim = G_im[gr * D2 + gc];
-              /* Side-channel: squared gate check (avoids 2× fabs) */
-              if (gre*gre + gim*gim < 1e-20) continue;
+    double *Th_out_re, *Th_out_im;
 
-              for (int a = 0; a < chi; a++) {
-                  int dst_row = kAp * chi + a;
-                  int src_row = kA * chi + a;
-                  for (int b = 0; b < chi; b++) {
-                      int dst_col = kBp * chi + b;
-                      int src_col = kB * chi + b;
-                      double tr = Th_re[src_row * dchi + src_col];
-                      double ti = Th_im[src_row * dchi + src_col];
-                      Th2_re[dst_row * dchi + dst_col] += gre*tr - gim*ti;
-                      Th2_im[dst_row * dchi + dst_col] += gre*ti + gim*tr;
+    if (is_diag) {
+        /* Diagonal gate: in-place, O(D²×χ²) — no Th2 buffer needed */
+        for (int kA = 0; kA < D; kA++)
+            for (int kB = 0; kB < D; kB++) {
+                int idx = kA * D + kB;
+                double gre = G_re[idx * D2 + idx];
+                double gim = G_im[idx * D2 + idx];
+                if (gre == 1.0 && gim == 0.0) continue; /* identity element */
+                for (int a = 0; a < chi; a++) {
+                    int r = kA * chi + a;
+                    for (int b = 0; b < chi; b++) {
+                        int c = kB * chi + b;
+                        size_t pos = (size_t)r * dchi + c;
+                        double tr = g2_Th_re[pos];
+                        double ti = g2_Th_im[pos];
+                        g2_Th_re[pos] = gre*tr - gim*ti;
+                        g2_Th_im[pos] = gre*ti + gim*tr;
+                    }
+                }
+            }
+        Th_out_re = g2_Th_re;
+        Th_out_im = g2_Th_im;
+    } else {
+        /* General gate: O(D⁴×χ²) with sparsity skip */
+        memset(g2_Th2_re, 0, dchi2 * sizeof(double));
+        memset(g2_Th2_im, 0, dchi2 * sizeof(double));
+
+        for (int kAp = 0; kAp < D; kAp++)
+         for (int kBp = 0; kBp < D; kBp++) {
+             int gr = kAp * D + kBp;
+             for (int kA = 0; kA < D; kA++)
+              for (int kB = 0; kB < D; kB++) {
+                  int gc = kA * D + kB;
+                  double gre = G_re[gr * D2 + gc];
+                  double gim = G_im[gr * D2 + gc];
+                  if (gre*gre + gim*gim < 1e-20) continue;
+
+                  for (int a = 0; a < chi; a++) {
+                      int dst_row = kAp * chi + a;
+                      int src_row = kA * chi + a;
+                      for (int b = 0; b < chi; b++) {
+                          int dst_col = kBp * chi + b;
+                          int src_col = kB * chi + b;
+                          double tr = g2_Th_re[src_row * dchi + src_col];
+                          double ti = g2_Th_im[src_row * dchi + src_col];
+                          g2_Th2_re[dst_row * dchi + dst_col] += gre*tr - gim*ti;
+                          g2_Th2_im[dst_row * dchi + dst_col] += gre*ti + gim*tr;
+                      }
                   }
               }
-          }
-     }
-
-    free(Th_re); free(Th_im);
+         }
+        Th_out_re = g2_Th2_re;
+        Th_out_im = g2_Th2_im;
+    }
 
     /* ── Step 4: SVD → truncate to χ ── */
-    double *U_re  = (double *)calloc((size_t)dchi * chi, sizeof(double));
-    double *U_im  = (double *)calloc((size_t)dchi * chi, sizeof(double));
-    double *sig   = (double *)calloc(chi, sizeof(double));
-    double *Vc_re = (double *)calloc((size_t)chi * dchi, sizeof(double));
-    double *Vc_im = (double *)calloc((size_t)chi * dchi, sizeof(double));
+    memset(g2_U_re, 0, (size_t)dchi * chi * sizeof(double));
+    memset(g2_U_im, 0, (size_t)dchi * chi * sizeof(double));
+    memset(g2_sig, 0, chi * sizeof(double));
+    memset(g2_Vc_re, 0, (size_t)chi * dchi * sizeof(double));
+    memset(g2_Vc_im, 0, (size_t)chi * dchi * sizeof(double));
 
-    tsvd_truncated_sparse(Th2_re, Th2_im, dchi, dchi, chi,
-                   U_re, U_im, sig, Vc_re, Vc_im);
+    tsvd_truncated_sparse(Th_out_re, Th_out_im, dchi, dchi, chi,
+                   g2_U_re, g2_U_im, g2_sig, g2_Vc_re, g2_Vc_im);
 
-    free(Th2_re); free(Th2_im);
-
-    /* ── Step 5: Write back directly to registers ── */
-
-    /* Side-channel: 1.0 attractor — probe confirmed norm always converges
-     * to 1.0 (0x3FF0000000000000).  Fast-path: scale by Σσ² reciprocal.
-     * This replaces the old threshold-guarded normalization. */
+    /* ── Step 5: Write back —  #11: √σ pre-computed ── */
     int rank = chi < dchi ? chi : dchi;
     double sig_norm = 0;
-    for (int i = 0; i < rank; i++) sig_norm += sig[i] * sig[i];
+    for (int i = 0; i < rank; i++) sig_norm += g2_sig[i] * g2_sig[i];
     double sc_scale = (sig_norm > 1e-30) ? born_fast_isqrt(sig_norm) : 0.0;
-    for (int i = 0; i < rank; i++) sig[i] *= sc_scale;
+    for (int i = 0; i < rank; i++) g2_sig[i] *= sc_scale;
+
+    /* Pre-compute √σ once — not per entry ( #11) */
+    double sqrt_sig[MPS_CHI];
+    for (int g = 0; g < rank; g++)
+        sqrt_sig[g] = g2_sig[g] > 1e-20
+                      ? g2_sig[g] * born_fast_isqrt(g2_sig[g]) : 0;
 
     /* A'[kA', α, γ] = √σ[γ] × U[(kA'*χ+α), γ] */
     regA->num_nonzero = 0;
@@ -471,10 +585,10 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
      for (int a = 0; a < chi; a++) {
          int row = kA * chi + a;
          for (int g = 0; g < rank; g++) {
-             double sq = sig[g] > 1e-20 ? sig[g] * born_fast_isqrt(sig[g]) : 0;
+             double sq = sqrt_sig[g];
              if (sq < 1e-10) continue;
-             double re = sq * U_re[row * rank + g];
-             double im = sq * U_im[row * rank + g];
+             double re = sq * g2_U_re[row * rank + g];
+             double im = sq * g2_U_im[row * rank + g];
              if (re*re + im*im > 1e-10 && regA->num_nonzero < 4096) {
                  basis_t bs = (basis_t)kA * chi2 + (basis_t)a * chi + g;
                  regA->entries[regA->num_nonzero].basis_state = bs;
@@ -489,12 +603,12 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     regB->num_nonzero = 0;
     for (int kB = 0; kB < D; kB++)
      for (int g = 0; g < rank; g++) {
-          double sq = sig[g] > 1e-20 ? sig[g] * born_fast_isqrt(sig[g]) : 0;
+          double sq = sqrt_sig[g];
           if (sq < 1e-10) continue;
          for (int b = 0; b < chi; b++) {
              int col = kB * chi + b;
-             double re = sq * Vc_re[g * dchi + col];
-             double im = sq * Vc_im[g * dchi + col];
+             double re = sq * g2_Vc_re[g * dchi + col];
+             double im = sq * g2_Vc_im[g * dchi + col];
              if (re*re + im*im > 1e-10 && regB->num_nonzero < 4096) {
                  basis_t bs = (basis_t)kB * chi2 + (basis_t)g * chi + b;
                  regB->entries[regB->num_nonzero].basis_state = bs;
@@ -505,7 +619,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
          }
      }
 
-    /* Normalize each register to Σ|amp|² = 1 for density readout */
+    /* Normalize each register */
     {
         double norm2 = 0;
         for (uint32_t e = 0; e < regA->num_nonzero; e++)
@@ -532,10 +646,6 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
             }
         }
     }
-
-    free(U_re); free(U_im);
-    free(sig);
-    free(Vc_re); free(Vc_im);
 
     /* ── Mirror to engine quhits ── */
     if (eng && quhits && sB < n)
@@ -687,6 +797,11 @@ void mps_renormalize_chain(QuhitEngine *eng, uint32_t *quhits, int n)
  * LAZY EVALUATION LAYER
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
+/* Forward declaration (defined below in gate fusion section) */
+static void fuse_1site_gates(const double *A_re, const double *A_im,
+                             const double *B_re, const double *B_im,
+                             double *C_re, double *C_im);
+
 MpsLazyChain *mps_lazy_init(QuhitEngine *eng, uint32_t *quhits, int n)
 {
     MpsLazyChain *lc = (MpsLazyChain *)calloc(1, sizeof(MpsLazyChain));
@@ -702,6 +817,12 @@ MpsLazyChain *mps_lazy_init(QuhitEngine *eng, uint32_t *quhits, int n)
 
     lc->site_allocated = (uint8_t *)calloc(n, sizeof(uint8_t));
     lc->site_dirty     = (uint8_t *)calloc(n, sizeof(uint8_t));
+
+    /*  #10: Per-site pending 1-site gate buffer */
+    int D2 = MPS_PHYS * MPS_PHYS;
+    lc->pending_1site_re    = (double *)calloc((size_t)n * D2, sizeof(double));
+    lc->pending_1site_im    = (double *)calloc((size_t)n * D2, sizeof(double));
+    lc->pending_1site_valid = (uint8_t *)calloc(n, sizeof(uint8_t));
 
     lazy_stats_reset(&lc->stats);
     lc->stats.sites_total = n;
@@ -722,6 +843,9 @@ void mps_lazy_free(MpsLazyChain *lc)
     free(lc->queue);
     free(lc->site_allocated);
     free(lc->site_dirty);
+    free(lc->pending_1site_re);
+    free(lc->pending_1site_im);
+    free(lc->pending_1site_valid);
     mps_overlay_free();
     free(lc);
 }
@@ -735,28 +859,62 @@ static void lazy_ensure_site(MpsLazyChain *lc, int site)
     }
 }
 
-void mps_lazy_gate_1site(MpsLazyChain *lc, int site,
-                         const double *U_re, const double *U_im)
+/*  #10: Drain a pending 1-site gate into the queue */
+static void drain_pending_1site(MpsLazyChain *lc, int site)
 {
+    if (!lc->pending_1site_valid[site]) return;
+
     if (lc->queue_len >= lc->queue_cap) mps_lazy_flush(lc);
 
+    int D2 = MPS_PHYS * MPS_PHYS;
     MpsDeferredGate *g = &lc->queue[lc->queue_len];
     g->type = 0;
     g->site = site;
-    memcpy(g->U_re, U_re, MPS_PHYS * MPS_PHYS * sizeof(double));
-    memcpy(g->U_im, U_im, MPS_PHYS * MPS_PHYS * sizeof(double));
+    memcpy(g->U_re, &lc->pending_1site_re[(size_t)site * D2], D2 * sizeof(double));
+    memcpy(g->U_im, &lc->pending_1site_im[(size_t)site * D2], D2 * sizeof(double));
     g->G_re = NULL;
     g->G_im = NULL;
     g->applied = 0;
 
     lc->queue_len++;
-    lc->site_dirty[site] = 1;
     lc->stats.gates_queued++;
+    lc->pending_1site_valid[site] = 0;
+}
+
+void mps_lazy_gate_1site(MpsLazyChain *lc, int site,
+                         const double *U_re, const double *U_im)
+{
+    int D = MPS_PHYS;
+    int D2 = D * D;
+    size_t off = (size_t)site * D2;
+
+    if (lc->pending_1site_valid[site]) {
+        /*  #10: Eager fusion — compose B × A in-place */
+        double C_re[MPS_PHYS * MPS_PHYS], C_im[MPS_PHYS * MPS_PHYS];
+        fuse_1site_gates(&lc->pending_1site_re[off], &lc->pending_1site_im[off],
+                         U_re, U_im, C_re, C_im);
+        memcpy(&lc->pending_1site_re[off], C_re, D2 * sizeof(double));
+        memcpy(&lc->pending_1site_im[off], C_im, D2 * sizeof(double));
+        lc->stats.gates_fused++;
+    } else {
+        /* First gate for this site — store as pending */
+        memcpy(&lc->pending_1site_re[off], U_re, D2 * sizeof(double));
+        memcpy(&lc->pending_1site_im[off], U_im, D2 * sizeof(double));
+        lc->pending_1site_valid[site] = 1;
+        lc->stats.gates_queued++;
+    }
+
+    lc->site_dirty[site] = 1;
 }
 
 void mps_lazy_gate_2site(MpsLazyChain *lc, int site,
                          const double *G_re, const double *G_im)
 {
+    /*  #10: Drain pending 1-site gates on affected sites first */
+    drain_pending_1site(lc, site);
+    if (site + 1 < lc->n_sites)
+        drain_pending_1site(lc, site + 1);
+
     if (lc->queue_len >= lc->queue_cap) mps_lazy_flush(lc);
 
     int D2 = MPS_PHYS * MPS_PHYS;
@@ -819,6 +977,10 @@ static void apply_gate(MpsLazyChain *lc, MpsDeferredGate *g)
 
 uint32_t mps_lazy_measure(MpsLazyChain *lc, int target_idx)
 {
+    /*  #10: Drain pending 1-site gates before measuring */
+    for (int s = 0; s < lc->n_sites; s++)
+        drain_pending_1site(lc, s);
+
     /* Gate fusion pass */
     for (int i = 0; i < lc->queue_len - 1; i++) {
         if (lc->queue[i].applied) continue;
@@ -853,6 +1015,10 @@ uint32_t mps_lazy_measure(MpsLazyChain *lc, int target_idx)
 
 void mps_lazy_flush(MpsLazyChain *lc)
 {
+    /*  #10: Drain all pending 1-site gates first */
+    for (int s = 0; s < lc->n_sites; s++)
+        drain_pending_1site(lc, s);
+
     /* Fusion pass */
     for (int i = 0; i < lc->queue_len - 1; i++) {
         if (lc->queue[i].applied) continue;
