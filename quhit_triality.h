@@ -32,12 +32,14 @@
 #define VIEW_EDGE     0   /* Computational basis — Yellow square */
 #define VIEW_VERTEX   1   /* Fourier basis (DFT₆) — Cyan square */
 #define VIEW_DIAGONAL 2   /* Conjugate Fourier (DFT₆²) — Magenta square */
+#define VIEW_FOLDED   3   /* Antipodal fold: Stage 1 of factored DFT₆ */
 
-/* Dirty bitmask: bit 0 = edge dirty, bit 1 = vertex dirty, bit 2 = diag dirty */
+/* Dirty bitmask: bit 0 = edge, bit 1 = vertex, bit 2 = diag, bit 3 = folded */
 #define DIRTY_EDGE     0x1
 #define DIRTY_VERTEX   0x2
 #define DIRTY_DIAGONAL 0x4
-#define DIRTY_ALL      0x7
+#define DIRTY_FOLDED   0x8
+#define DIRTY_ALL      0xF
 
 /* ═══════════════════════════════════════════════════════════════════════
  * THE TRIALITY QUHIT
@@ -48,9 +50,16 @@ typedef struct {
     double edge_re[TRI_D],   edge_im[TRI_D];     /* |ψ⟩ in computational basis */
     double vertex_re[TRI_D], vertex_im[TRI_D];    /* |ψ⟩ in Fourier basis */
     double diag_re[TRI_D],   diag_im[TRI_D];      /* |ψ⟩ in conjugate basis */
+    double folded_re[TRI_D], folded_im[TRI_D];    /* Antipodal fold intermediate */
 
-    uint8_t dirty;      /* Which views are stale */
-    uint8_t primary;    /* Which view was last written (0/1/2) */
+    uint8_t dirty;      /* Which views are stale (bits 0-3) */
+    uint8_t primary;    /* Which view was last written (0/1/2/3) */
+
+    /* ── Enhancement flags ── */
+    int8_t  eigenstate_class;  /* -1=unknown, 0..3=DFT₆ eigenvalue {1,-1,i,-i} */
+    uint8_t active_mask;       /* Bitmask of non-zero basis states (6 bits) */
+    uint8_t active_count;      /* popcount(active_mask), 1..6 */
+    uint8_t real_valued;       /* 1 if all imaginary parts are zero */
 } TrialityQuhit;
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -150,6 +159,40 @@ void triality_rotate(TrialityQuhit *q);
 void triality_rotate_inv(TrialityQuhit *q);
 
 /* ═══════════════════════════════════════════════════════════════════════
+ * GEOMETRIC COSMOLOGY ENHANCEMENTS
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* ── Enhancement 1: Folded View ── */
+/* Fold: pair antipodal vertices (0↔3, 1↔4, 2↔5) via Hadamard.
+ * This is Stage 1 of the factored DFT₆ (Cooley-Tukey 6=2×3).
+ * vesica[k] = (ψ[k] + ψ[k+3]) / √2  (k=0,1,2)
+ * wave[k]   = (ψ[k] - ψ[k+3]) / √2  (k=0,1,2) */
+void triality_fold(TrialityQuhit *q);
+void triality_unfold(TrialityQuhit *q);
+
+/* Convert Edge↔Vertex via the folded intermediate (O(18) vs O(36)) */
+void triality_ensure_view_via_fold(TrialityQuhit *q, int target_view);
+
+/* ── Enhancement 2: Eigenstate Detection ── */
+/* Detect if state is a DFT₆ eigenstate. Sets eigenstate_class.
+ * Returns eigenstate_class (0..3) or -1 if not an eigenstate. */
+int triality_detect_eigenstate(TrialityQuhit *q);
+
+/* Clear eigenstate flag (call when non-diagonal gate is applied) */
+void triality_clear_eigenstate(TrialityQuhit *q);
+
+/* ── Enhancement 3: Subspace Confinement ── */
+/* Recompute active_mask and active_count from current edge amplitudes */
+void triality_update_mask(TrialityQuhit *q);
+
+/* ── Enhancement 4: Real-Valued Detection ── */
+/* Detect and set real_valued flag from current edge amplitudes */
+void triality_detect_real(TrialityQuhit *q);
+
+/* ── Combined: refresh all enhancement flags ── */
+void triality_refresh_flags(TrialityQuhit *q);
+
+/* ═══════════════════════════════════════════════════════════════════════
  * DIAGNOSTICS
  * ═══════════════════════════════════════════════════════════════════════ */
 
@@ -164,10 +207,15 @@ typedef struct {
     uint64_t vertex_to_diag;
     uint64_t diag_to_edge;
     uint64_t diag_to_vertex;
+    uint64_t edge_to_folded;
+    uint64_t folded_to_vertex;
     uint64_t gates_edge;    /* gates executed in edge view */
     uint64_t gates_vertex;  /* gates executed in vertex view */
     uint64_t gates_diag;    /* gates executed in diagonal view */
     uint64_t rotations;     /* O(1) triality rotations */
+    uint64_t eigenstate_skips;   /* view conversions skipped by eigenstate flag */
+    uint64_t mask_skips;         /* operations skipped by active_mask */
+    uint64_t real_fast_path;     /* operations using real-valued fast path */
 } TrialityStats;
 
 extern TrialityStats triality_stats;
