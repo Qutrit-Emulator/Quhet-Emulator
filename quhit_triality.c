@@ -576,8 +576,21 @@ void triality_print(TrialityQuhit *q, const char *label) {
  *
  * Chain: state → F^pre0 · D0 → F^pre1 · D1 → ... → F^trailing
  * All diagonals in computational (edge) basis.
- * DFTs tracked per-segment. Consecutive same-type gates fuse.
+ * DFTs tracked per-segment. F^4 = I, so counts are mod 4.
+ * IDFT = F^3 (= F^-1 since F^4 = I).
+ *
+ * Z gate:    edge diagonal, no DFTs
+ * X gate:    F^1 · diag(w^k) · F^3  (DFT, multiply, IDFT)
+ * Shift(d):  F^1 · diag(w^dk) · F^3
+ * DFT:       trailing_dfts += 1
+ * IDFT:      trailing_dfts += 3
+ *
+ * Consecutive same-type gates fuse because:
+ *   Z+Z: both trailing=0, fuse directly
+ *   X+X: trailing=3+1=4≡0 mod 4, fuse directly 
  * ═══════════════════════════════════════════════════════════════════════ */
+
+#define DFT_ORDER 4  /* DFT_6^4 = I */
 
 static void ltri_diag_identity(double *re, double *im) {
     for (int k = 0; k < TRI_D; k++) { re[k] = 1.0; im[k] = 0.0; }
@@ -600,7 +613,7 @@ static void ltri_apply_diag(const double *d_re, const double *d_im,
 }
 
 static void ltri_apply_n_dfts(double *re, double *im, int n) {
-    n = ((n % 3) + 3) % 3;
+    n = ((n % DFT_ORDER) + DFT_ORDER) % DFT_ORDER;
     for (int d = 0; d < n; d++) {
         double tmp_re[TRI_D], tmp_im[TRI_D];
         dft6_forward(re, im, tmp_re, tmp_im);
@@ -635,7 +648,6 @@ void ltri_init_basis(LazyTrialityQuhit *q, int k) {
     q->state_re[k] = 1.0;
 }
 
-/* Ensure fusable segment exists (trailing_dfts must be 0 to fuse) */
 static void ltri_ensure_segment(LazyTrialityQuhit *q) {
     if (q->n_segments == 0 || q->trailing_dfts != 0) {
         ltri_new_segment(q);
@@ -643,8 +655,7 @@ static void ltri_ensure_segment(LazyTrialityQuhit *q) {
 }
 
 void ltri_z(LazyTrialityQuhit *q) {
-    /* Z = diag(w^k) in edge basis. No DFTs.
-     * Fuses if trailing_dfts == 0. */
+    /* Z = diag(w^k) in edge basis. No DFTs. */
     ltri_ensure_segment(q);
     int idx = q->n_segments - 1;
     for (int k = 0; k < TRI_D; k++)
@@ -654,28 +665,23 @@ void ltri_z(LazyTrialityQuhit *q) {
 }
 
 void ltri_x(LazyTrialityQuhit *q) {
-    /* X = IDFT * diag(w^k) * DFT
-     * = 2_DFTs * diag(w^k) * 1_DFT
-     * Step 1: add 1 DFT to trailing (the forward DFT)
-     * Step 2: create segment (eats trailing, stores pre_dfts)
-     * Step 3: fuse diag(w^k)
-     * Step 4: set trailing = 2 (the IDFT = 2 forward DFTs)
-     * Consecutive X: trailing=2 + step1_adds_1 = 3 = 0 mod 3 => fuse! */
-    q->trailing_dfts = (q->trailing_dfts + 1) % 3;
+    /* X = F^3 · diag(w^k) · F^1  (IDFT · diag · DFT)
+     * trailing += 1 (DFT), create/fuse segment, trailing = 3 (IDFT = F^3)
+     * Consecutive: 3+1=4=0 mod 4, so consecutive X gates fuse! */
+    q->trailing_dfts = (q->trailing_dfts + 1) % DFT_ORDER;
     ltri_ensure_segment(q);
     int idx = q->n_segments - 1;
     for (int k = 0; k < TRI_D; k++)
         ltri_diag_mul_phase(q->segments[idx].diag_re, q->segments[idx].diag_im,
                             k, W6_RE[k], W6_IM[k]);
-    q->trailing_dfts = 2;
+    q->trailing_dfts = 3;  /* IDFT = F^3 since F^4 = I */
     q->gates_fused++;
 }
 
 void ltri_shift(LazyTrialityQuhit *q, int delta) {
     delta = ((delta % TRI_D) + TRI_D) % TRI_D;
     if (delta == 0) return;
-    /* shift(d) = IDFT * diag(w^(dk)) * DFT */
-    q->trailing_dfts = (q->trailing_dfts + 1) % 3;
+    q->trailing_dfts = (q->trailing_dfts + 1) % DFT_ORDER;
     ltri_ensure_segment(q);
     int idx = q->n_segments - 1;
     for (int k = 0; k < TRI_D; k++) {
@@ -683,17 +689,17 @@ void ltri_shift(LazyTrialityQuhit *q, int delta) {
         ltri_diag_mul_phase(q->segments[idx].diag_re, q->segments[idx].diag_im,
                             k, W6_RE[widx], W6_IM[widx]);
     }
-    q->trailing_dfts = 2;
+    q->trailing_dfts = 3;  /* IDFT = F^3 */
     q->gates_fused++;
 }
 
 void ltri_dft(LazyTrialityQuhit *q) {
-    q->trailing_dfts = (q->trailing_dfts + 1) % 3;
+    q->trailing_dfts = (q->trailing_dfts + 1) % DFT_ORDER;
     q->gates_fused++;
 }
 
 void ltri_idft(LazyTrialityQuhit *q) {
-    q->trailing_dfts = (q->trailing_dfts + 2) % 3;
+    q->trailing_dfts = (q->trailing_dfts + 3) % DFT_ORDER;  /* F^-1 = F^3 */
     q->gates_fused++;
 }
 
@@ -732,14 +738,12 @@ void ltri_materialize(LazyTrialityQuhit *q, double *out_re, double *out_im) {
     q->materializations++;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-
 int ltri_measure(LazyTrialityQuhit *q, int view, uint64_t *rng_state) {
     double amp_re[TRI_D], amp_im[TRI_D];
     ltri_materialize(q, amp_re, amp_im);
 
     if (view != VIEW_EDGE) {
-        int steps = ((view - VIEW_EDGE) % 3 + 3) % 3;
+        int steps = ((view - VIEW_EDGE) % DFT_ORDER + DFT_ORDER) % DFT_ORDER;
         ltri_apply_n_dfts(amp_re, amp_im, steps);
     }
 
