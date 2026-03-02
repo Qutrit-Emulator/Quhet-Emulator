@@ -512,4 +512,136 @@ static inline void triad_renormalize(TriadicJoint *j)
     }
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * CHANNEL-LOCAL GATES — "Edges are compressed faces"
+ *
+ * Geometric insight: each CMY channel {C={0,1}, M={2,3}, Y={4,5}} is a
+ * front/back pair of one square face. A 2×2 gate on one channel flips
+ * or rotates just that face, leaving the other two squares untouched.
+ *
+ * Cost: 2×2 per (b,c) pair = 4 multiplies × 36 pairs = 144 ops
+ * vs 6×6 per (b,c) pair = 36 multiplies × 36 pairs = 1296 ops
+ * → 9× fewer multiplies for channel-local operations.
+ *
+ * The full DFT₆ is only needed when rotating BETWEEN channels (turning
+ * one square's edge into another square's face). Within-channel ops
+ * stay in 2×2 land.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* Apply 2×2 unitary U to one CMY channel of quhit A.
+ * channel: 0=C, 1=M, 2=Y
+ * U is stored as [U00_re, U00_im, U01_re, U01_im, U10_re, U10_im, U11_re, U11_im] */
+static inline void triad_channel_gate_a(TriadicJoint *j, int channel,
+                                          const double U[8])
+{
+    int s0 = channel * 2;      /* First basis state of channel */
+    int s1 = channel * 2 + 1;  /* Second basis state of channel */
+
+    for (int b = 0; b < TRIAD_D; b++)
+    for (int c = 0; c < TRIAD_D; c++) {
+        int i0 = TRIAD_IDX(s0, b, c);
+        int i1 = TRIAD_IDX(s1, b, c);
+
+        double r0 = j->re[i0], m0 = j->im[i0];
+        double r1 = j->re[i1], m1 = j->im[i1];
+
+        /* new[s0] = U00 * old[s0] + U01 * old[s1] */
+        j->re[i0] = U[0]*r0 - U[1]*m0 + U[2]*r1 - U[3]*m1;
+        j->im[i0] = U[0]*m0 + U[1]*r0 + U[2]*m1 + U[3]*r1;
+
+        /* new[s1] = U10 * old[s0] + U11 * old[s1] */
+        j->re[i1] = U[4]*r0 - U[5]*m0 + U[6]*r1 - U[7]*m1;
+        j->im[i1] = U[4]*m0 + U[5]*r0 + U[6]*m1 + U[7]*r1;
+    }
+}
+
+/* Apply 2×2 unitary to one CMY channel of quhit B */
+static inline void triad_channel_gate_b(TriadicJoint *j, int channel,
+                                          const double U[8])
+{
+    int s0 = channel * 2, s1 = channel * 2 + 1;
+
+    for (int a = 0; a < TRIAD_D; a++)
+    for (int c = 0; c < TRIAD_D; c++) {
+        int i0 = TRIAD_IDX(a, s0, c);
+        int i1 = TRIAD_IDX(a, s1, c);
+
+        double r0 = j->re[i0], m0 = j->im[i0];
+        double r1 = j->re[i1], m1 = j->im[i1];
+
+        j->re[i0] = U[0]*r0 - U[1]*m0 + U[2]*r1 - U[3]*m1;
+        j->im[i0] = U[0]*m0 + U[1]*r0 + U[2]*m1 + U[3]*r1;
+        j->re[i1] = U[4]*r0 - U[5]*m0 + U[6]*r1 - U[7]*m1;
+        j->im[i1] = U[4]*m0 + U[5]*r0 + U[6]*m1 + U[7]*r1;
+    }
+}
+
+/* Apply 2×2 unitary to one CMY channel of quhit C */
+static inline void triad_channel_gate_c(TriadicJoint *j, int channel,
+                                          const double U[8])
+{
+    int s0 = channel * 2, s1 = channel * 2 + 1;
+
+    for (int a = 0; a < TRIAD_D; a++)
+    for (int b = 0; b < TRIAD_D; b++) {
+        int i0 = TRIAD_IDX(a, b, s0);
+        int i1 = TRIAD_IDX(a, b, s1);
+
+        double r0 = j->re[i0], m0 = j->im[i0];
+        double r1 = j->re[i1], m1 = j->im[i1];
+
+        j->re[i0] = U[0]*r0 - U[1]*m0 + U[2]*r1 - U[3]*m1;
+        j->im[i0] = U[0]*m0 + U[1]*r0 + U[2]*m1 + U[3]*r1;
+        j->re[i1] = U[4]*r0 - U[5]*m0 + U[6]*r1 - U[7]*m1;
+        j->im[i1] = U[4]*m0 + U[5]*r0 + U[6]*m1 + U[7]*r1;
+    }
+}
+
+/* ── CMY-diagonal gate: three independent 2×2 blocks ──
+ * Applies U_C to channel C, U_M to channel M, U_Y to channel Y.
+ * Each U is [U00_re, U00_im, U01_re, U01_im, U10_re, U10_im, U11_re, U11_im].
+ * Total cost: 3 × (2×2) = 12 multiplies per (b,c) pair. */
+static inline void triad_cmy_gate_a(TriadicJoint *j,
+                                      const double U_C[8],
+                                      const double U_M[8],
+                                      const double U_Y[8])
+{
+    triad_channel_gate_a(j, 0, U_C);
+    triad_channel_gate_a(j, 1, U_M);
+    triad_channel_gate_a(j, 2, U_Y);
+}
+
+/* ── Channel-local DFT₂ (Hadamard) ──
+ * Decompresses one edge into its face within a single channel.
+ * H = (1/√2) × [[1, 1], [1, -1]]
+ * This is the "within-square" rotation: front↔back mixing. */
+static const double CHANNEL_DFT2[8] = {
+     0.7071067811865476, 0.0,   /*  1/√2,  0 */
+     0.7071067811865476, 0.0,   /*  1/√2,  0 */
+     0.7071067811865476, 0.0,   /*  1/√2,  0 */
+    -0.7071067811865476, 0.0    /* -1/√2,  0 */
+};
+
+/* Apply DFT₂ to all three channels of quhit A simultaneously.
+ * This decompresses ALL edges within A without mixing between channels. */
+static inline void triad_channel_dft_a(TriadicJoint *j)
+{
+    triad_cmy_gate_a(j, CHANNEL_DFT2, CHANNEL_DFT2, CHANNEL_DFT2);
+}
+
+/* ── Channel-local phase gate ──
+ * Apply e^{iθ} to the second basis state of one channel.
+ * This is the cheapest possible trainable gate: one complex multiply
+ * on half the channel. */
+static inline void triad_channel_phase_a(TriadicJoint *j, int channel, double theta)
+{
+    double U[8] = {
+        1.0, 0.0,           /* U00 = 1 */
+        0.0, 0.0,           /* U01 = 0 */
+        0.0, 0.0,           /* U10 = 0 */
+        cos(theta), sin(theta)  /* U11 = e^{iθ} */
+    };
+    triad_channel_gate_a(j, channel, U);
+}
+
 #endif /* QUHIT_TRIADIC_H */
