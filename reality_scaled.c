@@ -132,6 +132,7 @@ static void build_monolithic(void)
         }
 }
 
+#ifndef REALITY_SCALED_NO_MAIN
 int main(void)
 {
     printf("══════════════════════════════════════════════════════════════\n");
