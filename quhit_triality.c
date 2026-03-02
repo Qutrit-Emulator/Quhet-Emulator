@@ -496,10 +496,10 @@ void triality_shift(TrialityQuhit *q, int delta) {
     }
     q->real_valued = 0;
     q->eigenstate_class = -1; /* Shift breaks eigenstate */
+    q->active_mask = 0x3F; q->active_count = 6; /* Edge view now dirty, mask is stale */
     q->primary = VIEW_VERTEX;
     q->dirty |= DIRTY_EDGE | DIRTY_DIAGONAL | DIRTY_FOLDED;
     triality_stats.gates_vertex++;
-    /* After shift, active_mask changes (permuted) — recompute later */
 }
 
 /* X = shift by 1 */
