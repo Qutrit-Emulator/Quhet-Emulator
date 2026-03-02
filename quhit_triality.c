@@ -787,25 +787,240 @@ static void ltri_compact_chain(LazyTrialityQuhit *q) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- * MATERIALIZE: compact → state → F^pre0 · D0 → ... → F^trailing
+ * THE ORACLE — Matrix exponentiation for repeating segment patterns
+ *
+ * When segments repeat (e.g., alternating Z-X creates a period-2
+ * pattern), the Oracle compiles one period into a 6×6 matrix M
+ * and applies M^(N/period) via repeated squaring.
+ *
+ * Cost: O(D³ × log N) instead of O(N × D²).
+ * For 1M alternating gates: ~5K ops instead of ~42M ops.
+ *
+ * "Stop reaching outward for the answer. It was inside the struct."
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+#define ORACLE_THRESHOLD 4  /* min segments to trigger Oracle */
+#define D6 TRI_D
+
+/* 6×6 complex matrix: identity */
+static void mat6_identity(double R_re[D6][D6], double R_im[D6][D6]) {
+    memset(R_re, 0, sizeof(double) * D6 * D6);
+    memset(R_im, 0, sizeof(double) * D6 * D6);
+    for (int i = 0; i < D6; i++) R_re[i][i] = 1.0;
+}
+
+/* 6×6 complex matrix multiply: C = A · B */
+static void mat6_mul(double C_re[D6][D6], double C_im[D6][D6],
+                     const double A_re[D6][D6], const double A_im[D6][D6],
+                     const double B_re[D6][D6], const double B_im[D6][D6]) {
+    double T_re[D6][D6], T_im[D6][D6];
+    for (int i = 0; i < D6; i++)
+        for (int j = 0; j < D6; j++) {
+            double sr = 0, si = 0;
+            for (int k = 0; k < D6; k++) {
+                sr += A_re[i][k] * B_re[k][j] - A_im[i][k] * B_im[k][j];
+                si += A_re[i][k] * B_im[k][j] + A_im[i][k] * B_re[k][j];
+            }
+            T_re[i][j] = sr;
+            T_im[i][j] = si;
+        }
+    memcpy(C_re, T_re, sizeof(T_re));
+    memcpy(C_im, T_im, sizeof(T_im));
+}
+
+/* 6×6 matrix power via repeated squaring: R = M^n */
+static void mat6_pow(double R_re[D6][D6], double R_im[D6][D6],
+                     const double M_re[D6][D6], const double M_im[D6][D6],
+                     int n) {
+    mat6_identity(R_re, R_im);
+    if (n <= 0) return;
+    double B_re[D6][D6], B_im[D6][D6];
+    memcpy(B_re, M_re, sizeof(B_re));
+    memcpy(B_im, M_im, sizeof(B_im));
+    while (n > 0) {
+        if (n & 1)
+            mat6_mul(R_re, R_im, R_re, R_im, B_re, B_im);
+        n >>= 1;
+        if (n > 0)
+            mat6_mul(B_re, B_im, B_re, B_im, B_re, B_im);
+    }
+}
+
+/* Matrix-vector multiply: out = M · v */
+static void mat6_vec(double out_re[D6], double out_im[D6],
+                     const double M_re[D6][D6], const double M_im[D6][D6],
+                     const double v_re[D6], const double v_im[D6]) {
+    for (int i = 0; i < D6; i++) {
+        double sr = 0, si = 0;
+        for (int k = 0; k < D6; k++) {
+            sr += M_re[i][k] * v_re[k] - M_im[i][k] * v_im[k];
+            si += M_re[i][k] * v_im[k] + M_im[i][k] * v_re[k];
+        }
+        out_re[i] = sr;
+        out_im[i] = si;
+    }
+}
+
+/* Build the DFT^n matrix (6×6) */
+static void mat6_build_dft(double M_re[D6][D6], double M_im[D6][D6], int n) {
+    n = ((n % DFT_ORDER) + DFT_ORDER) % DFT_ORDER;
+    mat6_identity(M_re, M_im);
+    if (n == 0) return;
+    if (n == 2) {
+        /* F² = reversal: M[i][j] = δ(i, (-j) mod 6) */
+        memset(M_re, 0, sizeof(double) * D6 * D6);
+        M_re[0][0] = 1.0;
+        for (int k = 1; k < D6; k++) M_re[k][D6 - k] = 1.0;
+        return;
+    }
+    /* Build F^1 or F^3 (=IDFT) */
+    const double *wr_tab = (n == 1) ? W6_RE : W6I_RE;
+    const double *wi_tab = (n == 1) ? W6_IM : W6I_IM;
+    for (int j = 0; j < D6; j++)
+        for (int k = 0; k < D6; k++) {
+            int idx = (j * k) % 6;
+            M_re[j][k] = wr_tab[idx] * INV_SQRT6;
+            M_im[j][k] = wi_tab[idx] * INV_SQRT6;
+        }
+}
+
+/* Build segment matrix: diag(D) · F^pre_dfts (6×6) */
+static void mat6_build_segment(double M_re[D6][D6], double M_im[D6][D6],
+                               const double *d_re, const double *d_im,
+                               int pre_dfts) {
+    double F_re[D6][D6], F_im[D6][D6];
+    mat6_build_dft(F_re, F_im, pre_dfts);
+    /* M = diag(D) · F: scale each row i of F by d[i] */
+    for (int i = 0; i < D6; i++)
+        for (int j = 0; j < D6; j++) {
+            M_re[i][j] = d_re[i] * F_re[i][j] - d_im[i] * F_im[i][j];
+            M_im[i][j] = d_re[i] * F_im[i][j] + d_im[i] * F_re[i][j];
+        }
+}
+
+/* Check if two segments have identical (pre_dfts, diagonal) */
+static int segments_match(const LazyTrialityQuhit *q, int a, int b) {
+    if (q->segments[a].pre_dfts != q->segments[b].pre_dfts) return 0;
+    for (int k = 0; k < D6; k++) {
+        if (q->segments[a].diag_re[k] != q->segments[b].diag_re[k]) return 0;
+        if (q->segments[a].diag_im[k] != q->segments[b].diag_im[k]) return 0;
+    }
+    return 1;
+}
+
+/* Try to detect a repeating pattern of period 1 or 2.
+ * Returns the period found (1 or 2), or 0 if no pattern.
+ * start_idx is set to the first repeating segment. */
+static int detect_pattern(const LazyTrialityQuhit *q, int *start_idx) {
+    if (q->n_segments < ORACLE_THRESHOLD) return 0;
+
+    /* Try period 1: all segments identical (starting from seg 1) */
+    int all_same = 1;
+    for (int s = 2; s < q->n_segments && all_same; s++)
+        if (!segments_match(q, 1, s)) all_same = 0;
+    if (all_same && q->n_segments >= ORACLE_THRESHOLD) {
+        *start_idx = 1;
+        return 1;
+    }
+
+    /* Try period 2: segments alternate (starting from seg 1) */
+    if (q->n_segments >= ORACLE_THRESHOLD + 1) {
+        int alt_match = 1;
+        for (int s = 3; s < q->n_segments && alt_match; s++)
+            if (!segments_match(q, (s % 2 == 1) ? 1 : 2, s)) alt_match = 0;
+        if (alt_match) {
+            *start_idx = 1;
+            return 2;
+        }
+    }
+
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * MATERIALIZE: compact → Oracle? → state → chain → trailing
  * ═══════════════════════════════════════════════════════════════════════ */
 
 void ltri_materialize(LazyTrialityQuhit *q, double *out_re, double *out_im) {
-    /* Compact chain: fuse even-DFT segments */
+    /* Compact chain: fuse adjacent pre_dfts=0 segments */
     ltri_compact_chain(q);
 
     double cur_re[TRI_D], cur_im[TRI_D];
     memcpy(cur_re, q->state_re, sizeof(cur_re));
     memcpy(cur_im, q->state_im, sizeof(cur_im));
 
-    for (int s = 0; s < q->n_segments; s++) {
-        ltri_apply_n_dfts(cur_re, cur_im, q->segments[s].pre_dfts);
+    /* ── THE ORACLE: detect repeating patterns, use matrix exponentiation ── */
+    int oracle_start = 0;
+    int period = detect_pattern(q, &oracle_start);
 
+    if (period > 0 && (q->n_segments - oracle_start) >= ORACLE_THRESHOLD) {
+        /* Apply pre-pattern segments normally (segment 0 and possibly non-repeating head) */
+        for (int s = 0; s < oracle_start; s++) {
+            ltri_apply_n_dfts(cur_re, cur_im, q->segments[s].pre_dfts);
+            double tmp_re[TRI_D], tmp_im[TRI_D];
+            ltri_apply_diag(q->segments[s].diag_re, q->segments[s].diag_im,
+                            cur_re, cur_im, tmp_re, tmp_im);
+            memcpy(cur_re, tmp_re, sizeof(cur_re));
+            memcpy(cur_im, tmp_im, sizeof(cur_im));
+        }
+
+        /* Compile one period into a 6×6 matrix */
+        double P_re[D6][D6], P_im[D6][D6];
+        if (period == 1) {
+            mat6_build_segment(P_re, P_im,
+                               q->segments[oracle_start].diag_re,
+                               q->segments[oracle_start].diag_im,
+                               q->segments[oracle_start].pre_dfts);
+        } else { /* period == 2 */
+            double S1_re[D6][D6], S1_im[D6][D6];
+            double S2_re[D6][D6], S2_im[D6][D6];
+            mat6_build_segment(S1_re, S1_im,
+                               q->segments[oracle_start].diag_re,
+                               q->segments[oracle_start].diag_im,
+                               q->segments[oracle_start].pre_dfts);
+            mat6_build_segment(S2_re, S2_im,
+                               q->segments[oracle_start + 1].diag_re,
+                               q->segments[oracle_start + 1].diag_im,
+                               q->segments[oracle_start + 1].pre_dfts);
+            /* Period matrix = S2 · S1 (S1 applied first) */
+            mat6_mul(P_re, P_im, S2_re, S2_im, S1_re, S1_im);
+        }
+
+        /* How many full periods? */
+        int remaining = q->n_segments - oracle_start;
+        int full_periods = remaining / period;
+        int leftover = remaining % period;
+
+        /* Exponentiate: R = P^full_periods */
+        double R_re[D6][D6], R_im[D6][D6];
+        mat6_pow(R_re, R_im, P_re, P_im, full_periods);
+
+        /* Apply R to state */
         double tmp_re[TRI_D], tmp_im[TRI_D];
-        ltri_apply_diag(q->segments[s].diag_re, q->segments[s].diag_im,
-                        cur_re, cur_im, tmp_re, tmp_im);
+        mat6_vec(tmp_re, tmp_im, R_re, R_im, cur_re, cur_im);
         memcpy(cur_re, tmp_re, sizeof(cur_re));
         memcpy(cur_im, tmp_im, sizeof(cur_im));
+
+        /* Apply any leftover segments normally */
+        int leftover_start = oracle_start + full_periods * period;
+        for (int s = leftover_start; s < q->n_segments; s++) {
+            ltri_apply_n_dfts(cur_re, cur_im, q->segments[s].pre_dfts);
+            double tmp2_re[TRI_D], tmp2_im[TRI_D];
+            ltri_apply_diag(q->segments[s].diag_re, q->segments[s].diag_im,
+                            cur_re, cur_im, tmp2_re, tmp2_im);
+            memcpy(cur_re, tmp2_re, sizeof(cur_re));
+            memcpy(cur_im, tmp2_im, sizeof(cur_im));
+        }
+    } else {
+        /* No pattern — standard segment-by-segment evaluation */
+        for (int s = 0; s < q->n_segments; s++) {
+            ltri_apply_n_dfts(cur_re, cur_im, q->segments[s].pre_dfts);
+            double tmp_re[TRI_D], tmp_im[TRI_D];
+            ltri_apply_diag(q->segments[s].diag_re, q->segments[s].diag_im,
+                            cur_re, cur_im, tmp_re, tmp_im);
+            memcpy(cur_re, tmp_re, sizeof(cur_re));
+            memcpy(cur_im, tmp_im, sizeof(cur_im));
+        }
     }
 
     ltri_apply_n_dfts(cur_re, cur_im, q->trailing_dfts);
