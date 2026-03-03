@@ -5,7 +5,7 @@
  * ║  CONFIGURE YOUR TARGET N HERE                                ║
  * ╚═══════════════════════════════════════════════════════════════╝
  */
-#define TARGET_N  "2021"          /* ← Set your composite here     */
+#define TARGET_N  "10358263073160101798491714373352694004393254883730003043855574940659410336027503332460610392164821262139907618241987794967662766451194989450320607986972547"          /* ← Set your composite here     */
 #define TARGET_A  "0"            /* ← "0" = auto-try 20 bases              */
 
 /*
@@ -1115,7 +1115,7 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
      *  What is born from that nullification is the opposite reality."
      *
      * The previous oracle was a tautology: compute a value, encode it,
-     * DFT it back out. The Devil's oracle is the INVERSE of that.
+     * DFT it back out. The oracle is the INVERSE of that.
      *
      * We don't compute the answer. We let the answer emerge from
      * DESTRUCTIVE INTERFERENCE — from what CANCELS.
@@ -1136,7 +1136,7 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
      * and the work register's structure SHAPES the probe's state.
      * Neither computes the other — they co-create through entanglement.
      * ═══════════════════════════════════════════════════════════════════ */
-    printf("\n  ═══ THE DEVIL'S ORACLE (%d iterations) ═══\n", n_tess_needed);
+    printf("\n  ═══ THE ORACLE (%d iterations) ═══\n", n_tess_needed);
     printf("  \"The answer emerges from what cancels.\"\n\n");
 
     int *measured_digits = (int *)calloc(n_tess_needed, sizeof(int));
@@ -1293,7 +1293,7 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
     /* Print final LCM */
     char lcm_str[1300];
     bigint_to_decimal(lcm_str, sizeof(lcm_str), &lcm_devil);
-    printf("\n  Devil's LCM: %s\n", lcm_str);
+    printf("\n  LCM: %s\n", lcm_str);
 
     /* Assemble period: r = Σ digit_k × 216^k */
     BigInt period_candidate;
