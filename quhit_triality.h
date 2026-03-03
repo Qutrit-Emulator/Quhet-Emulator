@@ -22,6 +22,7 @@
 #define QUHIT_TRIALITY_H
 
 #include <stdint.h>
+#include "s6_exotic.h"
 
 #define TRI_D 6
 
@@ -33,13 +34,15 @@
 #define VIEW_VERTEX   1   /* Fourier basis (DFT₆) — Cyan square */
 #define VIEW_DIAGONAL 2   /* Conjugate Fourier (DFT₆²) — Magenta square */
 #define VIEW_FOLDED   3   /* Antipodal fold: Stage 1 of factored DFT₆ */
+#define VIEW_EXOTIC   4   /* Exotic fold: syntheme-parameterized (outer automorphism) */
 
-/* Dirty bitmask: bit 0 = edge, bit 1 = vertex, bit 2 = diag, bit 3 = folded */
-#define DIRTY_EDGE     0x1
-#define DIRTY_VERTEX   0x2
-#define DIRTY_DIAGONAL 0x4
-#define DIRTY_FOLDED   0x8
-#define DIRTY_ALL      0xF
+/* Dirty bitmask: bit 0 = edge, bit 1 = vertex, bit 2 = diag, bit 3 = folded, bit 4 = exotic */
+#define DIRTY_EDGE     0x01
+#define DIRTY_VERTEX   0x02
+#define DIRTY_DIAGONAL 0x04
+#define DIRTY_FOLDED   0x08
+#define DIRTY_EXOTIC   0x10
+#define DIRTY_ALL      0x1F
 
 /* ═══════════════════════════════════════════════════════════════════════
  * THE TRIALITY QUHIT
@@ -51,6 +54,8 @@ typedef struct {
     double vertex_re[TRI_D], vertex_im[TRI_D];    /* |ψ⟩ in Fourier basis */
     double diag_re[TRI_D],   diag_im[TRI_D];      /* |ψ⟩ in conjugate basis */
     double folded_re[TRI_D], folded_im[TRI_D];    /* Antipodal fold intermediate */
+    double exotic_re[TRI_D], exotic_im[TRI_D];    /* Exotic fold (alt syntheme) */
+    int    exotic_syntheme;                        /* Which syntheme to use for exotic view */
 
     uint8_t dirty;      /* Which views are stale (bits 0-3) */
     uint8_t primary;    /* Which view was last written (0/1/2/3) */
@@ -159,6 +164,48 @@ void triality_rotate(TrialityQuhit *q);
 void triality_rotate_inv(TrialityQuhit *q);
 
 /* ═══════════════════════════════════════════════════════════════════════
+ * S₆ OUTER AUTOMORPHISM — Exotic Extensions
+ *
+ * S₆ is the ONLY symmetric group with a non-trivial outer automorphism.
+ * These functions exploit this D=6-unique structure.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* Initialize the exotic engine (builds φ table). Call once at startup. */
+void triality_exotic_init(void);
+
+/* Set which syntheme the exotic view uses (default: 0 = {(01),(23),(45)}) */
+void triality_set_exotic_syntheme(TrialityQuhit *q, int syntheme_idx);
+
+/* Fold using any of the 15 synthemes instead of the default antipodal */
+void triality_fold_syntheme(TrialityQuhit *q, int syntheme_idx);
+void triality_unfold_syntheme(TrialityQuhit *q, int syntheme_idx);
+
+/* Apply exotic gate: uses φ(σ) instead of σ. O(D). */
+void triality_exotic_gate(TrialityQuhit *q, S6Perm sigma);
+
+/* Dual CZ: standard CZ + exotic channel information. Returns the
+ * statistical distance between standard and exotic channels. */
+double triality_cz_dual(TrialityQuhit *a, TrialityQuhit *b);
+
+/* Measure in the exotic fold basis. Returns outcome 0..D-1. */
+int triality_measure_exotic(TrialityQuhit *q, int syntheme_idx, uint64_t *rng_state);
+
+/* Dual measurement: returns both standard and exotic outcomes.
+ * Exotic outcome is in *exotic_outcome. Standard is returned. */
+int triality_measure_dual(TrialityQuhit *q, int view, int exotic_syntheme,
+                          uint64_t *rng_state, int *exotic_outcome);
+
+/* 6-fold rotation: cycles through all 6 synthematic views.
+ * Standard rotate: Edge→Vertex→Diagonal→Edge (3-cycle, views 0→1→2→0)
+ * Exotic rotate:   Also cycles the exotic syntheme through its total.
+ * This accesses the full Aut(S₆) ≅ S₆ ⋊ Z₂ structure. */
+void triality_rotate_exotic(TrialityQuhit *q);
+
+/* Probabilities in both standard and exotic bases — no collapse */
+void triality_dual_probabilities(TrialityQuhit *q, int view,
+                                 double *probs_std, double *probs_exo);
+
+/* ═══════════════════════════════════════════════════════════════════════
  * GEOMETRIC COSMOLOGY ENHANCEMENTS
  * ═══════════════════════════════════════════════════════════════════════ */
 
@@ -216,6 +263,9 @@ typedef struct {
     uint64_t eigenstate_skips;   /* view conversions skipped by eigenstate flag */
     uint64_t mask_skips;         /* operations skipped by active_mask */
     uint64_t real_fast_path;     /* operations using real-valued fast path */
+    uint64_t exotic_folds;       /* exotic syntheme fold operations */
+    uint64_t exotic_gates;       /* exotic-automorphism gate applications */
+    uint64_t dual_measurements;  /* dual standard+exotic measurements */
 } TrialityStats;
 
 extern TrialityStats triality_stats;
