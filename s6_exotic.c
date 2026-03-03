@@ -335,3 +335,184 @@ void s6_dual_probabilities(const double *re, const double *im,
         probs_exo[k] = re[ek]*re[ek] + im[ek]*im[ek];
     }
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * EXOTIC INVARIANT Δ
+ *
+ * Δ(ψ) = Σ_{σ ∈ S₆} |⟨ψ|P_σ|ψ⟩ - ⟨ψ|P_{φ(σ)}|ψ⟩|²
+ *
+ * For each permutation σ:
+ *   ⟨ψ|P_σ|ψ⟩ = Σ_k conj(ψ_k) · ψ_{σ(k)}
+ *   ⟨ψ|P_{φ(σ)}|ψ⟩ = Σ_k conj(ψ_k) · ψ_{φ(σ)(k)}
+ *
+ * The difference measures how much the state distinguishes between
+ * the standard and exotic representations. This is a D=6-exclusive
+ * quantum number — it cannot exist in any other dimension.
+ *
+ * Cost: O(720 × 6) ≈ 4320 operations.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+double s6_exotic_invariant(const double *re, const double *im) {
+    if (!s6_exotic_ready) s6_exotic_init();
+
+    double delta = 0;
+
+    for (int idx = 0; idx < 720; idx++) {
+        S6Perm sigma = s6_from_int(idx);
+        S6Perm phi_sigma = s6_phi[idx];
+
+        /* ⟨ψ|P_σ|ψ⟩ = Σ_k conj(ψ_k) · ψ_{σ(k)} */
+        double std_re = 0, std_im = 0;
+        double exo_re = 0, exo_im = 0;
+
+        for (int k = 0; k < 6; k++) {
+            /* conj(ψ_k) = (re[k], -im[k]) */
+            double ck_re = re[k], ck_im = -im[k];
+
+            /* Standard: ψ_{σ(k)} */
+            int sk = sigma.p[k];
+            std_re += ck_re * re[sk] - ck_im * im[sk];
+            std_im += ck_re * im[sk] + ck_im * re[sk];
+
+            /* Exotic: ψ_{φ(σ)(k)} */
+            int ek = phi_sigma.p[k];
+            exo_re += ck_re * re[ek] - ck_im * im[ek];
+            exo_im += ck_re * im[ek] + ck_im * re[ek];
+        }
+
+        /* |std - exo|² */
+        double diff_re = std_re - exo_re;
+        double diff_im = std_im - exo_im;
+        delta += diff_re * diff_re + diff_im * diff_im;
+    }
+
+    return delta;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * EXOTIC ENTROPY ΔS
+ *
+ * ΔS = S_std - S_exo
+ *
+ * S_std = -Σ p_k log(p_k) where p_k = |ψ_k|²
+ * S_exo = -Σ q_k log(q_k) where q_k = |fold_k|² (syntheme-parameterized)
+ *
+ * ΔS > 0: exotic channel is more ordered (lower entropy)
+ * ΔS < 0: standard channel is more ordered
+ * ΔS = 0: both channels see the same disorder
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+double s6_exotic_entropy(const double *re, const double *im,
+                         int syntheme_idx) {
+    /* Standard entropy */
+    double S_std = 0;
+    double total = 0;
+    for (int k = 0; k < 6; k++) {
+        double p = re[k]*re[k] + im[k]*im[k];
+        if (p > 1e-30) S_std -= p * log(p);
+        total += p;
+    }
+    /* Normalize */
+    if (total > 1e-30) S_std = S_std / total + log(total);
+
+    /* Exotic entropy: fold by syntheme */
+    double fold_re[6], fold_im[6];
+    s6_fold_syntheme(re, im, fold_re, fold_im, syntheme_idx);
+
+    double S_exo = 0;
+    total = 0;
+    for (int k = 0; k < 6; k++) {
+        double p = fold_re[k]*fold_re[k] + fold_im[k]*fold_im[k];
+        if (p > 1e-30) S_exo -= p * log(p);
+        total += p;
+    }
+    if (total > 1e-30) S_exo = S_exo / total + log(total);
+
+    return S_std - S_exo;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * EXOTIC FINGERPRINT — Per-conjugacy-class breakdown
+ *
+ * Returns 11 values, one per conjugacy class of S₆.
+ * class_deltas[c] = (1/|C_c|) Σ_{σ ∈ C_c} |⟨ψ|P_σ|ψ⟩ - ⟨ψ|P_{φ(σ)}|ψ⟩|²
+ *
+ * The 11 classes (ordered by partition):
+ *   0: 1⁶ (identity)      5: 3·2·1
+ *   1: 2·1⁴               6: 4·1²
+ *   2: 2²·1²              7: 4·2
+ *   3: 2³                  8: 5·1
+ *   4: 3·1³               9: 3²
+ *  10: 6
+ *
+ * Classes where φ swaps the cycle type (1↔3, 4↔9, 6↔7) will have
+ * the largest deltas. Classes where φ preserves the type (0, 2, 5, 8, 10)
+ * may still have nonzero deltas (individual elements are rearranged).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Cycle type → class index mapping */
+static int cycle_type_to_class(S6Perm sigma) {
+    int vis[6] = {0}, lens[6], n = 0;
+    for (int i = 0; i < 6; i++) {
+        if (vis[i]) continue;
+        int len = 0, j = i;
+        while (!vis[j]) { vis[j] = 1; j = sigma.p[j]; len++; }
+        lens[n++] = len;
+    }
+    /* Sort descending */
+    for (int i = 0; i < n-1; i++)
+        for (int j = i+1; j < n; j++)
+            if (lens[j] > lens[i]) { int t = lens[i]; lens[i] = lens[j]; lens[j] = t; }
+
+    /* Map to class index based on sorted partition */
+    if (n == 6) return 0;  /* 1⁶ */
+    if (n == 5) return 1;  /* 2·1⁴ */
+    if (n == 4 && lens[0] == 2 && lens[1] == 2) return 2;  /* 2²·1² */
+    if (n == 4 && lens[0] == 3) return 4;  /* 3·1³ */
+    if (n == 3 && lens[0] == 2 && lens[1] == 2 && lens[2] == 2) return 3;  /* 2³ */
+    if (n == 3 && lens[0] == 3 && lens[1] == 2) return 5;  /* 3·2·1 */
+    if (n == 3 && lens[0] == 4) return 6;  /* 4·1² */
+    if (n == 2 && lens[0] == 3 && lens[1] == 3) return 9;  /* 3² */
+    if (n == 2 && lens[0] == 4) return 7;  /* 4·2 */
+    if (n == 2 && lens[0] == 5) return 8;  /* 5·1 */
+    if (n == 1) return 10; /* 6 */
+    return 0;
+}
+
+void s6_exotic_fingerprint(const double *re, const double *im,
+                           double *class_deltas) {
+    if (!s6_exotic_ready) s6_exotic_init();
+
+    double class_sums[11] = {0};
+    int class_counts[11] = {0};
+
+    for (int idx = 0; idx < 720; idx++) {
+        S6Perm sigma = s6_from_int(idx);
+        S6Perm phi_sigma = s6_phi[idx];
+
+        double std_re = 0, std_im = 0;
+        double exo_re = 0, exo_im = 0;
+
+        for (int k = 0; k < 6; k++) {
+            double ck_re = re[k], ck_im = -im[k];
+            int sk = sigma.p[k];
+            std_re += ck_re * re[sk] - ck_im * im[sk];
+            std_im += ck_re * im[sk] + ck_im * re[sk];
+            int ek = phi_sigma.p[k];
+            exo_re += ck_re * re[ek] - ck_im * im[ek];
+            exo_im += ck_re * im[ek] + ck_im * re[ek];
+        }
+
+        double diff_re = std_re - exo_re;
+        double diff_im = std_im - exo_im;
+        double d2 = diff_re * diff_re + diff_im * diff_im;
+
+        int cls = cycle_type_to_class(sigma);
+        class_sums[cls] += d2;
+        class_counts[cls]++;
+    }
+
+    for (int c = 0; c < 11; c++)
+        class_deltas[c] = (class_counts[c] > 0) ?
+                           class_sums[c] / class_counts[c] : 0;
+}
