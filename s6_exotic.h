@@ -82,4 +82,27 @@ void s6_apply_exotic_gate(const double *in_re, const double *in_im,
 void s6_dual_probabilities(const double *re, const double *im,
                            double *probs_std, double *probs_exo);
 
+/* ══ Exotic Invariant Δ ══
+ * Δ(ψ) = Σ_σ |⟨ψ|P_σ|ψ⟩ - ⟨ψ|P_{φ(σ)}|ψ⟩|²
+ * Measures how much the state exploits D=6-specific structure.
+ * Δ=0: automorphism-transparent (generic, could run on qubits)
+ * Δ>0: hexagonally polarized (using structure unique to D=6)
+ * Cost: O(720 × D) = O(4320). */
+double s6_exotic_invariant(const double *re, const double *im);
+
+/* ══ Exotic Entropy ΔS ══
+ * ΔS = S_std - S_exo
+ * Difference between Shannon entropy in standard vs exotic basis.
+ * ΔS>0: more ordered in exotic channel.
+ * ΔS<0: more ordered in standard channel.
+ * Cost: O(D). */
+double s6_exotic_entropy(const double *re, const double *im,
+                         int syntheme_idx);
+
+/* ══ Exotic Fingerprint ══
+ * Per-conjugacy-class breakdown of the invariant.
+ * Returns 11 values (one per S₆ conjugacy class). */
+void s6_exotic_fingerprint(const double *re, const double *im,
+                           double *class_deltas);
+
 #endif /* S6_EXOTIC_H */
