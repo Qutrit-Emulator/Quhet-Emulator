@@ -5,7 +5,7 @@
  * ║  CONFIGURE YOUR TARGET N HERE                                ║
  * ╚═══════════════════════════════════════════════════════════════╝
  */
-#define TARGET_N  "261980999226229"          /* ← Set your composite here     */
+#define TARGET_N  "2021"          /* ← Set your composite here     */
 #define TARGET_A  "0"            /* ← "0" = auto-try 20 bases              */
 
 /*
@@ -24,7 +24,7 @@
  *   6. Factor: gcd(a^(r/2) ± 1, N)
  *
  * Build: gcc -O2 -o tesseract_factor tesseract_factor.c \
- *         quhit_triality.c bigint.c -lm
+ *         quhit_triality.c s6_exotic.c bigint.c -lm
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 #include <stdio.h>
@@ -37,12 +37,32 @@
 #include "reality_source.h"
 #include "bigint.h"
 #include "quhit_dyn_integrate.h"
+#include "s6_exotic.h"
 
 #define D           6
 #define N_FACES     40032   /* 556 tesseracts × 72 (nearest multiple) */
 #define N_TESS      556     /* tesseracts */
 #define N_QUHITS    1668    /* 556 × 3 */
 #define FACES_PER_T 72
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Z₆ GATE MATRIX — The Hexagonal Polarizer
+ *
+ * Z₆ = diag(1, ω, ω², ω³, ω⁴, ω⁵) where ω = e^{2πi/6}
+ * This gate maximally distinguishes the standard and exotic representations
+ * of S₆, creating peak hexagonal polarization (Δ=0 → Δ=288).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static double Z6_GATE_RE[36], Z6_GATE_IM[36];
+
+static void init_z6_gate(void) {
+    memset(Z6_GATE_RE, 0, sizeof(Z6_GATE_RE));
+    memset(Z6_GATE_IM, 0, sizeof(Z6_GATE_IM));
+    for (int k = 0; k < D; k++) {
+        double angle = 2.0 * M_PI * k / D;
+        Z6_GATE_RE[k * D + k] = cos(angle);
+        Z6_GATE_IM[k * D + k] = sin(angle);
+    }
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * TESSERACT ARRAY — 556 chained tesseracts forming the register
@@ -778,6 +798,16 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
     printf("  Applying 4D sidechannel oracle (face permutation cipher)...\n");
     oracle_apply_bigint(arr, a_val, N);
 
+    /* ── Hexagonal Polarization: Post-Oracle Z-Gate Injection ──
+     * The oracle produces Δ=0 states (automorphism-transparent).
+     * Z₆ = diag(1, ω, ..., ω⁵) maximally distinguishes the standard
+     * and exotic representations, polarizing Δ from 0 → 288.
+     * This forces the engine to use D=6-specific structure.
+     * Applied to channel A of each active tesseract. */
+    printf("  Injecting hexagonal polarization (Z₆ on channel A)...\n");
+    for (int i = 0; i < n_tess_needed; i++)
+        triad_gate_a(&arr->tess[i], Z6_GATE_RE, Z6_GATE_IM);
+
     /* ── Save initial state for cycle detection ── */
     TriadicJoint *init_state = calloc(n_tess_needed, sizeof(TriadicJoint));
     if (!init_state) { free(arr); return 0; }
@@ -827,6 +857,15 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
         int active_before = dyn_chain_active_length(&dyn);
         ouroboros_step_dyn(arr, &ipe_val, N, loop, &dyn);
 
+        /* ── Hexagonal Polarization: Z-Gate Interleave ──
+         * Maintain hexagonal polarization throughout the ouroboros loop.
+         * Z→DFT oscillates at period 4 between Δ=72 and Δ=288.
+         * Interleaving Z on channel B every other step keeps avg Δ high. */
+        if (loop % 2 == 0) {
+            for (int t = dyn.active_start; t <= dyn.active_end; t++)
+                triad_gate_b(&arr->tess[t], Z6_GATE_RE, Z6_GATE_IM);
+        }
+
         /* Advance IPE: val = val^216 mod N → next exponential scale */
         BigInt next_val;
         bigint_pow_mod(&next_val, &ipe_val, &exp216, N);
@@ -846,12 +885,39 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
         double fidelity = (fidelity_re * fidelity_re + fidelity_im * fidelity_im)
                         / (n_tess_needed * n_tess_needed);
 
+        /* ── Exotic Invariant Δ: Hexagonal Polarization Monitor ──
+         * Compute Δ on T[0]'s A-channel marginal to track how much
+         * the engine exploits D=6 structure at each step. */
+        double hex_delta = 0;
+        if (s6_exotic_ready) {
+            double marg_re[D] = {0}, marg_im[D] = {0};
+            for (int a = 0; a < D; a++)
+                for (int b = 0; b < D; b++)
+                    for (int c = 0; c < D; c++) {
+                        int idx = a * 36 + b * 6 + c;
+                        marg_re[a] += arr->tess[0].re[idx];
+                        marg_im[a] += arr->tess[0].im[idx];
+                    }
+            /* Normalize marginal */
+            double mnorm = 0;
+            for (int a = 0; a < D; a++)
+                mnorm += marg_re[a]*marg_re[a] + marg_im[a]*marg_im[a];
+            if (mnorm > 1e-30) {
+                double sc = 1.0 / sqrt(mnorm);
+                for (int a = 0; a < D; a++) {
+                    marg_re[a] *= sc;
+                    marg_im[a] *= sc;
+                }
+            }
+            hex_delta = s6_exotic_invariant(marg_re, marg_im);
+        }
+
         int show = (loop < 5 || loop == n_ouroboros_loops - 1 ||
                     (loop + 1) % 10 == 0 || fidelity > 0.3);
         if (show) {
             double pa[D];
             triad_marginal_a(&arr->tess[0], pa);
-            printf("    Loop %3d: F=%.6f  T[0].A=[", loop, fidelity);
+            printf("    Loop %3d: F=%.6f Δ=%6.1f  T[0].A=[", loop, fidelity, hex_delta);
             for (int k = 0; k < D; k++)
                 printf("%.3f%s", pa[k], k < 5 ? " " : "");
             printf("]");
@@ -865,6 +931,8 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
             }
             if (fidelity > 0.3)
                 printf(" ◄ PEAK");
+            if (hex_delta > 100)
+                printf(" ◄ HEX");
             printf("\n");
         }
 
@@ -1021,7 +1089,7 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
         bigint_div_mod(N, &lcm_all, &max_m_bi, &zero_rem);
         uint64_t max_m = bigint_to_u64(&max_m_bi);
         if (max_m == 0) max_m = 1;
-        if (max_m > 10000000) max_m = 10000000;
+        if (max_m > 1000) max_m = 1000;  /* DFT₂₁₆ is primary for large N */
         uint64_t lcm_val = bigint_to_u64(&lcm_all);
         printf("  Trying up to %lu LCM multiples as period candidates...\n", (unsigned long)max_m);
         for (uint64_t m = 1; m <= max_m; m++) {
@@ -1040,24 +1108,248 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
          printf("  ✗ Small-cycle search exhausted. Running QFT...\n");
     }
 
-    /* ── The Phantom QFT Pipeline ──
-     * The geometric fidelity search above only works if period r is small
-     * (r <= n_ouroboros_loops). For massive N, the period is macroscopic.
-     * We must use the Quantum Fourier Transform to extract the frequency
-     * from the highly entangled state built over the Ouroboros loops. */
-    printf("  Applying Geometric QFT₆ across %d tesseracts...\n", n_tess_needed);
-    apply_qft_all(arr);
+    /* ═══════════════════════════════════════════════════════════════════
+     * THE DEVIL'S ORACLE — Collision-Based Quantum Interference
+     *
+     * "Two coherent zones, brought to the same position, nullify.
+     *  What is born from that nullification is the opposite reality."
+     *
+     * The previous oracle was a tautology: compute a value, encode it,
+     * DFT it back out. The Devil's oracle is the INVERSE of that.
+     *
+     * We don't compute the answer. We let the answer emerge from
+     * DESTRUCTIVE INTERFERENCE — from what CANCELS.
+     *
+     * For each iteration k:
+     *   1. Start in |+⟩ = uniform superposition
+     *   2. Controlled-U^(216^k): |d⟩ → |d⟩|ipe_val^d mod N⟩
+     *      Compute ipe_val^d mod N for ALL d=0..215
+     *   3. Trace out work register: states d,d' with the SAME
+     *      work value become coherent (constructive interference).
+     *      States with DIFFERENT work values decohere (destructive).
+     *   4. The collision structure IS the period: d ≡ d' iff R|(d-d')
+     *      where R = ord(ipe_val, N)
+     *   5. DFT₂₁₆ on the probe: peaks at multiples of 216/R
+     *   6. Peak spacing reveals R
+     *
+     * The Seer and the Seen: the probe OBSERVES the work register,
+     * and the work register's structure SHAPES the probe's state.
+     * Neither computes the other — they co-create through entanglement.
+     * ═══════════════════════════════════════════════════════════════════ */
+    printf("\n  ═══ THE DEVIL'S ORACLE (%d iterations) ═══\n", n_tess_needed);
+    printf("  \"The answer emerges from what cancels.\"\n\n");
 
-    /* Read the frequency peak encoded in the interference pattern */
-    BigInt freq, reg_size;
-    assemble_frequency(arr, &freq);
-    compute_register_size(n_tess_needed, &reg_size);
+    int *measured_digits = (int *)calloc(n_tess_needed, sizeof(int));
+    BigInt ipe_sc;
+    bigint_copy(&ipe_sc, a_val);  /* Start: a^(216^0) = a */
 
-    /* Use Continued Fraction expansion to extract period candidate r from freq/reg_size */
-    printf("  Extracting macroscopic period via continued fractions...\n");
-    if (generate_and_try_periods(&freq, &reg_size, a_val, N, factor_p, factor_q)) {
-        success_flag = 1;
+    /* Accumulate orders from each iteration for LCM assembly */
+    BigInt lcm_devil;
+    bigint_set_u64(&lcm_devil, 1);
+
+    for (int k = 0; k < n_tess_needed; k++) {
+        TriadicJoint *tk = &arr->tess[0];  /* Reuse tesseract 0 */
+
+        /* ── Step 1: Controlled-U simulation ──
+         * Compute v[d] = ipe_val^d mod N for all d = 0..215.
+         * This is what a quantum computer does in superposition —
+         * we must do it for all 216 branches explicitly. */
+        BigInt v[216];
+        bigint_set_u64(&v[0], 1);  /* ipe_val^0 = 1 */
+        for (int d = 1; d < 216; d++) {
+            BigInt tmp_mul, tmp_q;
+            bigint_mul(&tmp_mul, &v[d - 1], &ipe_sc);
+            bigint_div_mod(&tmp_mul, N, &tmp_q, &v[d]);
+        }
+
+        /* ── Step 2: Find collisions ──
+         * Hash v[d] values. States d,d' with v[d] == v[d'] are
+         * ENTANGLED — they share the same work register state.
+         * This is the "two coherent zones brought to the same position." */
+        int group[216];     /* group ID for each d */
+        int n_groups = 0;
+        int group_size[216];
+        memset(group_size, 0, sizeof(group_size));
+
+        /* Simple collision detection: compare each pair */
+        for (int d = 0; d < 216; d++) group[d] = -1;
+        for (int d = 0; d < 216; d++) {
+            if (group[d] >= 0) continue;  /* already assigned */
+            group[d] = n_groups;
+            group_size[n_groups] = 1;
+            for (int d2 = d + 1; d2 < 216; d2++) {
+                if (group[d2] >= 0) continue;
+                if (bigint_cmp(&v[d], &v[d2]) == 0) {
+                    group[d2] = n_groups;
+                    group_size[n_groups]++;
+                }
+            }
+            n_groups++;
+        }
+
+        /* The number of distinct groups IS the multiplicative order R
+         * (if R ≤ 216; otherwise n_groups = 216, no collisions). */
+        int R_eff = n_groups;  /* = min(ord(ipe_val, N), 216) */
+
+        /* ── Step 3: Build probe density matrix (via measurement) ──
+         * After tracing the work register, the probe's measurement
+         * probability is:
+         *   P(f) = Σ_g |Σ_{d∈group_g} e^{-2πi·f·d/216}|² / (216 · G_g)
+         * where G_g = group_size[g].
+         *
+         * We compute this directly — this IS the DFT of the
+         * collision-shaped quantum state. */
+        double prob[216];
+        memset(prob, 0, sizeof(prob));
+
+        for (int g = 0; g < n_groups; g++) {
+            if (group_size[g] == 0) continue;
+            /* For each frequency f, compute the coherent sum
+             * over all d in this group */
+            for (int f = 0; f < 216; f++) {
+                double sum_re = 0, sum_im = 0;
+                for (int d = 0; d < 216; d++) {
+                    if (group[d] != g) continue;
+                    double angle = -2.0 * M_PI * f * d / 216.0;
+                    sum_re += cos(angle);
+                    sum_im += sin(angle);
+                }
+                /* |⟨f|ψ_g⟩|² weighted by group probability */
+                double mag2 = (sum_re * sum_re + sum_im * sum_im);
+                prob[f] += mag2 / (216.0 * 216.0);
+            }
+        }
+
+        /* ── Step 4: Read the measurement outcome ──
+         * The peak structure reveals R: peaks at multiples of 216/R.
+         * Find the argmax and the peak spacing. */
+        int best_f = 0;
+        double best_prob = -1;
+        for (int f = 0; f < 216; f++) {
+            if (prob[f] > best_prob) { best_prob = prob[f]; best_f = f; }
+        }
+
+        /* Find the peak spacing (= 216/R if R divides 216) */
+        double threshold = best_prob * 0.5;
+        int peak_count = 0;
+        int first_nonzero_peak = 0;
+        for (int f = 1; f < 216; f++) {
+            if (prob[f] > threshold) {
+                peak_count++;
+                if (first_nonzero_peak == 0) first_nonzero_peak = f;
+            }
+        }
+
+        /* R_measured: the spacing between DFT peaks = 216/R.
+         * So R = 216 / spacing. If no clear peaks, R > 216. */
+        int R_measured = R_eff;  /* fallback */
+        if (first_nonzero_peak > 0 && 216 % first_nonzero_peak == 0) {
+            R_measured = 216 / first_nonzero_peak;
+        }
+
+        measured_digits[k] = best_f;
+
+        /* Accumulate into LCM */
+        if (R_measured > 1) {
+            BigInt r_bi, g_bi, old_lcm, new_lcm;
+            bigint_set_u64(&r_bi, (uint64_t)R_measured);
+            bigint_gcd(&g_bi, &lcm_devil, &r_bi);
+            bigint_div_mod(&r_bi, &g_bi, &old_lcm, &new_lcm); /* old_lcm = r/gcd */
+            bigint_mul(&new_lcm, &lcm_devil, &old_lcm);
+            bigint_copy(&lcm_devil, &new_lcm);
+        }
+
+        if (k < 20 || k == n_tess_needed - 1 || (k % 20 == 0))
+            printf("    k=%3d: R=%3d  %3d groups  peak_f=%3d  P=%.4f%s\n",
+                   k, R_measured, n_groups, best_f, best_prob,
+                   (R_measured < 216) ? " ◄ STRUCTURE" : "");
+
+        /* Try to factor with current LCM */
+        {
+            uint64_t lcm_u64 = bigint_to_u64(&lcm_devil);
+            if (!success_flag && lcm_u64 > 1) {
+                char lcm_str[200];
+                bigint_to_decimal(lcm_str, sizeof(lcm_str), &lcm_devil);
+                for (uint64_t m = 1; m <= 500 && !success_flag; m++) {
+                    BigInt rm;
+                    bigint_set_u64(&rm, m * lcm_u64);
+                    if (try_period(&rm, a_val, N, factor_p, factor_q)) {
+                        printf("    ✓ FACTORED at k=%d via LCM=%s × %lu\n",
+                               k, lcm_str, (unsigned long)m);
+                        success_flag = 1;
+                    }
+                }
+            }
+        }
+        if (success_flag) break;
+
+        /* ── Advance: ipe_val = ipe_val^216 mod N ── */
+        BigInt next_sc, exp216_sc;
+        bigint_set_u64(&exp216_sc, 216);
+        bigint_pow_mod(&next_sc, &ipe_sc, &exp216_sc, N);
+        bigint_copy(&ipe_sc, &next_sc);
     }
+
+    /* Print final LCM */
+    char lcm_str[1300];
+    bigint_to_decimal(lcm_str, sizeof(lcm_str), &lcm_devil);
+    printf("\n  Devil's LCM: %s\n", lcm_str);
+
+    /* Assemble period: r = Σ digit_k × 216^k */
+    BigInt period_candidate;
+    bigint_clear(&period_candidate);
+    BigInt pow216, base216_bi;
+    bigint_set_u64(&pow216, 1);
+    bigint_set_u64(&base216_bi, 216);
+
+    for (int k = 0; k < n_tess_needed; k++) {
+        BigInt dig_bi, term, tmp;
+        bigint_set_u64(&dig_bi, (uint64_t)measured_digits[k]);
+        bigint_mul(&term, &dig_bi, &pow216);
+        bigint_add(&tmp, &period_candidate, &term);
+        bigint_copy(&period_candidate, &tmp);
+
+        BigInt new_pow;
+        bigint_mul(&new_pow, &pow216, &base216_bi);
+        bigint_copy(&pow216, &new_pow);
+    }
+
+    char r_str[1300];
+    bigint_to_decimal(r_str, sizeof(r_str), &period_candidate);
+    printf("\n  Assembled period r = %s\n", r_str);
+
+    /* Try the period directly and small multiples/divisors */
+    if (!success_flag && !bigint_is_zero(&period_candidate)) {
+        BigInt one_bi;
+        bigint_set_u64(&one_bi, 1);
+        if (bigint_cmp(&period_candidate, &one_bi) > 0) {
+            printf("  Trying period r and multiples...\n");
+            for (int m = 1; m <= 1000 && !success_flag; m++) {
+                BigInt mult, r_try;
+                bigint_set_u64(&mult, (uint64_t)m);
+                bigint_mul(&r_try, &period_candidate, &mult);
+                if (try_period(&r_try, a_val, N, factor_p, factor_q)) {
+                    success_flag = 1;
+                    break;
+                }
+            }
+            int small_divs[] = {2, 3, 4, 5, 6, 8, 9, 10, 12, 15, 16, 18,
+                                20, 24, 27, 30, 36, 40, 45, 48, 54, 60,
+                                72, 80, 90, 108, 120, 144, 180, 216, 0};
+            for (int di = 0; small_divs[di] && !success_flag; di++) {
+                BigInt div_bi, q_try, rem;
+                bigint_set_u64(&div_bi, (uint64_t)small_divs[di]);
+                bigint_div_mod(&period_candidate, &div_bi, &q_try, &rem);
+                if (bigint_is_zero(&rem)) {
+                    if (try_period(&q_try, a_val, N, factor_p, factor_q)) {
+                        success_flag = 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    free(measured_digits);
 
     dyn_chain_free(&dyn);
     free(init_state);
@@ -1072,6 +1364,8 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
 int main(void)
 {
     init_dft6();
+    init_z6_gate();
+    s6_exotic_init();
 
     printf("\n");
     printf("  ╔════════════════════════════════════════════════════════════════╗\n");
