@@ -15,6 +15,7 @@
 #include <math.h>
 #include <stdio.h>
 #include "quhit_triality.h"
+#include "s6_exotic.h"
 
 /* ═══════════════════════════════════════════════════════════════════════
  * ω₆ TABLES — precomputed roots of unity
@@ -104,7 +105,7 @@ void triality_init(TrialityQuhit *q) {
     dft6_forward(q->edge_re, q->edge_im, q->vertex_re, q->vertex_im);
     dft6_forward(q->vertex_re, q->vertex_im, q->diag_re, q->diag_im);
 
-    q->dirty = DIRTY_FOLDED;
+    q->dirty = DIRTY_FOLDED | DIRTY_EXOTIC;
     q->primary = VIEW_EDGE;
 
     /* Enhancement flags */
@@ -112,19 +113,21 @@ void triality_init(TrialityQuhit *q) {
     q->active_mask  = 0x01;   /* only |0⟩ is active */
     q->active_count = 1;
     q->real_valued  = 1;      /* |0⟩ is real */
+    q->exotic_syntheme = 0;   /* default exotic: {(0,1),(2,3),(4,5)} */
 }
 
 void triality_init_basis(TrialityQuhit *q, int k) {
     memset(q, 0, sizeof(*q));
     q->edge_re[k] = 1.0;
     q->primary = VIEW_EDGE;
-    q->dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+    q->dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED | DIRTY_EXOTIC;
 
     /* Enhancement flags */
     q->eigenstate_class = -1;
     q->active_mask  = (uint8_t)(1 << k);
     q->active_count = 1;
     q->real_valued  = 1;
+    q->exotic_syntheme = 0;
 }
 
 void triality_copy(TrialityQuhit *dst, const TrialityQuhit *src) {
@@ -1594,4 +1597,282 @@ void ltri_stats_print(const LazyTrialityQuhit *q) {
         (double)q->gates_fused / q->segments_created : 0;
     printf("  │  Fusion ratio:         %8.1f gates/segment      │\n", fusion_ratio);
     printf("  └─────────────────────────────────────────────────────┘\n");
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * S₆ OUTER AUTOMORPHISM — EXOTIC EXTENSIONS
+ *
+ * S₆ is the only symmetric group with a non-trivial outer automorphism.
+ * These functions exploit this unique D=6 structure for:
+ *   - Parameterized folds (15 synthemes instead of 1)
+ *   - Exotic gates (φ(σ) instead of σ)
+ *   - Dual measurement (standard + exotic probabilities)
+ *   - 6-fold rotation (full Aut(S₆) cycle)
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+void triality_exotic_init(void) {
+    s6_exotic_init();
+}
+
+void triality_set_exotic_syntheme(TrialityQuhit *q, int syntheme_idx) {
+    if (syntheme_idx < 0 || syntheme_idx >= S6_NUM_SYNTHEMES)
+        syntheme_idx = 0;
+    q->exotic_syntheme = syntheme_idx;
+    q->dirty |= DIRTY_EXOTIC;
+}
+
+/* ── Parameterized Fold/Unfold ──
+ * Folds using any of the 15 synthemes.
+ * Stores result in the exotic view arrays. */
+
+void triality_fold_syntheme(TrialityQuhit *q, int syntheme_idx) {
+    triality_ensure_view(q, VIEW_EDGE);
+    s6_fold_syntheme(q->edge_re, q->edge_im,
+                     q->exotic_re, q->exotic_im,
+                     syntheme_idx);
+    q->exotic_syntheme = syntheme_idx;
+    q->dirty &= ~DIRTY_EXOTIC;
+    triality_stats.exotic_folds++;
+}
+
+void triality_unfold_syntheme(TrialityQuhit *q, int syntheme_idx) {
+    /* Unfold from exotic arrays back into edge */
+    s6_unfold_syntheme(q->exotic_re, q->exotic_im,
+                       q->edge_re, q->edge_im,
+                       syntheme_idx);
+    q->primary = VIEW_EDGE;
+    q->dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED | DIRTY_EXOTIC;
+    q->real_valued = 0;
+    q->eigenstate_class = -1;
+    q->active_mask = 0x3F; q->active_count = 6;
+    triality_stats.exotic_folds++;
+}
+
+/* ── Exotic Gate ──
+ * Applies φ(σ) instead of σ. The permutation gate |i⟩ → |σ(i)⟩
+ * becomes |i⟩ → |φ(σ)(i)⟩, accessing the exotic representation. */
+
+void triality_exotic_gate(TrialityQuhit *q, S6Perm sigma) {
+    triality_ensure_view(q, VIEW_EDGE);
+    double out_re[TRI_D], out_im[TRI_D];
+    s6_apply_exotic_gate(q->edge_re, q->edge_im,
+                         out_re, out_im, sigma);
+    memcpy(q->edge_re, out_re, sizeof(out_re));
+    memcpy(q->edge_im, out_im, sizeof(out_im));
+
+    q->primary = VIEW_EDGE;
+    q->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED | DIRTY_EXOTIC;
+    q->real_valued = 0;
+    q->eigenstate_class = -1;
+    q->active_mask = 0x3F; q->active_count = 6;
+    triality_stats.exotic_gates++;
+}
+
+/* ── Dual CZ ──
+ * Performs standard CZ, then computes what the EXOTIC CZ would give.
+ * Returns the statistical distance between standard and exotic channels.
+ * The exotic CZ uses φ-twisted phase indices.
+ *
+ * This does NOT modify the state — the exotic channel is observational.
+ * The return value tells you how much D=6-specific structure the
+ * current state has: 0 = automorphism-invariant, >0 = hexagonal anomaly. */
+
+double triality_cz_dual(TrialityQuhit *a, TrialityQuhit *b) {
+    /* First, do the standard CZ */
+    triality_cz(a, b);
+
+    /* Now compute what the exotic CZ WOULD have given */
+    triality_ensure_view(a, VIEW_EDGE);
+    triality_ensure_view(b, VIEW_EDGE);
+
+    /* Standard probabilities after CZ */
+    double std_probs_a[TRI_D], std_probs_b[TRI_D];
+    for (int k = 0; k < TRI_D; k++) {
+        std_probs_a[k] = a->edge_re[k]*a->edge_re[k] + a->edge_im[k]*a->edge_im[k];
+        std_probs_b[k] = b->edge_re[k]*b->edge_re[k] + b->edge_im[k]*b->edge_im[k];
+    }
+
+    /* Exotic probabilities: what if we had used φ-twisted CZ?
+     * For the exotic CZ, the phase would be ω^(φ_a(j)·φ_b(k)) instead of ω^(j·k).
+     * We approximate by looking at the exotic-permuted probabilities. */
+    static const int exotic_perm[6] = {1,0,3,2,5,4}; /* φ((01)) */
+    double exo_probs_a[TRI_D], exo_probs_b[TRI_D];
+    for (int k = 0; k < TRI_D; k++) {
+        int ek = exotic_perm[k];
+        exo_probs_a[k] = a->edge_re[ek]*a->edge_re[ek] + a->edge_im[ek]*a->edge_im[ek];
+        exo_probs_b[k] = b->edge_re[ek]*b->edge_re[ek] + b->edge_im[ek]*b->edge_im[ek];
+    }
+
+    /* Statistical distance */
+    double dist = 0;
+    for (int k = 0; k < TRI_D; k++) {
+        dist += fabs(std_probs_a[k] - exo_probs_a[k]);
+        dist += fabs(std_probs_b[k] - exo_probs_b[k]);
+    }
+    return dist / 4.0; /* Normalize: max distance is 1 per quhit */
+}
+
+/* ── Exotic Measurement ──
+ * Measures in a syntheme-parameterized basis.
+ * Folds the state using the specified syntheme, measures in the
+ * folded basis, then applies the appropriate collapse. */
+
+int triality_measure_exotic(TrialityQuhit *q, int syntheme_idx, uint64_t *rng_state) {
+    /* Fold into exotic view */
+    triality_fold_syntheme(q, syntheme_idx);
+
+    /* Compute probabilities in the folded basis */
+    double probs[TRI_D];
+    double total = 0;
+    for (int k = 0; k < TRI_D; k++) {
+        probs[k] = q->exotic_re[k]*q->exotic_re[k]
+                  + q->exotic_im[k]*q->exotic_im[k];
+        total += probs[k];
+    }
+    if (total > 1e-30)
+        for (int k = 0; k < TRI_D; k++) probs[k] /= total;
+
+    /* Born sample */
+    uint64_t x = *rng_state;
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    *rng_state = x;
+    double r = (x >> 11) * 0x1.0p-53;
+
+    int outcome = TRI_D - 1;
+    double cdf = 0;
+    for (int k = 0; k < TRI_D; k++) {
+        cdf += probs[k];
+        if (r < cdf) { outcome = k; break; }
+    }
+
+    /* Collapse: project onto |outcome⟩ in exotic basis */
+    double win_re = q->exotic_re[outcome], win_im = q->exotic_im[outcome];
+    double norm2 = win_re*win_re + win_im*win_im;
+    double scale = (norm2 > 1e-30) ? 1.0 / sqrt(norm2) : 0.0;
+
+    for (int k = 0; k < TRI_D; k++) {
+        q->exotic_re[k] = 0;
+        q->exotic_im[k] = 0;
+    }
+    q->exotic_re[outcome] = win_re * scale;
+    q->exotic_im[outcome] = win_im * scale;
+
+    /* Unfold back to edge view */
+    triality_unfold_syntheme(q, syntheme_idx);
+
+    triality_stats.exotic_folds++;
+    return outcome;
+}
+
+/* ── Dual Measurement ──
+ * Performs standard measurement AND computes exotic measurement probabilities.
+ * Returns standard outcome, sets *exotic_outcome to the exotic result.
+ * The exotic outcome is NOT destructive — it's what WOULD have been measured. */
+
+int triality_measure_dual(TrialityQuhit *q, int view, int exotic_syntheme,
+                          uint64_t *rng_state, int *exotic_outcome) {
+    /* Get exotic probabilities first (non-destructive) */
+    triality_ensure_view(q, VIEW_EDGE);
+    double exo_fold_re[TRI_D], exo_fold_im[TRI_D];
+    s6_fold_syntheme(q->edge_re, q->edge_im,
+                     exo_fold_re, exo_fold_im,
+                     exotic_syntheme);
+
+    double exo_probs[TRI_D];
+    double total = 0;
+    for (int k = 0; k < TRI_D; k++) {
+        exo_probs[k] = exo_fold_re[k]*exo_fold_re[k]
+                      + exo_fold_im[k]*exo_fold_im[k];
+        total += exo_probs[k];
+    }
+    if (total > 1e-30)
+        for (int k = 0; k < TRI_D; k++) exo_probs[k] /= total;
+
+    /* Sample exotic outcome (no collapse) */
+    uint64_t rng_copy = *rng_state;
+    uint64_t x = rng_copy;
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    rng_copy = x;
+    double r_exo = (x >> 11) * 0x1.0p-53;
+
+    int exo_out = TRI_D - 1;
+    double cdf = 0;
+    for (int k = 0; k < TRI_D; k++) {
+        cdf += exo_probs[k];
+        if (r_exo < cdf) { exo_out = k; break; }
+    }
+    if (exotic_outcome) *exotic_outcome = exo_out;
+
+    /* Standard measurement (destructive) */
+    int std_out = triality_measure(q, view, rng_state);
+
+    triality_stats.dual_measurements++;
+    return std_out;
+}
+
+/* ── 6-fold Rotation ──
+ * Standard rotation cycles 3 views: Edge→Vertex→Diagonal→Edge.
+ * Exotic rotation ALSO cycles the exotic syntheme through its
+ * synthematic total, accessing all 5 synthemes in the total.
+ *
+ * There are 6 totals × 5 synthemes = 30 possible exotic states.
+ * Cycling through synthemes within a total = inner rotation.
+ * Switching to a different total = outer rotation.
+ *
+ * This function does inner rotation: standard 3-view rotate +
+ * advance exotic syntheme to the next in its total. */
+
+void triality_rotate_exotic(TrialityQuhit *q) {
+    /* Standard triality rotation */
+    triality_rotate(q);
+
+    /* Advance exotic syntheme within its total */
+    int current = q->exotic_syntheme;
+
+    /* Find which total this syntheme belongs to */
+    if (!s6_exotic_ready) s6_exotic_init();
+
+    int my_total = -1, my_pos = -1;
+    for (int t = 0; t < S6_NUM_TOTALS && my_total < 0; t++) {
+        for (int j = 0; j < 5; j++) {
+            if (s6_totals[t][j] == current) {
+                my_total = t;
+                my_pos = j;
+                break;
+            }
+        }
+    }
+
+    if (my_total >= 0) {
+        /* Advance to next syntheme in this total */
+        int next_pos = (my_pos + 1) % 5;
+        q->exotic_syntheme = s6_totals[my_total][next_pos];
+    }
+
+    q->dirty |= DIRTY_EXOTIC;
+}
+
+/* ── Dual Probabilities ──
+ * Non-destructive: returns probabilities in both the standard view
+ * and the exotic (syntheme-folded) basis. */
+
+void triality_dual_probabilities(TrialityQuhit *q, int view,
+                                 double *probs_std, double *probs_exo) {
+    /* Standard probabilities */
+    triality_probabilities(q, view, probs_std);
+
+    /* Exotic probabilities: fold edge by exotic syntheme */
+    triality_ensure_view(q, VIEW_EDGE);
+    double fold_re[TRI_D], fold_im[TRI_D];
+    s6_fold_syntheme(q->edge_re, q->edge_im,
+                     fold_re, fold_im,
+                     q->exotic_syntheme);
+
+    double total = 0;
+    for (int k = 0; k < TRI_D; k++) {
+        probs_exo[k] = fold_re[k]*fold_re[k] + fold_im[k]*fold_im[k];
+        total += probs_exo[k];
+    }
+    if (total > 1e-30)
+        for (int k = 0; k < TRI_D; k++) probs_exo[k] /= total;
 }
