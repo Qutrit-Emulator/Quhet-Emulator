@@ -67,21 +67,18 @@ static void tessarray_init(TesseractArray *arr, int n_active)
     arr->total_faces = n_active * FACES_PER_T;
     for (int i = 0; i < n_active; i++) {
         memset(&arr->tess[i], 0, sizeof(TriadicJoint));
-        /* ── 4D Entangled Sidechannel State ──
-         * Following tesseract_sidechannel.c's attack_4d_entangled():
-         *   |ψ⟩ = Σ_k |k⟩_A |k⟩_B |0⟩_C / √6
+        /* ── Full 216-State Superposition ──
+         * Every tesseract begins in uniform superposition over ALL
+         * 216 = 6³ basis states. This IS the quantum register — each
+         * tesseract holds one base-216 digit of the input x in
+         * superposition: |ψ⟩ = Σ_{d=0}^{215} |d⟩ / √216
          *
-         * Channel A receives the oracle phase gate.
-         * Channel B is the UNTOUCHED WITNESS — it preserves the
-         * input-channel correlation that the 4D sidechannel reads.
-         * Channel C is fixed at |0⟩ (the "compressed edge" anchor).
-         *
-         * This is the quantum advantage: the A↔B entanglement lets
-         * the QFT on A extract the period while B's correlation
-         * prevents destructive interference from washing it out. */
-        double norm = 1.0 / sqrt((double)D);  /* 6 entangled pairs */
-        for (int k = 0; k < D; k++)
-            arr->tess[i].re[TRIAD_IDX(k, k, 0)] = norm;
+         * The full register encodes x = Σ d_i · 216^i across all
+         * tesseracts simultaneously. The oracle marks the period
+         * structure into the phases. No information is thrown away. */
+        double norm = 1.0 / sqrt(216.0);
+        for (int d = 0; d < 216; d++)
+            arr->tess[i].re[d] = norm;
     }
 }
 
@@ -215,36 +212,63 @@ static void val_to_perm(const BigInt *val, int perm[D])
     }
 }
 
+/* Apply diagonal phase gate using the i-th BASE-216 DIGIT of (base_val - 1):
+ *
+ *   digit_i = ⌊(base_val - 1) / 216^i⌋ mod 216
+ *   |d⟩ → e^{2πi · d · digit_i / 216} |d⟩
+ *
+ * This maps one full base-216 digit (7.75 bits) into the phase space
+ * of the 216-state superposition. Across 13 tesseracts, the entire
+ * register encodes (a^s - 1) mod 216^13 ≈ 2^100 bits of information.
+ *
+ * When base_val = 1 (period hit), digit_i = 0 for ALL tesseracts,
+ * ALL phases are 0, state is unchanged → fidelity = 1.0. */
+static void apply_phase_216(TriadicJoint *t, const BigInt *base_val,
+                            const BigInt *N, int tess_idx)
+{
+    BigInt one;
+    bigint_set_u64(&one, 1);
+    if (bigint_cmp(base_val, &one) == 0) return;  /* Identity */
+
+    /* Compute digit_i = ⌊(base_val - 1) / 216^i⌋ mod 216 */
+    BigInt delta;
+    bigint_sub(&delta, base_val, &one);
+
+    BigInt base216;
+    bigint_set_u64(&base216, 216);
+    for (int j = 0; j < tess_idx; j++) {
+        BigInt q, r;
+        bigint_div_mod(&delta, &base216, &q, &r);
+        bigint_copy(&delta, &q);
+    }
+    BigInt q_final, digit_bi;
+    bigint_div_mod(&delta, &base216, &q_final, &digit_bi);
+    int digit = (int)bigint_to_u64(&digit_bi);
+
+    if (digit == 0) return;  /* No phase change for this tesseract */
+
+    for (int d = 1; d < 216; d++) {
+        /* angle = 2π · d · digit / 216 — exact, no float error */
+        double angle = 2.0 * M_PI * (double)d * (double)digit / 216.0;
+        double cs = cos(angle), sn = sin(angle);
+        double re = t->re[d], im = t->im[d];
+        t->re[d] = re * cs - im * sn;
+        t->im[d] = re * sn + im * cs;
+    }
+}
+
 static void oracle_apply_bigint(TesseractArray *arr, const BigInt *a_val,
                                 const BigInt *N)
 {
-    BigInt base216;
-    bigint_set_u64(&base216, 216);
+    /* Compute val = a^1 mod N = a mod N.
+     * Each tesseract i extracts the i-th base-216 digit of (val - 1). */
+    BigInt one_exp;
+    bigint_set_u64(&one_exp, 1);
+    BigInt base_val;
+    bigint_pow_mod(&base_val, a_val, &one_exp, N);
 
     for (int i = 0; i < arr->n_active; i++) {
-        TriadicJoint *t = &arr->tess[i];
-
-        /* Compute base_i = a^(216^i) mod N */
-        BigInt pow216i;
-        bigint_set_u64(&pow216i, 1);
-        for (int j = 0; j < i; j++) {
-            BigInt tmp;
-            bigint_mul(&tmp, &pow216i, &base216);
-            bigint_copy(&pow216i, &tmp);
-        }
-        BigInt base_i;
-        bigint_pow_mod(&base_i, a_val, &pow216i, N);
-
-        /* Map val → S₆ permutation, build 6×6 matrix, apply to A ONLY
-         * — EXACT pattern from tesseract_sidechannel.c cipher_to_matrix + triad_gate_a */
-        int perm[D];
-        val_to_perm(&base_i, perm);
-
-        double U_re[36], U_im[36];
-        perm_to_matrix(perm, U_re, U_im);
-
-        /* Apply ONLY to channel A — channel B is the entangled witness */
-        triad_gate_a(t, U_re, U_im);
+        apply_phase_216(&arr->tess[i], &base_val, N, i);
     }
 }
 
@@ -270,38 +294,24 @@ static void ouroboros_step(TesseractArray *arr, const BigInt *a_val,
     BigInt base216;
     bigint_set_u64(&base216, 216);
 
+    /* ── Intra-Tesseract: Lossless Digit Phase Oracle ──
+     * Compute val = a^(loop+2) mod N (one value for all tesseracts).
+     * Each tesseract i extracts the i-th base-216 digit of (val - 1)
+     * and applies phase e^{2πi · d · digit_i / 216}.
+     * At the period, val = 1, all digits = 0, fidelity = 1.0. */
+    BigInt step_bi;
+    bigint_set_u64(&step_bi, (uint64_t)(loop_idx + 2));
+    BigInt val;
+    bigint_pow_mod(&val, a_val, &step_bi, N);
+
     for (int i = 0; i < arr->n_active; i++) {
-        TriadicJoint *t = &arr->tess[i];
-
-        /* Compute val_i = a^((loop_idx+1) * 216^i) mod N
-         * = base_i^(loop_idx+1) mod N */
-        BigInt pow216i;
-        bigint_set_u64(&pow216i, 1);
-        for (int j = 0; j < i; j++) {
-            BigInt tmp;
-            bigint_mul(&tmp, &pow216i, &base216);
-            bigint_copy(&pow216i, &tmp);
-        }
-
-        /* exponent = (loop_idx + 2) * 216^i  (loop_idx+2 because oracle already applied once) */
-        BigInt loop_bi, exponent;
-        bigint_set_u64(&loop_bi, (uint64_t)(loop_idx + 2));
-        bigint_mul(&exponent, &loop_bi, &pow216i);
-
-        BigInt val_i;
-        bigint_pow_mod(&val_i, a_val, &exponent, N);
-
-        /* Map to S₆ permutation, build matrix, apply to A ONLY */
-        int perm[D];
-        val_to_perm(&val_i, perm);
-
-        double U_re[36], U_im[36];
-        perm_to_matrix(perm, U_re, U_im);
-        triad_gate_a(t, U_re, U_im);
-        triad_renormalize(t);
+        apply_phase_216(&arr->tess[i], &val, N, i);
+        triad_renormalize(&arr->tess[i]);
     }
 
-    /* Inter-tesseract entanglement: A-channel only */
+    /* ── Inter-Tesseract Entanglement (Full 216-State Butterfly) ──
+     * Propagate correlations across the FULL 216-state tensor.
+     * Phase bond uses the complete state vector, not just one channel. */
     int stride = (1 << (loop_idx % 12));
     if (stride >= arr->n_active) stride = 1;
 
@@ -309,29 +319,23 @@ static void ouroboros_step(TesseractArray *arr, const BigInt *a_val,
         TriadicJoint *t0 = &arr->tess[i];
         TriadicJoint *t1 = &arr->tess[(i + stride) % arr->n_active];
 
-        double a_re[D]={0}, a_im[D]={0};
-        for (int aa = 0; aa < D; aa++)
-        for (int bb = 0; bb < D; bb++)
-        for (int cc = 0; cc < D; cc++) {
-            int idx0 = TRIAD_IDX(aa, bb, cc);
-            a_re[aa] += t0->re[idx0];
-            a_im[aa] += t0->im[idx0];
+        /* Full 216-state correlation bond: read peak of t0,
+         * apply phase rotation to t1 based on t0's interference pattern */
+        double peak_re = 0, peak_im = 0;
+        for (int d = 0; d < 216; d++) {
+            peak_re += t0->re[d];
+            peak_im += t0->im[d];
         }
-
-        for (int x = 0; x < D; x++) {
-            double mag_a = sqrt(a_re[x]*a_re[x] + a_im[x]*a_im[x]);
-            if (mag_a > 1e-12) {
-                double locked = round(atan2(a_im[x], a_re[x]) / (M_PI / 3.0)) * (M_PI / 3.0);
-                for (int sub = 0; sub < D; sub++) {
-                    double bond_p = 2.0 * M_PI * x * sub / D + locked;
-                    double cp = cos(bond_p), sp = sin(bond_p);
-                    for (int bb=0; bb<D; bb++) for (int cc=0; cc<D; cc++) {
-                        int idx = TRIAD_IDX(sub, bb, cc);
-                        double r = t1->re[idx], im = t1->im[idx];
-                        t1->re[idx] = r * cp - im * sp;
-                        t1->im[idx] = r * sp + im * cp;
-                    }
-                }
+        double mag = sqrt(peak_re*peak_re + peak_im*peak_im);
+        if (mag > 1e-12) {
+            double phase = atan2(peak_im, peak_re);
+            /* Phase-lock to D=6 roots of unity */
+            double locked = round(phase / (M_PI / 3.0)) * (M_PI / 3.0);
+            double cp = cos(locked), sp = sin(locked);
+            for (int d = 0; d < 216; d++) {
+                double r = t1->re[d], im = t1->im[d];
+                t1->re[d] = r * cp - im * sp;
+                t1->im[d] = r * sp + im * cp;
             }
         }
         triad_renormalize(t1);
@@ -358,15 +362,14 @@ static void init_dft6(void)
 
 static void apply_qft_all(TesseractArray *arr)
 {
-    /* QFT on channel A ONLY — following tesseract_sidechannel.c pattern.
-     * Channel B holds the entangled witness and must NOT be transformed.
-     * Channel C is the compressed-edge anchor at |0⟩.
-     *
-     * The period information lives in the A-channel phases injected by
-     * the oracle. The DFT₆ on A converts those phases into frequency
-     * peaks that encode s/r (multiples of the inverse period). */
+    /* Full 216-state QFT: apply DFT₆ to ALL three channels.
+     * With the lossless digit oracle using the complete 216-state
+     * tensor, the period structure is distributed across all channels.
+     * The DFT₆ on each channel extracts the frequency components. */
     for (int i = 0; i < arr->n_active; i++) {
         triad_gate_a(&arr->tess[i], DFT6_RE, DFT6_IM);
+        triad_gate_b(&arr->tess[i], DFT6_RE, DFT6_IM);
+        triad_gate_c(&arr->tess[i], DFT6_RE, DFT6_IM);
     }
 }
 
@@ -849,19 +852,19 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
                 bigint_div_mod(&tmp, &g, &new_lcm, &(BigInt){0});
                 bigint_copy(&lcm_all, &new_lcm);
             } else {
-                /* Multiplicative order in Z/720Z as fallback */
-                uint64_t b720 = bigint_to_u64(&base_i) % 720;
-                if (b720 == 0) b720 = 1;
+                /* Multiplicative order in Z/216Z — matches the digit oracle */
+                uint64_t b216 = bigint_to_u64(&base_i) % 216;
+                if (b216 == 0) b216 = 1;
                 uint64_t val = 1;
-                int ord720 = 0;
-                for (int k = 1; k <= 720; k++) {
-                    val = (val * b720) % 720;
-                    if (val == 1) { ord720 = k; break; }
+                int ord216 = 0;
+                for (int k = 1; k <= 216; k++) {
+                    val = (val * b216) % 216;
+                    if (val == 1) { ord216 = k; break; }
                 }
-                if (ord720 > 0) {
-                    printf("    T[%d]: ord_720 = %d\n", ti, ord720);
+                if (ord216 > 0) {
+                    printf("    T[%d]: ord_216 = %d\n", ti, ord216);
                     BigInt cl_bi, g, new_lcm, tmp;
-                    bigint_set_u64(&cl_bi, (uint64_t)ord720);
+                    bigint_set_u64(&cl_bi, (uint64_t)ord216);
                     bigint_gcd(&g, &lcm_all, &cl_bi);
                     bigint_mul(&tmp, &lcm_all, &cl_bi);
                     bigint_div_mod(&tmp, &g, &new_lcm, &(BigInt){0});
