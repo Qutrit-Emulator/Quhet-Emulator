@@ -353,20 +353,19 @@ static void ouroboros_step(TesseractArray *arr, const BigInt *a_val,
  * - DynChain contracts when digits return to 0 (period signal)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static void ouroboros_step_dyn(TesseractArray *arr, const BigInt *a_val,
+static void ouroboros_step_dyn(TesseractArray *arr, const BigInt *ipe_val,
                                const BigInt *N, int loop_idx,
                                DynChain *dyn)
 {
-    /* Compute val = a^(loop+2) mod N — one BigInt computation */
-    BigInt step_bi;
-    bigint_set_u64(&step_bi, (uint64_t)(loop_idx + 2));
-    BigInt val;
-    bigint_pow_mod(&val, a_val, &step_bi, N);
+    /* ipe_val = a^(216^loop) mod N — pre-computed via exponential leap.
+     * Each iteration probes a DIFFERENT scale of the period structure.
+     * This is true Iterative Phase Estimation: O(n) iterations for
+     * an n-digit period, not O(r) iterations for a period of size r. */
 
     /* Apply digit phase oracle ONLY to active sites */
     for (int i = dyn->active_start; i <= dyn->active_end; i++) {
         if (!dyn_chain_is_active(dyn, i)) continue;
-        apply_phase_216(&arr->tess[i], &val, N, i);
+        apply_phase_216(&arr->tess[i], ipe_val, N, i);
         triad_renormalize(&arr->tess[i]);
     }
 
@@ -747,7 +746,13 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
     printf("    Tesseracts: %d of %d (active/available)\n", n_tess_needed, N_TESS);
     printf("    Faces: %d of %d\n", total_faces, N_FACES);
     printf("    Quhits: %d\n", n_tess_needed * 3);
-    printf("    Ouroboros loops: %d\n\n", n_ouroboros_loops);
+    /* With exponential-leap IPE, we need at most n_tess_needed iterations
+     * (each probes a^(216^k), extracting one digit). Allow 2× for safety. */
+    if (n_ouroboros_loops <= 0 || n_ouroboros_loops > 4 * n_tess_needed)
+        n_ouroboros_loops = 2 * n_tess_needed;
+
+    printf("    Ouroboros loops: %d (IPE: %d digit probes)\n\n",
+           n_ouroboros_loops, n_tess_needed);
 
     /* Check trivial gcd first */
     BigInt g;
@@ -804,10 +809,28 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
 
     printf("  DynChain: %d sites, seeded at [0,0]\n", n_tess_needed);
 
+    /* ── IPE Running Base: a^(216^loop) mod N ──
+     * Maintained across iterations via val = val^216 mod N.
+     * Loop 0: val = a^1 = a
+     * Loop 1: val = a^216
+     * Loop 2: val = a^(216^2) = a^46656
+     * ...
+     * Loop k: val = a^(216^k)
+     * This is the exponential leap that makes IPE polynomial. */
+    BigInt ipe_val;
+    bigint_copy(&ipe_val, a_val);  /* Start: a^(216^0) = a */
+    BigInt exp216;
+    bigint_set_u64(&exp216, 216);
+
     for (int loop = 0; loop < n_ouroboros_loops; loop++) {
         /* Only step active sites */
         int active_before = dyn_chain_active_length(&dyn);
-        ouroboros_step_dyn(arr, a_val, N, loop, &dyn);
+        ouroboros_step_dyn(arr, &ipe_val, N, loop, &dyn);
+
+        /* Advance IPE: val = val^216 mod N → next exponential scale */
+        BigInt next_val;
+        bigint_pow_mod(&next_val, &ipe_val, &exp216, N);
+        bigint_copy(&ipe_val, &next_val);
 
         /* Compute fidelity: F = |⟨ψ_init|ψ_current⟩|²
          * Summed across all tesseracts */
@@ -1101,7 +1124,7 @@ int main(void)
         bigint_to_decimal(a_str, sizeof(a_str), &a_val);
         printf("  ── Attempt %d: a = %s ──\n\n", bi + 1, a_str);
 
-        success = factor_with_faces(&N, &a_val, &factor_p, &factor_q, 720);
+        success = factor_with_faces(&N, &a_val, &factor_p, &factor_q, 0 /* auto: IPE */);
 
         if (success) {
             char p_str[1300], q_str[1300];
