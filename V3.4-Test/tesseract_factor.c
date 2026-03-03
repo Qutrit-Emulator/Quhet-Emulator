@@ -36,6 +36,7 @@
 #include "quhit_triadic.h"
 #include "reality_source.h"
 #include "bigint.h"
+#include "quhit_dyn_integrate.h"
 
 #define D           6
 #define N_FACES     40032   /* 556 tesseracts × 72 (nearest multiple) */
@@ -330,6 +331,65 @@ static void ouroboros_step(TesseractArray *arr, const BigInt *a_val,
         if (mag > 1e-12) {
             double phase = atan2(peak_im, peak_re);
             /* Phase-lock to D=6 roots of unity */
+            double locked = round(phase / (M_PI / 3.0)) * (M_PI / 3.0);
+            double cp = cos(locked), sp = sin(locked);
+            for (int d = 0; d < 216; d++) {
+                double r = t1->re[d], im = t1->im[d];
+                t1->re[d] = r * cp - im * sp;
+                t1->im[d] = r * sp + im * cp;
+            }
+        }
+        triad_renormalize(t1);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * DYN-GATED OUROBOROS STEP — Only compute active sites
+ *
+ * Identical oracle logic, but tesseracts outside [active_start, active_end]
+ * are SKIPPED entirely. This is the lazy evaluation core:
+ * - Most digits are 0 → most sites are dormant → no work
+ * - DynChain grows as new digits become non-zero
+ * - DynChain contracts when digits return to 0 (period signal)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void ouroboros_step_dyn(TesseractArray *arr, const BigInt *a_val,
+                               const BigInt *N, int loop_idx,
+                               DynChain *dyn)
+{
+    /* Compute val = a^(loop+2) mod N — one BigInt computation */
+    BigInt step_bi;
+    bigint_set_u64(&step_bi, (uint64_t)(loop_idx + 2));
+    BigInt val;
+    bigint_pow_mod(&val, a_val, &step_bi, N);
+
+    /* Apply digit phase oracle ONLY to active sites */
+    for (int i = dyn->active_start; i <= dyn->active_end; i++) {
+        if (!dyn_chain_is_active(dyn, i)) continue;
+        apply_phase_216(&arr->tess[i], &val, N, i);
+        triad_renormalize(&arr->tess[i]);
+    }
+
+    /* Inter-tesseract entanglement: only among active sites */
+    int active_len = dyn_chain_active_length(dyn);
+    if (active_len < 2) return;
+
+    int stride = (1 << (loop_idx % 12));
+    if (stride >= active_len) stride = 1;
+
+    for (int i = dyn->active_start; i <= dyn->active_end; i++) {
+        int j = dyn->active_start + ((i - dyn->active_start + stride) % active_len);
+        TriadicJoint *t0 = &arr->tess[i];
+        TriadicJoint *t1 = &arr->tess[j];
+
+        double peak_re = 0, peak_im = 0;
+        for (int d = 0; d < 216; d++) {
+            peak_re += t0->re[d];
+            peak_im += t0->im[d];
+        }
+        double mag = sqrt(peak_re*peak_re + peak_im*peak_im);
+        if (mag > 1e-12) {
+            double phase = atan2(peak_im, peak_re);
             double locked = round(phase / (M_PI / 3.0)) * (M_PI / 3.0);
             double cp = cos(locked), sp = sin(locked);
             for (int d = 0; d < 216; d++) {
@@ -732,8 +792,22 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
     double best_fidelity = 0;
     int best_cycle = 0;
 
+    /* ── DynChain: Lazy Evaluation for the Tesseract Register ──
+     * Only compute oracle + entanglement for ACTIVE tesseracts.
+     * Chain breathes: grows toward entropy, contracts from silence.
+     * Massive contraction = period signal (all digits → 0). */
+    DynChain dyn = dyn_chain_create(n_tess_needed);
+    dyn.min_active = 1;
+    dyn.grow_threshold = 0.05 * log2(216.0);  /* Grow when site entropy > 5% of max */
+    dyn.contract_threshold = 0.001 * log2(216.0);  /* Contract near-zero entropy */
+    dyn_chain_seed(&dyn, 0, 0);  /* Start with just T[0] active */
+
+    printf("  DynChain: %d sites, seeded at [0,0]\n", n_tess_needed);
+
     for (int loop = 0; loop < n_ouroboros_loops; loop++) {
-        ouroboros_step(arr, a_val, N, loop);
+        /* Only step active sites */
+        int active_before = dyn_chain_active_length(&dyn);
+        ouroboros_step_dyn(arr, a_val, N, loop, &dyn);
 
         /* Compute fidelity: F = |⟨ψ_init|ψ_current⟩|²
          * Summed across all tesseracts */
@@ -775,6 +849,45 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
         if (fidelity > best_fidelity && loop > 0) {
             best_fidelity = fidelity;
             best_cycle = loop + 1;
+        }
+
+        /* ── DynChain Entropy Feed + Breathe ──
+         * Compute per-site entropy and feed to DynChain.
+         * Then let the chain grow/contract. */
+        for (int t = dyn.active_start; t <= dyn.active_end; t++) {
+            double probs[216];
+            double norm = 0;
+            for (int s = 0; s < 216; s++) {
+                probs[s] = arr->tess[t].re[s] * arr->tess[t].re[s]
+                         + arr->tess[t].im[s] * arr->tess[t].im[s];
+                norm += probs[s];
+            }
+            if (norm > 0) for (int s = 0; s < 216; s++) probs[s] /= norm;
+            dyn_chain_update_entropy(&dyn, t, probs, 216);
+        }
+        int prev_active = dyn_chain_active_length(&dyn);
+        dyn_chain_step(&dyn);
+        int curr_active = dyn_chain_active_length(&dyn);
+
+        /* Log DynChain state on display lines */
+        if (show) {
+            printf("    Dyn: [%d..%d] active=%d (Δ%+d)\n",
+                   dyn.active_start, dyn.active_end, curr_active,
+                   curr_active - active_before);
+        }
+
+        /* ── Contraction Period Signal ──
+         * If active region contracted significantly, that's a
+         * fingerprint of all digits collapsing toward 0 → period. */
+        if (prev_active > 3 && curr_active <= 1 && loop > 10) {
+            printf("    ◄◄ DynChain CONTRACTION from %d to %d at loop %d!\n",
+                   prev_active, curr_active, loop);
+            BigInt r_bi;
+            bigint_set_u64(&r_bi, (uint64_t)(loop + 1));
+            if (try_period(&r_bi, a_val, N, factor_p, factor_q)) {
+                success_flag = 1;
+                break;
+            }
         }
 
         /* Try this cycle length as a period candidate */
@@ -923,6 +1036,7 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
         success_flag = 1;
     }
 
+    dyn_chain_free(&dyn);
     free(init_state);
     free(arr);
     return success_flag;
