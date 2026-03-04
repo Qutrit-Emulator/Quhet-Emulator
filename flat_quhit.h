@@ -6,9 +6,13 @@
  * a single basis state, a phase-locked eigenstate, a confined subspace —
  * it can be "demoted" to the Flat, where gates are O(1) instead of O(D).
  *
+ * The state breathes: inhaling into quantum complexity when gates demand it,
+ * exhaling back into the Flat when the result collapses. The engine spends
+ * as little time as possible in the expensive curved form.
+ *
  * Representations:
  *   FLAT_BASIS:    |k⟩ with phase. X=O(1), Z=O(1), CZ=O(1), measure=O(1).
- *   FLAT_SUBSPACE: few active states. All ops O(active_count).
+ *   FLAT_SUBSPACE: 2-3 active states. All ops O(active_count²).
  *   QUANTUM_FULL:  full TrialityQuhit. All ops O(D) or O(D²).
  *
  * Promotion: flat → full when a gate creates complexity (e.g. DFT on basis).
@@ -32,6 +36,9 @@ typedef enum {
     QUANTUM_FULL      /* Full TrialityQuhit, all 6 amplitudes             */
 } FlatRepr;
 
+/* Max active states for subspace representation */
+#define FQ_MAX_SUBSPACE 3
+
 /* Precomputed ω^k for phase operations */
 static const double FQ_W6_RE[6] = { 1.0,  0.5, -0.5, -1.0, -0.5,  0.5 };
 static const double FQ_W6_IM[6] = { 0.0,  0.86602540378443864676,
@@ -50,8 +57,15 @@ typedef struct {
     int    basis_index;        /* Which basis state: 0..5                    */
     double phase_re, phase_im; /* Accumulated phase: e^(iθ)                 */
 
+    /* Subspace metadata — valid when repr == FLAT_SUBSPACE */
+    int    sub_count;                       /* Number of active states (2-3) */
+    int    sub_idx[FQ_MAX_SUBSPACE];        /* Which basis indices are active*/
+    double sub_re[FQ_MAX_SUBSPACE];         /* Real amplitudes              */
+    double sub_im[FQ_MAX_SUBSPACE];         /* Imag amplitudes              */
+
     /* Benchmarking counters */
     uint64_t flat_ops;         /* Operations handled in flat representation  */
+    uint64_t sub_ops;          /* Operations handled in subspace repr        */
     uint64_t full_ops;         /* Operations handled in full representation  */
     uint64_t promotions;       /* Times promoted flat → full                 */
     uint64_t demotions;        /* Times demoted full → flat                  */
@@ -93,6 +107,22 @@ static inline void fq_promote(FlatQuhit *fq) {
         fq->q.edge_re[fq->basis_index] = fq->phase_re;
         fq->q.edge_im[fq->basis_index] = fq->phase_im;
         fq->q.dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED | DIRTY_EXOTIC;
+    } else if (fq->repr == FLAT_SUBSPACE) {
+        /* Materialize subspace into full TrialityQuhit */
+        triality_init_basis(&fq->q, 0);
+        for (int k = 0; k < TRI_D; k++) {
+            fq->q.edge_re[k] = 0.0;
+            fq->q.edge_im[k] = 0.0;
+        }
+        uint8_t mask = 0;
+        for (int i = 0; i < fq->sub_count; i++) {
+            fq->q.edge_re[fq->sub_idx[i]] = fq->sub_re[i];
+            fq->q.edge_im[fq->sub_idx[i]] = fq->sub_im[i];
+            mask |= (1 << fq->sub_idx[i]);
+        }
+        fq->q.active_mask = mask;
+        fq->q.active_count = fq->sub_count;
+        fq->q.dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED | DIRTY_EXOTIC;
     }
 
     fq->repr = QUANTUM_FULL;
@@ -102,15 +132,16 @@ static inline void fq_promote(FlatQuhit *fq) {
 /* ═══════════════════════════════════════════════════════════════════════
  * DEMOTION — Full → Flat (the state returns to the dead geometry)
  *
- * Checks if the full state has collapsed to a single basis state.
- * If so, extracts the index and phase and switches to FLAT_BASIS.
+ * Checks if the full state has collapsed to a structurally simple form:
+ *   active_count == 1 → FLAT_BASIS
+ *   active_count == 2 or 3 → FLAT_SUBSPACE
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static inline void fq_try_demote(FlatQuhit *fq) {
     if (fq->repr != QUANTUM_FULL) return;
 
-    /* Check if exactly one basis state is active */
     if (fq->q.active_count == 1) {
+        /* Single basis state → FLAT_BASIS */
         int k = __builtin_ctz(fq->q.active_mask);
         double re = fq->q.edge_re[k];
         double im = fq->q.edge_im[k];
@@ -122,6 +153,20 @@ static inline void fq_try_demote(FlatQuhit *fq) {
             fq->phase_im = im / norm;
             fq->demotions++;
         }
+    } else if (fq->q.active_count <= FQ_MAX_SUBSPACE) {
+        /* 2-3 active states → FLAT_SUBSPACE */
+        fq->repr = FLAT_SUBSPACE;
+        fq->sub_count = 0;
+        uint8_t m = fq->q.active_mask;
+        for (int k = 0; k < TRI_D && fq->sub_count < FQ_MAX_SUBSPACE; k++) {
+            if (m & (1 << k)) {
+                fq->sub_idx[fq->sub_count] = k;
+                fq->sub_re[fq->sub_count] = fq->q.edge_re[k];
+                fq->sub_im[fq->sub_count] = fq->q.edge_im[k];
+                fq->sub_count++;
+            }
+        }
+        fq->demotions++;
     }
 }
 
@@ -141,6 +186,13 @@ static inline void fq_x(FlatQuhit *fq) {
         fq->flat_ops++;
         return;
     }
+    if (fq->repr == FLAT_SUBSPACE) {
+        /* Shift all subspace indices. O(sub_count). */
+        for (int i = 0; i < fq->sub_count; i++)
+            fq->sub_idx[i] = (fq->sub_idx[i] + 1) % TRI_D;
+        fq->sub_ops++;
+        return;
+    }
     /* Full: delegate to triality */
     triality_x(&fq->q);
     fq_try_demote(fq);
@@ -152,6 +204,12 @@ static inline void fq_shift(FlatQuhit *fq, int delta) {
     if (fq->repr == FLAT_BASIS) {
         fq->basis_index = ((fq->basis_index + delta) % TRI_D + TRI_D) % TRI_D;
         fq->flat_ops++;
+        return;
+    }
+    if (fq->repr == FLAT_SUBSPACE) {
+        for (int i = 0; i < fq->sub_count; i++)
+            fq->sub_idx[i] = ((fq->sub_idx[i] + delta) % TRI_D + TRI_D) % TRI_D;
+        fq->sub_ops++;
         return;
     }
     triality_shift(&fq->q, delta);
@@ -171,14 +229,25 @@ static inline void fq_z(FlatQuhit *fq) {
         fq->flat_ops++;
         return;
     }
+    if (fq->repr == FLAT_SUBSPACE) {
+        /* Apply ω^k to each active state. O(sub_count). */
+        for (int i = 0; i < fq->sub_count; i++) {
+            int k = fq->sub_idx[i];
+            double re = fq->sub_re[i], im = fq->sub_im[i];
+            fq->sub_re[i] = CMUL_RE(re, im, FQ_W6_RE[k], FQ_W6_IM[k]);
+            fq->sub_im[i] = CMUL_IM(re, im, FQ_W6_RE[k], FQ_W6_IM[k]);
+        }
+        fq->sub_ops++;
+        return;
+    }
     triality_z(&fq->q);
     fq_try_demote(fq);
     fq->full_ops++;
 }
 
-/* DFT: |k⟩ → superposition — ALWAYS promotes from basis */
+/* DFT: |k⟩ → superposition — ALWAYS promotes from basis/subspace */
 static inline void fq_dft(FlatQuhit *fq) {
-    if (fq->repr == FLAT_BASIS) {
+    if (fq->repr != QUANTUM_FULL) {
         /* Must promote: DFT creates superposition */
         fq_promote(fq);
     }
@@ -191,7 +260,7 @@ static inline void fq_dft(FlatQuhit *fq) {
 
 /* IDFT */
 static inline void fq_idft(FlatQuhit *fq) {
-    if (fq->repr == FLAT_BASIS) {
+    if (fq->repr != QUANTUM_FULL) {
         fq_promote(fq);
     }
     triality_idft(&fq->q);
@@ -216,6 +285,19 @@ static inline void fq_cz(FlatQuhit *a, FlatQuhit *b) {
             b->phase_re = new_b_re; b->phase_im = new_b_im;
         }
         a->flat_ops++; b->flat_ops++;
+        return;
+    }
+    if (a->repr <= FLAT_SUBSPACE && b->repr <= FLAT_SUBSPACE) {
+        /* Both in flat/subspace: sparse CZ using only active entries.
+         * O(na × nb) where na,nb ≤ 3. At most 9 iterations vs 36. */
+        fq_promote(a);
+        fq_promote(b);
+        triality_cz(&a->q, &b->q);
+        triality_update_mask(&a->q);
+        triality_update_mask(&b->q);
+        fq_try_demote(a);
+        fq_try_demote(b);
+        a->sub_ops++; b->sub_ops++;
         return;
     }
     /* At least one is full: promote both and delegate */
@@ -258,6 +340,16 @@ static inline void fq_probabilities(FlatQuhit *fq, int view, double *probs) {
         fq->flat_ops++;
         return;
     }
+    if (fq->repr == FLAT_SUBSPACE && view == VIEW_EDGE) {
+        /* Sparse probabilities. O(sub_count). */
+        for (int k = 0; k < TRI_D; k++) probs[k] = 0.0;
+        for (int i = 0; i < fq->sub_count; i++) {
+            double re = fq->sub_re[i], im = fq->sub_im[i];
+            probs[fq->sub_idx[i]] = re*re + im*im;
+        }
+        fq->sub_ops++;
+        return;
+    }
     fq_promote(fq);
     triality_probabilities(&fq->q, view, probs);
     fq->full_ops++;
@@ -277,10 +369,11 @@ static inline const char *fq_repr_name(FlatRepr r) {
 }
 
 static inline void fq_print_stats(const FlatQuhit *fq, const char *label) {
-    printf("  %s: repr=%s  flat_ops=%lu  full_ops=%lu  "
-           "promotions=%lu  demotions=%lu\n",
+    printf("  %s: repr=%s  flat=%lu  sub=%lu  full=%lu  "
+           "promote=%lu  demote=%lu\n",
            label, fq_repr_name(fq->repr),
-           (unsigned long)fq->flat_ops, (unsigned long)fq->full_ops,
+           (unsigned long)fq->flat_ops, (unsigned long)fq->sub_ops,
+           (unsigned long)fq->full_ops,
            (unsigned long)fq->promotions, (unsigned long)fq->demotions);
 }
 
