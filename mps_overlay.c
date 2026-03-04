@@ -658,10 +658,6 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
 
     /* ── Step 5: Write back —  #11: √σ pre-computed ── */
     int rank = chi < dchi ? chi : dchi;
-    double sig_norm = 0;
-    for (int i = 0; i < rank; i++) sig_norm += g2_sig[i] * g2_sig[i];
-    double sc_scale = (sig_norm > 1e-30) ? born_fast_isqrt(sig_norm) : 0.0;
-    for (int i = 0; i < rank; i++) g2_sig[i] *= sc_scale;
 
     /* Pre-compute √σ once — not per entry ( #11) */
     double sqrt_sig[MPS_CHI];
@@ -709,33 +705,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
          }
      }
 
-    /* Normalize each register */
-    {
-        double norm2 = 0;
-        for (uint32_t e = 0; e < regA->num_nonzero; e++)
-            norm2 += regA->entries[e].amp_re * regA->entries[e].amp_re +
-                     regA->entries[e].amp_im * regA->entries[e].amp_im;
-        if (norm2 > 1e-20) {
-            double inv = born_fast_isqrt(norm2);
-            for (uint32_t e = 0; e < regA->num_nonzero; e++) {
-                regA->entries[e].amp_re *= inv;
-                regA->entries[e].amp_im *= inv;
-            }
-        }
-    }
-    {
-        double norm2 = 0;
-        for (uint32_t e = 0; e < regB->num_nonzero; e++)
-            norm2 += regB->entries[e].amp_re * regB->entries[e].amp_re +
-                     regB->entries[e].amp_im * regB->entries[e].amp_im;
-        if (norm2 > 1e-20) {
-            double inv = born_fast_isqrt(norm2);
-            for (uint32_t e = 0; e < regB->num_nonzero; e++) {
-                regB->entries[e].amp_re *= inv;
-                regB->entries[e].amp_im *= inv;
-            }
-        }
-    }
+
 
     /* ── Mirror to engine quhits ── */
     if (eng && quhits && sB < n)
