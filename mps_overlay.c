@@ -453,13 +453,103 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     size_t dchi2 = (size_t)dchi * dchi;
     int D2 = D * D;
 
+    QuhitRegister *regA = &eng->registers[mps_store[sA].reg_idx];
+    QuhitRegister *regB = &eng->registers[mps_store[sB].reg_idx];
+
+    /* ── Optimization 3: Product-state SVD bypass ──
+     * When both sites have nnz ≤ 1, the joint state is a single product
+     * |kA, α, γ⟩ ⊗ |kB, γ', β⟩. The 2-site gate simply maps the physical
+     * indices (kA,kB) → Σ G(kA',kB'; kA,kB) without needing SVD.
+     * Result: O(D²) instead of O(D²·χ²). */
+    if (regA->num_nonzero <= 1 && regB->num_nonzero <= 1) {
+        if (regA->num_nonzero == 0 || regB->num_nonzero == 0) return;
+
+        /* Extract the single nonzero entry from each register */
+        basis_t bsA = regA->entries[0].basis_state;
+        double arA = regA->entries[0].amp_re, aiA = regA->entries[0].amp_im;
+        int kA_old = (int)(bsA / chi2);
+        int alpha  = (int)((bsA / chi) % chi);
+        int gamma  = (int)(bsA % chi);
+
+        basis_t bsB = regB->entries[0].basis_state;
+        double arB = regB->entries[0].amp_re, aiB = regB->entries[0].amp_im;
+        int kB_old = (int)(bsB / chi2);
+        int gamma2 = (int)((bsB / chi) % chi);
+        int beta   = (int)(bsB % chi);
+
+        /* Product amplitude */
+        double prod_re = arA * arB - aiA * aiB;
+        double prod_im = arA * aiB + aiA * arB;
+
+        /* Apply gate: new state = Σ_{kA',kB'} G(kA',kB'; kA,kB) × prod × |kA',α,γ⟩⊗|kB',γ',β⟩ */
+        int gc = kA_old * D + kB_old;  /* gate input column */
+
+        /* Clear both registers */
+        regA->num_nonzero = 0;
+        regB->num_nonzero = 0;
+
+        /* Find the dominant output (for rank-1, there's typically one large output) */
+        for (int kAp = 0; kAp < D; kAp++) {
+            for (int kBp = 0; kBp < D; kBp++) {
+                int gr = kAp * D + kBp;
+                double gre = G_re[gr * D2 + gc];
+                double gim = G_im[gr * D2 + gc];
+                if (gre*gre + gim*gim < 1e-30) continue;
+
+                double out_re = gre * prod_re - gim * prod_im;
+                double out_im = gre * prod_im + gim * prod_re;
+                if (out_re*out_re + out_im*out_im < 1e-30) continue;
+
+                /* Write to register A: |kAp, α, γ⟩ */
+                basis_t newA = (uint64_t)kAp * chi2 + alpha * chi + gamma;
+                /* Write to register B: |kBp, γ', β⟩ */
+                basis_t newB = (uint64_t)kBp * chi2 + gamma2 * chi + beta;
+
+                /* For product-state output, factor as √|out|² on each site */
+                double mag = sqrt(out_re*out_re + out_im*out_im);
+                double phase_re = out_re / mag, phase_im = out_im / mag;
+
+                /* Put magnitude on A, phase on A, unit on B */
+                if (regA->num_nonzero < 4096) {
+                    int found = -1;
+                    for (uint32_t e = 0; e < regA->num_nonzero; e++) {
+                        if (regA->entries[e].basis_state == newA) { found = e; break; }
+                    }
+                    if (found >= 0) {
+                        regA->entries[found].amp_re += mag * phase_re;
+                        regA->entries[found].amp_im += mag * phase_im;
+                    } else {
+                        int e = regA->num_nonzero++;
+                        regA->entries[e].basis_state = newA;
+                        regA->entries[e].amp_re = mag * phase_re;
+                        regA->entries[e].amp_im = mag * phase_im;
+                    }
+                }
+                if (regB->num_nonzero < 4096) {
+                    int found = -1;
+                    for (uint32_t e = 0; e < regB->num_nonzero; e++) {
+                        if (regB->entries[e].basis_state == newB) { found = e; break; }
+                    }
+                    if (found >= 0) {
+                        /* already there */
+                    } else {
+                        int e = regB->num_nonzero++;
+                        regB->entries[e].basis_state = newB;
+                        regB->entries[e].amp_re = 1.0;
+                        regB->entries[e].amp_im = 0.0;
+                    }
+                }
+            }
+        }
+        return;  /* Skip entire Θ formation + SVD pipeline */
+    }
+
+    /* ── General path: full Θ contraction + SVD ── */
+
     /*  #7: Ensure scratch pool */
     g2_pool_ensure();
     memset(g2_Th_re, 0, dchi2 * sizeof(double));
     memset(g2_Th_im, 0, dchi2 * sizeof(double));
-
-    QuhitRegister *regA = &eng->registers[mps_store[sA].reg_idx];
-    QuhitRegister *regB = &eng->registers[mps_store[sB].reg_idx];
 
     /* ── Step 1+2: Build Θ —  #9: γ-bucketed contraction ──
      * Pre-sort register B entries by shared bond γ.
