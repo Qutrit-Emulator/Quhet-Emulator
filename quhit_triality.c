@@ -623,6 +623,31 @@ void triality_cz(TrialityQuhit *a, TrialityQuhit *b) {
     }
     triality_stats.mask_skips += skipped;
 
+    /* ── Renormalize after effective-phase CZ ──
+     * The effective-phase model computes eff[j] = Σ_k |b_k|² × ω^(jk),
+     * then a[j] *= eff[j].  Since |eff[j]| = |Σ |b_k|² ω^(jk)| ≤ 1
+     * (strictly < 1 when |b| is not perfectly normalized), floating-point
+     * drift causes mutual amplitude drain between both quhits.
+     * Renormalization prevents this feedback loop. */
+    {
+        double na = 0, nb = 0;
+        for (int i = 0; i < TRI_D; i++) {
+            na += a->edge_re[i]*a->edge_re[i] + a->edge_im[i]*a->edge_im[i];
+            nb += b->edge_re[i]*b->edge_re[i] + b->edge_im[i]*b->edge_im[i];
+        }
+        if (na > 1e-30 && fabs(na - 1.0) > 1e-15) {
+            double inv = 1.0 / sqrt(na);
+            for (int i = 0; i < TRI_D; i++) {
+                a->edge_re[i] *= inv; a->edge_im[i] *= inv;
+            }
+        }
+        if (nb > 1e-30 && fabs(nb - 1.0) > 1e-15) {
+            double inv = 1.0 / sqrt(nb);
+            for (int i = 0; i < TRI_D; i++) {
+                b->edge_re[i] *= inv; b->edge_im[i] *= inv;
+            }
+        }
+    }
     a->real_valued = 0; b->real_valued = 0; /* CZ introduces complex phases */
     a->eigenstate_class = -1; b->eigenstate_class = -1;
     a->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
