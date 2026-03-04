@@ -589,6 +589,64 @@ void triality_cz(TrialityQuhit *a, TrialityQuhit *b) {
      * This is the biggest win — D_eff × D_eff iterations instead of 36. */
     uint8_t ma = a->active_mask, mb = b->active_mask;
 
+    /* ── Optimization: Triangle Shortcut ──
+     * The hexagon has two Z₃ triangles:
+     *   EVEN {0,2,4} = mask 0x15    ODD {1,3,5} = mask 0x2A
+     * When active_mask is confined to one triangle, we only iterate 3
+     * states instead of 6, reducing the inner loop from 36 to 9 ops.
+     * Triangle indices for direct iteration: */
+    static const int TRI_EVEN[3] = {0, 2, 4};
+    static const int TRI_ODD[3]  = {1, 3, 5};
+    #define MASK_EVEN 0x15   /* bits 0,2,4 */
+    #define MASK_ODD  0x2A   /* bits 1,3,5 */
+
+    const int *tri_a = NULL, *tri_b = NULL;
+    int na = 0, nb = 0;
+
+    if ((ma & ~MASK_EVEN) == 0 && ma) { tri_a = TRI_EVEN; na = __builtin_popcount(ma); }
+    else if ((ma & ~MASK_ODD) == 0 && ma) { tri_a = TRI_ODD; na = __builtin_popcount(ma); }
+
+    if ((mb & ~MASK_EVEN) == 0 && mb) { tri_b = TRI_EVEN; nb = __builtin_popcount(mb); }
+    else if ((mb & ~MASK_ODD) == 0 && mb) { tri_b = TRI_ODD; nb = __builtin_popcount(mb); }
+
+    if (tri_a && tri_b) {
+        /* Both confined to triangles — iterate only triangle indices */
+        double eff_a_re[TRI_D] = {0}, eff_a_im[TRI_D] = {0};
+        double eff_b_re[TRI_D] = {0}, eff_b_im[TRI_D] = {0};
+
+        for (int ti = 0; ti < 3; ti++) {
+            int j = tri_a[ti];
+            if (!(ma & (1 << j))) continue;
+            double aprob = a->edge_re[j]*a->edge_re[j] + a->edge_im[j]*a->edge_im[j];
+            for (int tk = 0; tk < 3; tk++) {
+                int k = tri_b[tk];
+                if (!(mb & (1 << k))) continue;
+                int idx = (j * k) % 6;
+                double bprob = b->edge_re[k]*b->edge_re[k] + b->edge_im[k]*b->edge_im[k];
+                eff_a_re[j] += bprob * W6_RE[idx];
+                eff_a_im[j] += bprob * W6_IM[idx];
+                eff_b_re[k] += aprob * W6_RE[idx];
+                eff_b_im[k] += aprob * W6_IM[idx];
+            }
+        }
+        for (int ti = 0; ti < 3; ti++) {
+            int j = tri_a[ti];
+            if (!(ma & (1 << j))) continue;
+            double re = a->edge_re[j], im = a->edge_im[j];
+            a->edge_re[j] = re * eff_a_re[j] - im * eff_a_im[j];
+            a->edge_im[j] = re * eff_a_im[j] + im * eff_a_re[j];
+        }
+        for (int tk = 0; tk < 3; tk++) {
+            int k = tri_b[tk];
+            if (!(mb & (1 << k))) continue;
+            double re = b->edge_re[k], im = b->edge_im[k];
+            b->edge_re[k] = re * eff_b_re[k] - im * eff_b_im[k];
+            b->edge_im[k] = re * eff_b_im[k] + im * eff_b_re[k];
+        }
+        triality_stats.mask_skips += (6 - na) + (6 - nb);
+        goto cz_renorm;
+    }
+
     /* Compute effective phases from partner */
     double eff_a_re[TRI_D] = {0}, eff_a_im[TRI_D] = {0};
     double eff_b_re[TRI_D] = {0}, eff_b_im[TRI_D] = {0};
@@ -629,6 +687,7 @@ void triality_cz(TrialityQuhit *a, TrialityQuhit *b) {
      * (strictly < 1 when |b| is not perfectly normalized), floating-point
      * drift causes mutual amplitude drain between both quhits.
      * Renormalization prevents this feedback loop. */
+cz_renorm:
     {
         double na = 0, nb = 0;
         for (int i = 0; i < TRI_D; i++) {
