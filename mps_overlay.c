@@ -1,1183 +1,452 @@
 /*
- * mps_overlay.c — MPS Overlay with Pure Magic Pointers
+ * mps_overlay.c — 1D Tensor Network: Register-Based SVD Engine
  *
- * All tensor data stored in QuhitRegisters — RAM-agnostic.
- * Gate functions use register-based read/write via mps_read_tensor/mps_write_tensor.
- * 2-site gates are O(1) via CZ₆ engine pair operations.
+ * D=6 native (SU(6)), bond dimension χ=256 per axis (2 axes: left, right).
+ * Simple-update with Jacobi SVD for proper 2-site gate application.
+ * All tensor data stored in registers — temporary dense buffers for SVD.
+ *
+ * Modeled directly on peps3d_overlay.c, adapted for 1D chains.
+ *
+ * 3-index tensor: T[k, α, β]
+ *   k = physical index (position 2, most significant)
+ *   α = left bond  (position 1)
+ *   β = right bond (position 0, least significant)
+ * basis = k*χ² + α*χ + β
+ *
+ * Shared bond between site i and i+1: β_i = α_{i+1}
+ *   A's shared = β (position 0)
+ *   B's shared = α (position 1)
  */
 
-#ifdef _OPENMP
-#include <omp.h>
-#endif
-
 #include "mps_overlay.h"
-#include <math.h>
-#include <fenv.h>
-#include <xmmintrin.h>    /* _MM_SET_FLUSH_ZERO_MODE */
-#include <pmmintrin.h>    /* _MM_SET_DENORMALS_ZERO_MODE */
-
-/* ─── Global tensor store ──────────────────────────────────────────────────── */
-MpsTensor        *mps_store     = NULL;
-int               mps_store_n   = 0;
-QuhitEngine      *mps_eng       = NULL;
-TriOverlaySite   *mps_tri_sites = NULL;
-int               mps_defer_renorm = 0;
-int               mps_sweep_right  = 1;
-
-/* ═══════════════════════════════════════════════════════════════════════════════
- * INIT / FREE
- * ═══════════════════════════════════════════════════════════════════════════════ */
-
-void mps_overlay_init(QuhitEngine *eng, uint32_t *quhits, int n)
-{
-    (void)quhits;
-    mps_eng = eng;
-
-    /* Lightweight tensor metadata — 4 bytes per site */
-    if (mps_store) { free(mps_store); mps_store = NULL; }
-    mps_store = (MpsTensor *)calloc((size_t)n, sizeof(MpsTensor));
-    mps_store_n = n;
-
-    /* Sidechannel probe: DAZ/FTZ eliminates 25.7× denormal penalty.
-     * Denormal ops (< 2^-1022): 59.7 ns → 2.0 ns with flush enabled.
-     * Safe for quantum simulation: denormal amplitudes are below noise. */
-    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
-    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
-
-    /* Create per-site registers: 3 qudits (k, α, β) */
-    for (int i = 0; i < n; i++) {
-        mps_store[i].reg_idx = quhit_reg_init(eng, (uint64_t)i, 3, MPS_CHI);
-        if (mps_store[i].reg_idx >= 0) {
-            eng->registers[mps_store[i].reg_idx].bulk_rule = 0;
-            /* Seed product state: |k=0, α=0, β=0⟩ with amplitude 1.0 */
-            quhit_reg_sv_set(eng, mps_store[i].reg_idx, 0, 1.0, 0.0);
-        }
-    }
-
-    /* ── Triality per-site state ── */
-    if (mps_tri_sites) { free(mps_tri_sites); mps_tri_sites = NULL; }
-    mps_tri_sites = (TriOverlaySite *)calloc((size_t)n, sizeof(TriOverlaySite));
-    for (int i = 0; i < n; i++)
-        tri_site_init(&mps_tri_sites[i]);
-}
-
-void mps_overlay_free(void)
-{
-    free(mps_store);
-    mps_store = NULL;
-    mps_store_n = 0;
-    mps_eng = NULL;
-    free(mps_tri_sites);
-    mps_tri_sites = NULL;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════════
- * W-STATE CONSTRUCTION
- * ═══════════════════════════════════════════════════════════════════════════════ */
-
-void mps_overlay_write_w_state(QuhitEngine *eng, uint32_t *quhits, int n)
-{
-    (void)eng; (void)quhits;
-    double site_scale = pow((double)n, -1.0 / (2.0 * n));
-
-    for (int i = 0; i < n; i++) {
-        mps_zero_site(i);
-        mps_write_tensor(i, 0, 0, 0, site_scale, 0.0);
-        mps_write_tensor(i, 0, 1, 1, site_scale, 0.0);
-        mps_write_tensor(i, 1, 0, 1, site_scale, 0.0);
-    }
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════════
- * PRODUCT STATE |0⟩^⊗N
- * ═══════════════════════════════════════════════════════════════════════════════ */
-
-void mps_overlay_write_zero(QuhitEngine *eng, uint32_t *quhits, int n)
-{
-    (void)eng; (void)quhits;
-    for (int i = 0; i < n; i++) {
-        mps_zero_site(i);
-        mps_write_tensor(i, 0, 0, 0, 1.0, 0.0);
-    }
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════════
- * AMPLITUDE INSPECTION: ⟨basis|ψ⟩ = L^T · Π_i A[k_i] · R
- * ═══════════════════════════════════════════════════════════════════════════════ */
-
-void mps_overlay_amplitude(QuhitEngine *eng, uint32_t *quhits, int n,
-                           const uint32_t *basis, double *out_re, double *out_im)
-{
-    (void)eng; (void)quhits;
-    double v_re[MPS_CHI], v_im[MPS_CHI];
-    memset(v_re, 0, sizeof(v_re));
-    memset(v_im, 0, sizeof(v_im));
-    v_re[0] = 1.0;
-
-    for (int i = 0; i < n; i++) {
-        int k = (int)basis[i];
-        double next_re[MPS_CHI] = {0}, next_im[MPS_CHI] = {0};
-
-        for (int beta = 0; beta < MPS_CHI; beta++)
-            for (int alpha = 0; alpha < MPS_CHI; alpha++) {
-                double t_re, t_im;
-                mps_read_tensor(i, k, alpha, beta, &t_re, &t_im);
-                next_re[beta] += v_re[alpha]*t_re - v_im[alpha]*t_im;
-                next_im[beta] += v_re[alpha]*t_im + v_im[alpha]*t_re;
-            }
-        memcpy(v_re, next_re, sizeof(v_re));
-        memcpy(v_im, next_im, sizeof(v_im));
-    }
-
-    double sr = 0, si = 0;
-    for (int i = 0; i < MPS_CHI; i++) { sr += v_re[i]; si += v_im[i]; }
-    *out_re = sr;
-    *out_im = si;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════════
- * MEASUREMENT — O(N × χ³ × D)
- * ═══════════════════════════════════════════════════════════════════════════════ */
-
-uint32_t mps_overlay_measure(QuhitEngine *eng, uint32_t *quhits, int n, int target_idx)
-{
-    (void)quhits;
-    int chi = MPS_CHI;
-    size_t chi2 = (size_t)chi * chi;
-
-    /* Right density environment (heap) */
-    double *rho_R = (double *)calloc(chi2, sizeof(double));
-    rho_R[0] = 1.0;  /* rho_R[0][0] = 1.0 */
-
-    for (int j = n - 1; j > target_idx; j--) {
-        double *new_rho = (double *)calloc(chi2, sizeof(double));
-        for (int k = 0; k < MPS_PHYS; k++) {
-            double *A = (double *)calloc(chi2, sizeof(double));
-            for (int a = 0; a < chi; a++)
-                for (int b = 0; b < chi; b++) {
-                    double re, im;
-                    mps_read_tensor(j, k, a, b, &re, &im);
-                    A[a * chi + b] = re;
-                }
-            double *tmp = (double *)calloc(chi2, sizeof(double));
-            for (int a = 0; a < chi; a++)
-                for (int b = 0; b < chi; b++)
-                    for (int c = 0; c < chi; c++)
-                        tmp[a * chi + b] += A[a * chi + c] * rho_R[c * chi + b];
-            for (int a = 0; a < chi; a++)
-                for (int b = 0; b < chi; b++)
-                    for (int c = 0; c < chi; c++)
-                        new_rho[a * chi + b] += tmp[a * chi + c] * A[b * chi + c];
-            free(A); free(tmp);
-        }
-        memcpy(rho_R, new_rho, chi2 * sizeof(double));
-        free(new_rho);
-    }
-
-    /* Left environment */
-    double *L = (double *)calloc(chi, sizeof(double));
-    L[0] = 1.0;
-
-    for (int j = 0; j < target_idx; j++) {
-        double *new_L = (double *)calloc(chi, sizeof(double));
-        for (int k = 0; k < MPS_PHYS; k++) {
-            double *Ak = (double *)calloc(chi2, sizeof(double));
-            int nonzero = 0;
-            for (int a = 0; a < chi; a++)
-                for (int b = 0; b < chi; b++) {
-                    double re, im;
-                    mps_read_tensor(j, k, a, b, &re, &im);
-                    Ak[a * chi + b] = re;
-                    if (re != 0 || im != 0) nonzero = 1;
-                }
-            if (!nonzero) { free(Ak); continue; }
-            for (int b = 0; b < chi; b++)
-                for (int a = 0; a < chi; a++)
-                    new_L[b] += L[a] * Ak[a * chi + b];
-            free(Ak);
-        }
-        memcpy(L, new_L, chi * sizeof(double));
-        free(new_L);
-    }
-
-    /* P(k) */
-    double probs[MPS_PHYS];
-    double total_prob = 0;
-
-    for (int k = 0; k < MPS_PHYS; k++) {
-        double *Ak = (double *)calloc(chi2, sizeof(double));
-        for (int a = 0; a < chi; a++)
-            for (int b = 0; b < chi; b++) {
-                double re, im;
-                mps_read_tensor(target_idx, k, a, b, &re, &im);
-                Ak[a * chi + b] = re;
-            }
-        double *mid = (double *)calloc(chi, sizeof(double));
-        for (int b = 0; b < chi; b++)
-            for (int a = 0; a < chi; a++)
-                mid[b] += L[a] * Ak[a * chi + b];
-        double pk = 0;
-        for (int a = 0; a < chi; a++)
-            for (int b = 0; b < chi; b++)
-                pk += mid[a] * rho_R[a * chi + b] * mid[b];
-        probs[k] = pk > 0 ? pk : 0;
-        total_prob += probs[k];
-        free(Ak); free(mid);
-    }
-
-    free(L);
-    free(rho_R);
-
-    /* Born sample */
-    if (total_prob > 1e-30)
-        for (int k = 0; k < MPS_PHYS; k++) probs[k] /= total_prob;
-
-    double r = quhit_prng_double(eng);
-    uint32_t outcome = 0;
-    double cdf = 0;
-    for (int k = 0; k < MPS_PHYS; k++) {
-        cdf += probs[k];
-        if (r < cdf) { outcome = (uint32_t)k; break; }
-    }
-
-    /* Project + renormalize */
-    for (int k = 0; k < MPS_PHYS; k++) {
-        if ((uint32_t)k != outcome) {
-            for (int a = 0; a < chi; a++)
-                for (int b = 0; b < chi; b++)
-                    mps_write_tensor(target_idx, k, a, b, 0, 0);
-        }
-    }
-    double slice_norm2 = 0;
-    for (int a = 0; a < chi; a++)
-        for (int b = 0; b < chi; b++) {
-            double re, im;
-            mps_read_tensor(target_idx, (int)outcome, a, b, &re, &im);
-            slice_norm2 += re*re + im*im;
-        }
-    if (slice_norm2 > 1e-30) {
-        double scale = born_fast_isqrt(slice_norm2);
-        for (int a = 0; a < chi; a++)
-            for (int b = 0; b < chi; b++) {
-                double re, im;
-                mps_read_tensor(target_idx, (int)outcome, a, b, &re, &im);
-                mps_write_tensor(target_idx, (int)outcome, a, b, re*scale, im*scale);
-            }
-    }
-
-    return outcome;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════════
- * SINGLE-SITE GATE — O(entries × D) via register
- * ═══════════════════════════════════════════════════════════════════════════════ */
-
-static int mps_cmp_basis(const void *a, const void *b)
-{
-    const struct { basis_t basis; double re, im; } *ea = a, *eb = b;
-    if (ea->basis < eb->basis) return -1;
-    if (ea->basis > eb->basis) return 1;
-    return 0;
-}
-
-void mps_gate_1site(QuhitEngine *eng, uint32_t *quhits, int n,
-                    int site, const double *U_re, const double *U_im)
-{
-    /* Register-based: rotate the physical index k using triality-masked gate */
-    if (eng && mps_store && mps_store[site].reg_idx >= 0) {
-        int reg_idx = mps_store[site].reg_idx;
-        QuhitRegister *reg = &eng->registers[reg_idx];
-        uint8_t mask = mps_tri_sites ? mps_tri_sites[site].active_mask : 0x3F;
-        unsigned __int128 chi_power = (unsigned __int128)MPS_CHI * MPS_CHI;
-        tri_reg_gate_1site_masked(reg, U_re, U_im, mask, chi_power);
-    }
-
-    /* Mirror to triality site (replaces standard quhit mirror) */
-    if (mps_tri_sites && site < n)
-        tri_site_apply_gate(&mps_tri_sites[site], U_re, U_im);
-    else if (eng && quhits && site < n)
-        quhit_apply_unitary(eng, quhits[site], U_re, U_im);
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════════
- * 2-SITE GATE — Register-Based SVD Contraction
- *
- *  Optimizations V3.4:
- *   #7  Memory pool: static scratch buffers, no per-gate malloc/free
- *   #8  Diagonal fast-path: in-place O(D²χ²) for CZ/Potts gates
- *   #9  γ-bucketing: pre-sort register B by shared bond index
- *   #11 √σ pre-compute: one sqrt per singular value, not per entry
- *
- * Original V3.3 findings preserved:
- *   • Zero attractor → skip negligible Θ entries via mag² (no sqrt)
- *   • Gate sparsity → skip via mag² (no fabs)
- *   • 1.0 attractor → norm always converges to 1.0
- *   • 1/6 spectrum → σ values converge to equal weights at D=6
- * ═══════════════════════════════════════════════════════════════════════════════ */
-
 #include "tensor_svd.h"
+#include "svd_truncate.h"
 
-/* Temp entry struct matching QuhitRegister::entries[] layout */
-typedef struct { basis_t basis_state; double amp_re, amp_im; } TmpEntry;
+static SvdTmpBuf mps_svd_buf;
+#include <stdio.h>
+#include <stdint.h>
+#include <math.h>
 
-#define DCHI (MPS_PHYS * MPS_CHI)
+/* ═══════════════ LIFECYCLE ═══════════════ */
 
-/* ──  #7: Static scratch pool ──
- * Pre-allocated buffers reused across all gate calls.
- * Eliminates 14 malloc/free round-trips per gate. */
-static double *g2_Th_re, *g2_Th_im;
-static double *g2_Th2_re, *g2_Th2_im;
-static double *g2_U_re, *g2_U_im, *g2_sig;
-static double *g2_Vc_re, *g2_Vc_im;
-static int g2_pool_init = 0;
+MpsChain *mps_init(int L)
+{
+    MpsChain *c = (MpsChain *)calloc(1, sizeof(MpsChain));
+    c->L = L;
 
-static void g2_pool_ensure(void) {
-    if (g2_pool_init) return;
-    size_t dchi = DCHI;
-    size_t dchi2 = dchi * dchi;
-    size_t chi = MPS_CHI;
-    g2_Th_re  = (double *)malloc(dchi2 * sizeof(double));
-    g2_Th_im  = (double *)malloc(dchi2 * sizeof(double));
-    g2_Th2_re = (double *)malloc(dchi2 * sizeof(double));
-    g2_Th2_im = (double *)malloc(dchi2 * sizeof(double));
-    g2_U_re   = (double *)malloc(dchi * chi * sizeof(double));
-    g2_U_im   = (double *)malloc(dchi * chi * sizeof(double));
-    g2_sig    = (double *)malloc(chi * sizeof(double));
-    g2_Vc_re  = (double *)malloc(chi * dchi * sizeof(double));
-    g2_Vc_im  = (double *)malloc(chi * dchi * sizeof(double));
-    g2_pool_init = 1;
+    c->tensors = (MpsTensor *)calloc(L, sizeof(MpsTensor));
+
+    /* Bond weights: L-1 bonds between consecutive sites */
+    c->bonds = (MpsBondWeight *)calloc(L - 1, sizeof(MpsBondWeight));
+    for (int i = 0; i < L - 1; i++) {
+        c->bonds[i].w = (double *)calloc((size_t)MPS_CHI, sizeof(double));
+        for (int s = 0; s < (int)MPS_CHI; s++) c->bonds[i].w[s] = 1.0;
+    }
+
+    c->eng = (QuhitEngine *)calloc(1, sizeof(QuhitEngine));
+    quhit_engine_init(c->eng);
+
+    c->q_phys = (uint32_t *)calloc(L, sizeof(uint32_t));
+    for (int i = 0; i < L; i++)
+        c->q_phys[i] = quhit_init_basis(c->eng, 0);
+
+    c->site_reg = (int *)calloc(L, sizeof(int));
+    for (int i = 0; i < L; i++) {
+        c->site_reg[i] = quhit_reg_init(c->eng, (uint64_t)i, 3, MPS_CHI);
+        if (c->site_reg[i] >= 0) {
+            c->eng->registers[c->site_reg[i]].bulk_rule = 0;
+            quhit_reg_sv_set(c->eng, c->site_reg[i], 0, 1.0, 0.0);
+        }
+        c->tensors[i].reg_idx = c->site_reg[i];
+    }
+
+    /* Per-site Triality state */
+    c->tri_sites = (TriOverlaySite *)calloc(L, sizeof(TriOverlaySite));
+    for (int i = 0; i < L; i++)
+        tri_site_init(&c->tri_sites[i]);
+
+    return c;
 }
 
-/* ──  #8: Diagonal gate detection ── */
-static int gate_is_diagonal(const double *G_re, const double *G_im, int D2) {
-    for (int i = 0; i < D2; i++)
-        for (int j = 0; j < D2; j++)
-            if (i != j) {
-                if (G_re[i*D2+j] != 0.0 || G_im[i*D2+j] != 0.0)
-                    return 0;
-            }
-    return 1;
+void mps_free(MpsChain *c)
+{
+    if (!c) return;
+    free(c->tensors);
+    for (int i = 0; i < c->L - 1; i++) free(c->bonds[i].w);
+    free(c->bonds);
+    if (c->eng) {
+        quhit_engine_destroy(c->eng);
+        free(c->eng);
+    }
+    free(c->q_phys);
+    free(c->site_reg);
+    free(c->tri_sites);
+    free(c);
 }
 
-/* ──  #9: γ-bucket structure for sparse contraction ── */
-typedef struct {
-    uint16_t *indices;  /* entry indices per bucket */
-    uint16_t *counts;   /* count per gamma value */
-    uint16_t *offsets;  /* start offset per gamma value */
-} GammaBuckets;
+/* ═══════════════ STATE INITIALIZATION ═══════════════ */
 
-static GammaBuckets gb_cache = {0};
+void mps_set_product_state(MpsChain *c, int site,
+                           const double *amps_re, const double *amps_im)
+{
+    int reg = c->site_reg[site];
+    if (reg < 0) return;
 
-static void gb_ensure(int chi, int max_entries) {
-    if (!gb_cache.indices) {
-        gb_cache.indices = (uint16_t *)malloc(max_entries * sizeof(uint16_t));
-        gb_cache.counts  = (uint16_t *)malloc(chi * sizeof(uint16_t));
-        gb_cache.offsets = (uint16_t *)malloc(chi * sizeof(uint16_t));
+    c->eng->registers[reg].num_nonzero = 0;
+    for (int k = 0; k < MPS_D; k++) {
+        if (amps_re[k] * amps_re[k] + amps_im[k] * amps_im[k] > 1e-30)
+            quhit_reg_sv_set(c->eng, reg, (basis_t)k * MPS_C2,
+                             amps_re[k], amps_im[k]);
+    }
+
+    /* Sync triality sidecar */
+    if (c->tri_sites) {
+        triality_ensure_view(&c->tri_sites[site].tri, VIEW_EDGE);
+        for (int k = 0; k < MPS_D; k++) {
+            c->tri_sites[site].tri.edge_re[k] = amps_re[k];
+            c->tri_sites[site].tri.edge_im[k] = amps_im[k];
+        }
+        c->tri_sites[site].tri.dirty = DIRTY_VERTEX | DIRTY_DIAGONAL |
+                                        DIRTY_FOLDED | DIRTY_EXOTIC;
+        tri_site_sync(&c->tri_sites[site]);
     }
 }
 
-static void gb_build(GammaBuckets *gb, QuhitRegister *reg, int chi) {
-    memset(gb->counts, 0, chi * sizeof(uint16_t));
-    /* Bucket regB by LEFT bond (alpha = shared bond with regA's right bond β)
-     * Encoding: bs = k * chi² + alpha * chi + beta
-     * alpha = (bs / chi) % chi */
-    for (uint32_t e = 0; e < reg->num_nonzero; e++) {
-        double ar = reg->entries[e].amp_re, ai = reg->entries[e].amp_im;
-        if (ar*ar + ai*ai < 1e-30) continue;
-        int alpha = (int)((reg->entries[e].basis_state / chi) % chi);
-        if (alpha < chi) gb->counts[alpha]++;
-    }
-    /* Compute offsets */
-    uint16_t off = 0;
-    for (int g = 0; g < chi; g++) {
-        gb->offsets[g] = off;
-        off += gb->counts[g];
-    }
-    /* Fill index array */
-    uint16_t *pos = (uint16_t *)alloca(chi * sizeof(uint16_t));
-    memcpy(pos, gb->offsets, chi * sizeof(uint16_t));
-    for (uint32_t e = 0; e < reg->num_nonzero; e++) {
-        double ar = reg->entries[e].amp_re, ai = reg->entries[e].amp_im;
-        if (ar*ar + ai*ai < 1e-30) continue;
-        int alpha = (int)((reg->entries[e].basis_state / chi) % chi);
-        if (alpha < chi)
-            gb->indices[pos[alpha]++] = (uint16_t)e;
-    }
+/* ═══════════════ 1-SITE GATE ═══════════════ */
+
+void mps_gate_1site(MpsChain *c, int site,
+                    const double *U_re, const double *U_im)
+{
+    int reg_idx = c->site_reg[site];
+    if (reg_idx < 0 || !c->eng) return;
+
+    QuhitRegister *r = &c->eng->registers[reg_idx];
+    uint8_t mask = c->tri_sites ? c->tri_sites[site].active_mask : 0x3F;
+    unsigned __int128 chi_power = (unsigned __int128)MPS_C2;
+    tri_reg_gate_1site_masked(r, U_re, U_im, mask, chi_power);
+
+    /* Mirror to triality site */
+    if (c->tri_sites)
+        tri_site_apply_gate(&c->tri_sites[site], U_re, U_im);
 }
 
-void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
-                    int site, const double *G_re, const double *G_im)
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * 2-SITE GATE: BOND (site, site+1) WITH SVD
+ *
+ * 3-index tensor: T[k, α, β]
+ * Index positions: k=2 (most sig), α=1, β=0 (least sig)
+ * bp[3] = {1, χ, χ²}
+ *
+ * Shared bond: β_A (position 0) = α_B (position 1)
+ * A environment: α_A (position 1) — just the left bond
+ * B environment: β_B (position 0) — just the right bond
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+void mps_gate_bond(MpsChain *c, int site,
+                   const double *G_re, const double *G_im)
 {
     int sA = site, sB = site + 1;
-    int D = MPS_PHYS, chi = MPS_CHI;
-    int dchi = D * chi;
-    int chi2 = chi * chi;
-    size_t dchi2 = (size_t)dchi * dchi;
-    int D2 = D * D;
+    int D = MPS_D, chi = (int)MPS_CHI;
 
-    QuhitRegister *regA = &eng->registers[mps_store[sA].reg_idx];
-    QuhitRegister *regB = &eng->registers[mps_store[sB].reg_idx];
+    /* Bond index powers: position 0=β, 1=α, 2=k */
+    basis_t bp[3] = {1, MPS_CHI, MPS_C2};
 
-    /* ── Optimization 3: Product-state SVD bypass ──
-     * When both sites have nnz ≤ 1, the joint state is a single product
-     * |kA, α, γ⟩ ⊗ |kB, γ', β⟩. The 2-site gate simply maps the physical
-     * indices (kA,kB) → Σ G(kA',kB'; kA,kB) without needing SVD.
-     * Result: O(D²) instead of O(D²·χ²). */
-    if (regA->num_nonzero <= 1 && regB->num_nonzero <= 1) {
-        if (regA->num_nonzero == 0 || regB->num_nonzero == 0) return;
+    /* Shared bond: A's β (position 0), B's α (position 1)
+     * bond_A = 0 (position of shared in A's bond indices)
+     * bond_B = 1 (position of shared in B's bond indices) */
+    int bond_A = 0;  /* β position */
+    int bond_B = 1;  /* α position */
 
-        /* Extract the single nonzero entry from each register */
-        basis_t bsA = regA->entries[0].basis_state;
-        double arA = regA->entries[0].amp_re, aiA = regA->entries[0].amp_im;
-        int kA_old = (int)(bsA / chi2);
-        int alpha  = (int)((bsA / chi) % chi);
-        int gamma  = (int)(bsA % chi);
+    MpsBondWeight *shared_bw = &c->bonds[site];
 
-        basis_t bsB = regB->entries[0].basis_state;
-        double arB = regB->entries[0].amp_re, aiB = regB->entries[0].amp_im;
-        int kB_old = (int)(bsB / chi2);
-        int gamma2 = (int)((bsB / chi) % chi);
-        int beta   = (int)(bsB % chi);
+    QuhitRegister *regA = &c->eng->registers[c->site_reg[sA]];
+    QuhitRegister *regB = &c->eng->registers[c->site_reg[sB]];
 
-        /* Product amplitude */
-        double prod_re = arA * arB - aiA * aiB;
-        double prod_im = arA * aiB + aiA * arB;
+    /* ── 1. Find exact Sparse-Rank Environment ── */
+    int max_E = chi;
+    basis_t *uniq_envA = (basis_t *)malloc(max_E * sizeof(basis_t));
+    basis_t *uniq_envB = (basis_t *)malloc(max_E * sizeof(basis_t));
+    int num_EA = 0, num_EB = 0;
 
-        /* Apply gate: new state = Σ_{kA',kB'} G(kA',kB'; kA,kB) × prod × |kA',α,γ⟩⊗|kB',γ',β⟩ */
-        int gc = kA_old * D + kB_old;  /* gate input column */
-
-        /* Clear both registers */
-        regA->num_nonzero = 0;
-        regB->num_nonzero = 0;
-
-        /* Find the dominant output (for rank-1, there's typically one large output) */
-        for (int kAp = 0; kAp < D; kAp++) {
-            for (int kBp = 0; kBp < D; kBp++) {
-                int gr = kAp * D + kBp;
-                double gre = G_re[gr * D2 + gc];
-                double gim = G_im[gr * D2 + gc];
-                if (gre*gre + gim*gim < 1e-30) continue;
-
-                double out_re = gre * prod_re - gim * prod_im;
-                double out_im = gre * prod_im + gim * prod_re;
-                if (out_re*out_re + out_im*out_im < 1e-30) continue;
-
-                /* Write to register A: |kAp, α, γ⟩ */
-                basis_t newA = (uint64_t)kAp * chi2 + alpha * chi + gamma;
-                /* Write to register B: |kBp, γ', β⟩ */
-                basis_t newB = (uint64_t)kBp * chi2 + gamma2 * chi + beta;
-
-                /* For product-state output, factor as √|out|² on each site */
-                double mag = sqrt(out_re*out_re + out_im*out_im);
-                double phase_re = out_re / mag, phase_im = out_im / mag;
-
-                /* Put magnitude on A, phase on A, unit on B */
-                {
-                    int found = -1;
-                    for (uint32_t e = 0; e < regA->num_nonzero; e++) {
-                        if (regA->entries[e].basis_state == newA) { found = e; break; }
-                    }
-                    if (found >= 0) {
-                        regA->entries[found].amp_re += mag * phase_re;
-                        regA->entries[found].amp_im += mag * phase_im;
-                    } else if (regA->num_nonzero < 4096) {
-                        int e = regA->num_nonzero++;
-                        regA->entries[e].basis_state = newA;
-                        regA->entries[e].amp_re = mag * phase_re;
-                        regA->entries[e].amp_im = mag * phase_im;
-                    }
-                }
-                {
-                    int found = -1;
-                    for (uint32_t e = 0; e < regB->num_nonzero; e++) {
-                        if (regB->entries[e].basis_state == newB) { found = e; break; }
-                    }
-                    if (found >= 0) {
-                        /* already there */
-                    } else if (regB->num_nonzero < 4096) {
-                        int e = regB->num_nonzero++;
-                        regB->entries[e].basis_state = newB;
-                        regB->entries[e].amp_re = 1.0;
-                        regB->entries[e].amp_im = 0.0;
-                    }
-                }
-            }
-        }
-        return;  /* Skip entire Θ formation + SVD pipeline */
+    /* A env: strip shared bond (position 0) from bond part
+     * pure = basis % χ² (strip k), env = pure / bp[1] = α */
+    for (uint32_t eA = 0; eA < regA->num_nonzero; eA++) {
+        basis_t pure = regA->entries[eA].basis_state % MPS_C2;
+        basis_t env = (pure / bp[bond_A + 1]) * bp[bond_A] + (pure % bp[bond_A]);
+        int found = 0;
+        for (int i = 0; i < num_EA; i++)
+            if (uniq_envA[i] == env) { found = 1; break; }
+        if (!found && num_EA < max_E) uniq_envA[num_EA++] = env;
     }
 
-    /* ── General path: full Θ contraction + SVD ── */
+    /* B env: strip shared bond (position 1) from bond part
+     * pure = basis % χ², env = pure / bp[2] * bp[1] + pure % bp[1] = β */
+    for (uint32_t eB = 0; eB < regB->num_nonzero; eB++) {
+        basis_t pure = regB->entries[eB].basis_state % MPS_C2;
+        basis_t env = (pure / bp[bond_B + 1]) * bp[bond_B] + (pure % bp[bond_B]);
+        int found = 0;
+        for (int i = 0; i < num_EB; i++)
+            if (uniq_envB[i] == env) { found = 1; break; }
+        if (!found && num_EB < max_E) uniq_envB[num_EB++] = env;
+    }
 
-    /*  #7: Ensure scratch pool */
-    g2_pool_ensure();
-    memset(g2_Th_re, 0, dchi2 * sizeof(double));
-    memset(g2_Th_im, 0, dchi2 * sizeof(double));
+    if (num_EA == 0 || num_EB == 0) {
+        free(uniq_envA); free(uniq_envB);
+        return;
+    }
 
-    /* ── Step 1+2: Build Θ —  #9: γ-bucketed contraction ──
-     * Pre-sort register B entries by shared bond γ.
-     * Then for each regA entry, only iterate matching γ bucket. */
-    gb_ensure(chi, 8192);
-    gb_build(&gb_cache, regB, chi);
+    /* ── 2. Build Θ ── */
+    int svddim_A = D * num_EA;
+    int svddim_B = D * num_EB;
+    size_t svd2 = (size_t)svddim_A * svddim_B;
+    double *Th_re = (double *)calloc(svd2, sizeof(double));
+    double *Th_im = (double *)calloc(svd2, sizeof(double));
 
     for (uint32_t eA = 0; eA < regA->num_nonzero; eA++) {
         basis_t bsA = regA->entries[eA].basis_state;
         double arA = regA->entries[eA].amp_re;
         double aiA = regA->entries[eA].amp_im;
-        if (arA*arA + aiA*aiA < 1e-30) continue;
+        if (arA*arA + aiA*aiA < 1e-10) continue;
 
-        int kA = (int)(bsA / chi2);
-        int alpha = (int)((bsA / chi) % chi);
-        int gamma_A = (int)(bsA % chi);
-        int row = kA * chi + alpha;
+        int kA = (int)(bsA / MPS_C2);
+        basis_t pureA = bsA % MPS_C2;
+        int shared_valA = (int)((pureA / bp[bond_A]) % chi);  /* β_A */
+        basis_t envA = (pureA / bp[bond_A + 1]) * bp[bond_A] + (pureA % bp[bond_A]);
 
-        /* Only iterate register B entries with matching gamma */
-        uint16_t start = gb_cache.offsets[gamma_A];
-        uint16_t count = gb_cache.counts[gamma_A];
-        for (uint16_t bi = 0; bi < count; bi++) {
-            uint16_t eB = gb_cache.indices[start + bi];
+        int idx_EA = -1;
+        for (int i = 0; i < num_EA; i++)
+            if (uniq_envA[i] == envA) { idx_EA = i; break; }
+        if (idx_EA < 0) continue;
+        int row = kA * num_EA + idx_EA;
+
+        for (uint32_t eB = 0; eB < regB->num_nonzero; eB++) {
             basis_t bsB = regB->entries[eB].basis_state;
             double arB = regB->entries[eB].amp_re;
             double aiB = regB->entries[eB].amp_im;
+            if (arB*arB + aiB*aiB < 1e-10) continue;
 
-            int kB   = (int)(bsB / chi2);
-            int beta = (int)(bsB % chi);
-            int col  = kB * chi + beta;
+            basis_t pureB = bsB % MPS_C2;
+            int shared_valB = (int)((pureB / bp[bond_B]) % chi);  /* α_B */
+            if (shared_valA != shared_valB) continue;
 
-            g2_Th_re[row * dchi + col] += arA*arB - aiA*aiB;
-            g2_Th_im[row * dchi + col] += arA*aiB + aiA*arB;
+            int kB = (int)(bsB / MPS_C2);
+            basis_t envB = (pureB / bp[bond_B + 1]) * bp[bond_B] + (pureB % bp[bond_B]);
+
+            int idx_EB = -1;
+            for (int i = 0; i < num_EB; i++)
+                if (uniq_envB[i] == envB) { idx_EB = i; break; }
+            if (idx_EB < 0) continue;
+            int col = kB * num_EB + idx_EB;
+
+            double sw = shared_bw->w[shared_valA];
+            double br = arB * sw, bi = aiB * sw;
+
+            Th_re[row * svddim_B + col] += arA*br - aiA*bi;
+            Th_im[row * svddim_B + col] += arA*bi + aiA*br;
         }
     }
 
-    /* ── Step 3: Apply gate —  #8: diagonal fast-path ── */
-    int is_diag = gate_is_diagonal(G_re, G_im, D2);
+    /* ── 3. Apply Gate ── */
+    double *Th2_re = (double *)calloc(svd2, sizeof(double));
+    double *Th2_im = (double *)calloc(svd2, sizeof(double));
+    int D2 = D * D;
 
-    double *Th_out_re, *Th_out_im;
+    for (int kAp = 0; kAp < D; kAp++)
+     for (int kBp = 0; kBp < D; kBp++) {
+         int gr = kAp * D + kBp;
+         for (int kA = 0; kA < D; kA++)
+          for (int kB = 0; kB < D; kB++) {
+              int gc = kA * D + kB;
+              double gre = G_re[gr * D2 + gc];
+              double gim = G_im[gr * D2 + gc];
+              if (gre*gre + gim*gim < 1e-20) continue;
 
-    if (is_diag) {
-        /* Diagonal gate: in-place, O(D²×χ²) — no Th2 buffer needed */
-        for (int kA = 0; kA < D; kA++)
-            for (int kB = 0; kB < D; kB++) {
-                int idx = kA * D + kB;
-                double gre = G_re[idx * D2 + idx];
-                double gim = G_im[idx * D2 + idx];
-                if (gre == 1.0 && gim == 0.0) continue; /* identity element */
-                for (int a = 0; a < chi; a++) {
-                    int r = kA * chi + a;
-                    for (int b = 0; b < chi; b++) {
-                        int c = kB * chi + b;
-                        size_t pos = (size_t)r * dchi + c;
-                        double tr = g2_Th_re[pos];
-                        double ti = g2_Th_im[pos];
-                        g2_Th_re[pos] = gre*tr - gim*ti;
-                        g2_Th_im[pos] = gre*ti + gim*tr;
-                    }
-                }
-            }
-        Th_out_re = g2_Th_re;
-        Th_out_im = g2_Th_im;
-    } else {
-        /* General gate: O(D⁴×χ²) with sparsity skip */
-        memset(g2_Th2_re, 0, dchi2 * sizeof(double));
-        memset(g2_Th2_im, 0, dchi2 * sizeof(double));
-
-        for (int kAp = 0; kAp < D; kAp++)
-         for (int kBp = 0; kBp < D; kBp++) {
-             int gr = kAp * D + kBp;
-             for (int kA = 0; kA < D; kA++)
-              for (int kB = 0; kB < D; kB++) {
-                  int gc = kA * D + kB;
-                  double gre = G_re[gr * D2 + gc];
-                  double gim = G_im[gr * D2 + gc];
-                  if (gre*gre + gim*gim < 1e-20) continue;
-
-                  for (int a = 0; a < chi; a++) {
-                      int dst_row = kAp * chi + a;
-                      int src_row = kA * chi + a;
-                      for (int b = 0; b < chi; b++) {
-                          int dst_col = kBp * chi + b;
-                          int src_col = kB * chi + b;
-                          double tr = g2_Th_re[src_row * dchi + src_col];
-                          double ti = g2_Th_im[src_row * dchi + src_col];
-                          g2_Th2_re[dst_row * dchi + dst_col] += gre*tr - gim*ti;
-                          g2_Th2_im[dst_row * dchi + dst_col] += gre*ti + gim*tr;
-                      }
+              for (int eA = 0; eA < num_EA; eA++) {
+                  int dst_row = kAp * num_EA + eA;
+                  int src_row = kA * num_EA + eA;
+                  for (int eB = 0; eB < num_EB; eB++) {
+                      int dst_col = kBp * num_EB + eB;
+                      int src_col = kB * num_EB + eB;
+                      double tr = Th_re[src_row * svddim_B + src_col];
+                      double ti = Th_im[src_row * svddim_B + src_col];
+                      Th2_re[dst_row * svddim_B + dst_col] += gre*tr - gim*ti;
+                      Th2_im[dst_row * svddim_B + dst_col] += gre*ti + gim*tr;
                   }
               }
-         }
-        Th_out_re = g2_Th2_re;
-        Th_out_im = g2_Th2_im;
-    }
+          }
+     }
+    free(Th_re); free(Th_im);
 
-    /* ── Step 4: Renormalize Θ → SVD → truncate to χ ── */
+    /* ── 4. SVD ── */
+    double *U_re  = (double *)calloc((size_t)svddim_A * chi, sizeof(double));
+    double *U_im  = (double *)calloc((size_t)svddim_A * chi, sizeof(double));
+    double *sig   = (double *)calloc(chi, sizeof(double));
+    double *Vc_re = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
+    double *Vc_im = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
 
-    /* Pre-normalize Θ to unit Frobenius norm to prevent σ explosion */
-    double th_norm2 = 0;
-    for (size_t i = 0; i < (size_t)dchi * dchi; i++)
-        th_norm2 += Th_out_re[i] * Th_out_re[i] + Th_out_im[i] * Th_out_im[i];
-    double th_norm = (th_norm2 > 1e-60) ? sqrt(th_norm2) : 1.0;
-    if (th_norm > 1e-30 && th_norm != 1.0) {
-        double inv_norm = 1.0 / th_norm;
-        for (size_t i = 0; i < (size_t)dchi * dchi; i++) {
-            Th_out_re[i] *= inv_norm;
-            Th_out_im[i] *= inv_norm;
-        }
-    }
+    tsvd_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B, chi,
+                   U_re, U_im, sig, Vc_re, Vc_im);
+    free(Th2_re); free(Th2_im);
 
-    memset(g2_U_re, 0, (size_t)dchi * chi * sizeof(double));
-    memset(g2_U_im, 0, (size_t)dchi * chi * sizeof(double));
-    memset(g2_sig, 0, chi * sizeof(double));
-    memset(g2_Vc_re, 0, (size_t)chi * dchi * sizeof(double));
-    memset(g2_Vc_im, 0, (size_t)chi * dchi * sizeof(double));
+    int rank = chi < svddim_B ? chi : svddim_B;
+    if (rank > svddim_A) rank = svddim_A;
 
-    tsvd_truncated_sparse(Th_out_re, Th_out_im, dchi, dchi, chi,
-                   g2_U_re, g2_U_im, g2_sig, g2_Vc_re, g2_Vc_im);
+    /* Cap rank for 4096-entry register limit */
+    int max_env = num_EA > num_EB ? num_EA : num_EB;
+    int rank_cap = max_env > 0 ? 4096 / (D * max_env) : rank;
+    if (rank_cap < 1) rank_cap = 1;
+    if (rank > rank_cap) rank = rank_cap;
 
-    /* Rescale σ by original Θ norm */
-    for (int g = 0; g < chi; g++)
-        g2_sig[g] *= th_norm;
+    double sig_norm = 0;
+    for (int s = 0; s < rank; s++) sig_norm += sig[s];
 
-    /* ── Step 5: Write back —  #11: √σ pre-computed ── */
-    int rank = chi < dchi ? chi : dchi;
+    /* Bond weights locked to 1.0 (same attractor as peps3d) */
+    for (int s = 0; s < (int)MPS_CHI; s++) shared_bw->w[s] = 1.0;
 
-    /* Pre-compute √σ once — not per entry ( #11) */
-    double sqrt_sig[MPS_CHI];
-    for (int g = 0; g < rank; g++)
-        sqrt_sig[g] = g2_sig[g] > 1e-30
-                      ? g2_sig[g] * born_fast_isqrt(g2_sig[g]) : 0;
-
-    /* ── Write-back with magnitude-sorted truncation ──
-     * Collect ALL entries into a temp buffer, then keep the top 4096
-     * by |amplitude|². This prevents random drops that cascade to zero. */
-
-    /* Static temp buffer (allocated once alongside pool) */
-    static TmpEntry *g2_tmp_buf = NULL;
-    static int g2_tmp_init = 0;
-    if (!g2_tmp_init) {
-        g2_tmp_buf = (TmpEntry *)malloc(16384 * sizeof(TmpEntry));
-        g2_tmp_init = 1;
-    }
-
-    /* A'[kA', α, γ] = √σ[γ] × U[(kA'*χ+α), γ] */
-    uint32_t nA = 0;
+    /* ── 5. Write back ── */
+    svd_buf_reset(&mps_svd_buf);
     for (int kA = 0; kA < D; kA++)
-     for (int a = 0; a < chi; a++) {
-         int row = kA * chi + a;
-         for (int g = 0; g < rank; g++) {
-             double sq = sqrt_sig[g];
-             if (sq < 1e-30) continue;
-             double re = sq * g2_U_re[row * rank + g];
-             double im = sq * g2_U_im[row * rank + g];
-             if (re*re + im*im > 1e-30 && nA < 16384) {
-                 g2_tmp_buf[nA].basis_state = (basis_t)kA * chi2 + (basis_t)a * chi + g;
-                 g2_tmp_buf[nA].amp_re = re;
-                 g2_tmp_buf[nA].amp_im = im;
-                 nA++;
-             }
+     for (int eA = 0; eA < num_EA; eA++) {
+         int row_idx = kA * num_EA + eA;
+         basis_t envA = uniq_envA[eA];
+         basis_t pure = (envA / bp[bond_A]) * bp[bond_A + 1] + (envA % bp[bond_A]);
+         for (int gv = 0; gv < rank; gv++) {
+             double weight = (sig_norm > 1e-30 && sig[gv] > 1e-30)
+                           ? born_fast_isqrt(sig[gv] * sig_norm) * sig[gv] : 0.0;
+             double re = U_re[row_idx * rank + gv] * weight;
+             double im = U_im[row_idx * rank + gv] * weight;
+             if (re*re + im*im < 1e-50) continue;
+             svd_buf_push(&mps_svd_buf,
+                          kA * MPS_C2 + pure + gv * bp[bond_A], re, im);
          }
      }
-    /* Partial selection sort to keep top-4096 by magnitude */
-    if (nA > 4096) {
-        for (uint32_t i = 0; i < 4096; i++) {
-            uint32_t best = i;
-            double best_m = g2_tmp_buf[i].amp_re * g2_tmp_buf[i].amp_re +
-                            g2_tmp_buf[i].amp_im * g2_tmp_buf[i].amp_im;
-            for (uint32_t j = i + 1; j < nA; j++) {
-                double m = g2_tmp_buf[j].amp_re * g2_tmp_buf[j].amp_re +
-                           g2_tmp_buf[j].amp_im * g2_tmp_buf[j].amp_im;
-                if (m > best_m) { best = j; best_m = m; }
-            }
-            if (best != i) {
-                TmpEntry tmp = g2_tmp_buf[i];
-                g2_tmp_buf[i] = g2_tmp_buf[best];
-                g2_tmp_buf[best] = tmp;
-            }
-        }
-        nA = 4096;
-    }
-    regA->num_nonzero = nA;
-    memcpy(regA->entries, g2_tmp_buf, nA * sizeof(TmpEntry));
+    svd_buf_flush(&mps_svd_buf, regA);
 
-    /* B'[kB', γ, β] = √σ[γ] × V†[γ, (kB'*χ+β)] */
-    uint32_t nB = 0;
+    svd_buf_reset(&mps_svd_buf);
     for (int kB = 0; kB < D; kB++)
-     for (int g = 0; g < rank; g++) {
-          double sq = sqrt_sig[g];
-          if (sq < 1e-30) continue;
-         for (int b = 0; b < chi; b++) {
-             int col = kB * chi + b;
-             double re = sq * g2_Vc_re[g * dchi + col];
-             double im = sq * g2_Vc_im[g * dchi + col];
-             if (re*re + im*im > 1e-30 && nB < 16384) {
-                 g2_tmp_buf[nB].basis_state = (basis_t)kB * chi2 + (basis_t)g * chi + b;
-                 g2_tmp_buf[nB].amp_re = re;
-                 g2_tmp_buf[nB].amp_im = im;
-                 nB++;
-             }
+     for (int eB = 0; eB < num_EB; eB++) {
+         int col_idx = kB * num_EB + eB;
+         basis_t envB = uniq_envB[eB];
+         basis_t pure = (envB / bp[bond_B]) * bp[bond_B + 1] + (envB % bp[bond_B]);
+         for (int gv = 0; gv < rank; gv++) {
+             double weight = (sig_norm > 1e-30 && sig[gv] > 1e-30)
+                           ? born_fast_isqrt(sig[gv] * sig_norm) * sig[gv] : 0.0;
+             double re = weight * Vc_re[gv * svddim_B + col_idx];
+             double im = weight * Vc_im[gv * svddim_B + col_idx];
+             if (re*re + im*im < 1e-50) continue;
+             svd_buf_push(&mps_svd_buf,
+                          kB * MPS_C2 + pure + gv * bp[bond_B], re, im);
          }
      }
-    if (nB > 4096) {
-        for (uint32_t i = 0; i < 4096; i++) {
-            uint32_t best = i;
-            double best_m = g2_tmp_buf[i].amp_re * g2_tmp_buf[i].amp_re +
-                            g2_tmp_buf[i].amp_im * g2_tmp_buf[i].amp_im;
-            for (uint32_t j = i + 1; j < nB; j++) {
-                double m = g2_tmp_buf[j].amp_re * g2_tmp_buf[j].amp_re +
-                           g2_tmp_buf[j].amp_im * g2_tmp_buf[j].amp_im;
-                if (m > best_m) { best = j; best_m = m; }
-            }
-            if (best != i) {
-                TmpEntry tmp = g2_tmp_buf[i];
-                g2_tmp_buf[i] = g2_tmp_buf[best];
-                g2_tmp_buf[best] = tmp;
-            }
-        }
-        nB = 4096;
-    }
-    regB->num_nonzero = nB;
-    memcpy(regB->entries, g2_tmp_buf, nB * sizeof(TmpEntry));
+    svd_buf_flush(&mps_svd_buf, regB);
 
+    free(U_re); free(U_im);
+    free(sig);
+    free(Vc_re); free(Vc_im);
+    free(uniq_envA); free(uniq_envB);
 
-    /* ── Mirror to triality sites (replaces engine quhit CZ mirror) ── */
-    if (mps_tri_sites && sB < n)
-        tri_site_apply_cz(&mps_tri_sites[sA], &mps_tri_sites[sB]);
-    else if (eng && quhits && sB < n)
-        quhit_apply_cz(eng, quhits[sA], quhits[sB]);
+    /* ── 6. Mirror to triality ── */
+    if (c->tri_sites)
+        tri_site_apply_cz(&c->tri_sites[sA], &c->tri_sites[sB]);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════════
- * GATE CONSTRUCTORS
- * ═══════════════════════════════════════════════════════════════════════════════ */
+/* ═══════════════ LOCAL DENSITY ═══════════════ */
 
-/* Sidechannel probe: OMEGA6 table eliminates runtime cos/sin.
- * 26.5 ns vs 235.5 ns = 8.9× speedup per gate construction.
- * ω^k = (OMEGA6_RE[k%6], OMEGA6_IM[k%6]) for k = jk mod 6. */
-static const double OMEGA6_RE[6] = {
-    1.0, 0.5, -0.5, -1.0, -0.5, 0.5
-};
-static const double OMEGA6_IM[6] = {
-    0.0, 0.86602540378443864676, 0.86602540378443864676,
-    0.0, -0.86602540378443864676, -0.86602540378443864676
-};
+void mps_local_density(MpsChain *c, int site, double *probs)
+{
+    int reg = c->site_reg[site];
+
+    for (int k = 0; k < MPS_D; k++) probs[k] = 0;
+
+    if (reg < 0 || !c->eng) { probs[0] = 1.0; return; }
+
+    QuhitRegister *r = &c->eng->registers[reg];
+    double total = 0;
+
+    for (uint32_t e = 0; e < r->num_nonzero; e++) {
+        basis_t bs = r->entries[e].basis_state;
+        int k = (int)(bs / MPS_C2);
+        if (k >= MPS_D) continue;
+        double re = r->entries[e].amp_re;
+        double im = r->entries[e].amp_im;
+        double p = re * re + im * im;
+        probs[k] += p;
+        total += p;
+    }
+
+    if (total > 1e-30)
+        for (int k = 0; k < MPS_D; k++) probs[k] /= total;
+    else
+        probs[0] = 1.0;
+}
+
+/* ═══════════════ BATCH GATE APPLICATION ═══════════════ */
+
+void mps_gate_bond_all(MpsChain *c, const double *G_re, const double *G_im)
+{
+    if (c->L < 2) return;
+
+    for (int parity = 0; parity < 2; parity++) {
+        for (int i = parity; i < c->L - 1; i += 2)
+            mps_gate_bond(c, i, G_re, G_im);
+    }
+}
+
+void mps_gate_1site_all(MpsChain *c, const double *U_re, const double *U_im)
+{
+    for (int i = 0; i < c->L; i++)
+        mps_gate_1site(c, i, U_re, U_im);
+}
+
+void mps_normalize_site(MpsChain *c, int site)
+{
+    int reg = c->site_reg[site];
+    if (reg < 0) return;
+    QuhitRegister *r = &c->eng->registers[reg];
+
+    double n2 = 0;
+    for (uint32_t e = 0; e < r->num_nonzero; e++) {
+        n2 += r->entries[e].amp_re * r->entries[e].amp_re +
+              r->entries[e].amp_im * r->entries[e].amp_im;
+    }
+    if (n2 > 1e-20) {
+        double inv = born_fast_isqrt(n2);
+        for (uint32_t e = 0; e < r->num_nonzero; e++) {
+            r->entries[e].amp_re *= inv;
+            r->entries[e].amp_im *= inv;
+        }
+    }
+}
+
+void mps_trotter_step(MpsChain *c, const double *G_re, const double *G_im)
+{
+    mps_gate_bond_all(c, G_re, G_im);
+}
+
+/* ═══════════════ GATE CONSTRUCTORS ═══════════════ */
 
 void mps_build_dft6(double *U_re, double *U_im)
 {
-    double inv = born_fast_isqrt(6.0);
-    for (int j = 0; j < 6; j++)
-        for (int k = 0; k < 6; k++) {
-            int idx = (j * k) % 6;
-            U_re[j * 6 + k] = inv * OMEGA6_RE[idx];
-            U_im[j * 6 + k] = inv * OMEGA6_IM[idx];
+    int D = MPS_D;
+    double inv = 1.0 / sqrt((double)D);
+    for (int j = 0; j < D; j++)
+        for (int k = 0; k < D; k++) {
+            double angle = 2.0 * M_PI * j * k / (double)D;
+            U_re[j * D + k] = inv * cos(angle);
+            U_im[j * D + k] = inv * sin(angle);
         }
 }
 
 void mps_build_cz(double *G_re, double *G_im)
 {
-    int D2 = MPS_PHYS * MPS_PHYS;
-    memset(G_re, 0, D2 * D2 * sizeof(double));
-    memset(G_im, 0, D2 * D2 * sizeof(double));
-    for (int k = 0; k < MPS_PHYS; k++)
-        for (int l = 0; l < MPS_PHYS; l++) {
-            int idx_g = (k * MPS_PHYS + l) * D2 + (k * MPS_PHYS + l);
-            int idx_w = (k * l) % 6;
-            G_re[idx_g] = OMEGA6_RE[idx_w];
-            G_im[idx_g] = OMEGA6_IM[idx_w];
-        }
-}
-
-void mps_build_controlled_phase(double *G_re, double *G_im, int power)
-{
-    int D2 = MPS_PHYS * MPS_PHYS;
-    memset(G_re, 0, D2 * D2 * sizeof(double));
-    memset(G_im, 0, D2 * D2 * sizeof(double));
-    double pf = (double)(1 << power) / (double)(MPS_PHYS * MPS_PHYS);
-    for (int k = 0; k < MPS_PHYS; k++)
-        for (int l = 0; l < MPS_PHYS; l++) {
-            int idx = (k * MPS_PHYS + l) * D2 + (k * MPS_PHYS + l);
-            double angle = 2.0 * M_PI * k * l * pf;
+    int D = MPS_D, D2 = D * D, D4 = D2 * D2;
+    memset(G_re, 0, D4 * sizeof(double));
+    memset(G_im, 0, D4 * sizeof(double));
+    for (int j = 0; j < D; j++)
+        for (int k = 0; k < D; k++) {
+            int idx = (j * D + k) * D2 + (j * D + k);
+            double angle = 2.0 * M_PI * j * k / (double)D;
             G_re[idx] = cos(angle);
             G_im[idx] = sin(angle);
         }
-}
-
-void mps_build_hadamard2(double *U_re, double *U_im)
-{
-    memset(U_re, 0, 36 * sizeof(double));
-    memset(U_im, 0, 36 * sizeof(double));
-    double s = born_fast_isqrt(2.0);
-    U_re[0*6+0] =  s; U_re[0*6+1] =  s;
-    U_re[1*6+0] =  s; U_re[1*6+1] = -s;
-    for (int k = 2; k < 6; k++) U_re[k*6+k] = 1.0;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════════
- * NORM ⟨ψ|ψ⟩
- * ═══════════════════════════════════════════════════════════════════════════════ */
-
-double mps_overlay_norm(QuhitEngine *eng, uint32_t *quhits, int n)
-{
-    (void)eng; (void)quhits;
-    int chi = MPS_CHI;
-    size_t chi2 = (size_t)chi * chi;
-
-    double *rho_re = (double *)calloc(chi2, sizeof(double));
-    double *rho_im = (double *)calloc(chi2, sizeof(double));
-    rho_re[0] = 1.0;  /* [0][0] */
-
-    for (int i = 0; i < n; i++) {
-        double *nr     = (double *)calloc(chi2, sizeof(double));
-        double *ni_arr = (double *)calloc(chi2, sizeof(double));
-
-        for (int k = 0; k < MPS_PHYS; k++) {
-            double *A_re = (double *)calloc(chi2, sizeof(double));
-            double *A_im = (double *)calloc(chi2, sizeof(double));
-            for (int a = 0; a < chi; a++)
-                for (int b = 0; b < chi; b++)
-                    mps_read_tensor(i, k, a, b,
-                                    &A_re[a * chi + b], &A_im[a * chi + b]);
-
-            double *tr2 = (double *)calloc(chi2, sizeof(double));
-            double *ti2 = (double *)calloc(chi2, sizeof(double));
-            for (int a = 0; a < chi; a++)
-                for (int bp = 0; bp < chi; bp++)
-                    for (int ap = 0; ap < chi; ap++) {
-                        tr2[a*chi+bp] += rho_re[a*chi+ap]*A_re[ap*chi+bp]
-                                       - rho_im[a*chi+ap]*A_im[ap*chi+bp];
-                        ti2[a*chi+bp] += rho_re[a*chi+ap]*A_im[ap*chi+bp]
-                                       + rho_im[a*chi+ap]*A_re[ap*chi+bp];
-                    }
-
-            for (int b = 0; b < chi; b++)
-                for (int bp = 0; bp < chi; bp++)
-                    for (int a = 0; a < chi; a++) {
-                        double ar = A_re[a*chi+b], ai = -A_im[a*chi+b];
-                        nr[b*chi+bp]     += ar*tr2[a*chi+bp] - ai*ti2[a*chi+bp];
-                        ni_arr[b*chi+bp] += ar*ti2[a*chi+bp] + ai*tr2[a*chi+bp];
-                    }
-            free(A_re); free(A_im); free(tr2); free(ti2);
-        }
-        memcpy(rho_re, nr, chi2 * sizeof(double));
-        memcpy(rho_im, ni_arr, chi2 * sizeof(double));
-        free(nr); free(ni_arr);
-    }
-
-    double trace = 0;
-    for (int i = 0; i < chi; i++) trace += rho_re[i * chi + i];
-    free(rho_re); free(rho_im);
-    return trace;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════════
- * DEFERRED RENORMALIZATION
- * ═══════════════════════════════════════════════════════════════════════════════ */
-
-void mps_renormalize_chain(QuhitEngine *eng, uint32_t *quhits, int n)
-{
-    double norm = mps_overlay_norm(eng, quhits, n);
-    if (norm > 1e-30 && fabs(norm - 1.0) > 1e-12) {
-        double scale = born_fast_isqrt(norm);
-        for (int k = 0; k < MPS_PHYS; k++)
-            for (int a = 0; a < MPS_CHI; a++)
-                for (int b = 0; b < MPS_CHI; b++) {
-                    double tr, ti;
-                    mps_read_tensor(0, k, a, b, &tr, &ti);
-                    mps_write_tensor(0, k, a, b, tr * scale, ti * scale);
-                }
-    }
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════════
- * LAZY EVALUATION LAYER
- * ═══════════════════════════════════════════════════════════════════════════════ */
-
-/* Forward declaration (defined below in gate fusion section) */
-static void fuse_1site_gates(const double *A_re, const double *A_im,
-                             const double *B_re, const double *B_im,
-                             double *C_re, double *C_im);
-
-MpsLazyChain *mps_lazy_init(QuhitEngine *eng, uint32_t *quhits, int n)
-{
-    MpsLazyChain *lc = (MpsLazyChain *)calloc(1, sizeof(MpsLazyChain));
-    lc->eng = eng;
-    lc->quhits = quhits;
-    lc->n_sites = n;
-
-    mps_overlay_init(eng, quhits, n);
-    lc->tri_sites = mps_tri_sites;  /* Link to per-site triality state */
-
-    lc->queue_cap = MAX_LAZY_GATES;
-    lc->queue = (MpsDeferredGate *)calloc(lc->queue_cap, sizeof(MpsDeferredGate));
-    lc->queue_len = 0;
-
-    lc->site_allocated = (uint8_t *)calloc(n, sizeof(uint8_t));
-    lc->site_dirty     = (uint8_t *)calloc(n, sizeof(uint8_t));
-
-    /*  #10: Per-site pending 1-site gate buffer */
-    int D2 = MPS_PHYS * MPS_PHYS;
-    lc->pending_1site_re    = (double *)calloc((size_t)n * D2, sizeof(double));
-    lc->pending_1site_im    = (double *)calloc((size_t)n * D2, sizeof(double));
-    lc->pending_1site_valid = (uint8_t *)calloc(n, sizeof(uint8_t));
-
-    lazy_stats_reset(&lc->stats);
-    lc->stats.sites_total = n;
-    lc->stats.hilbert_log10 = n * log10(6.0);
-
-    return lc;
-}
-
-void mps_lazy_free(MpsLazyChain *lc)
-{
-    if (!lc) return;
-    for (int i = 0; i < lc->queue_len; i++) {
-        if (lc->queue[i].type == 1) {
-            free(lc->queue[i].G_re);
-            free(lc->queue[i].G_im);
-        }
-    }
-    free(lc->queue);
-    free(lc->site_allocated);
-    free(lc->site_dirty);
-    free(lc->pending_1site_re);
-    free(lc->pending_1site_im);
-    free(lc->pending_1site_valid);
-    mps_overlay_free();
-    free(lc);
-}
-
-static void lazy_ensure_site(MpsLazyChain *lc, int site)
-{
-    if (!lc->site_allocated[site]) {
-        mps_zero_site(site);
-        mps_write_tensor(site, 0, 0, 0, 1.0, 0.0);
-        lc->site_allocated[site] = 1;
-    }
-}
-
-/*  #10: Drain a pending 1-site gate into the queue */
-static void drain_pending_1site(MpsLazyChain *lc, int site)
-{
-    if (!lc->pending_1site_valid[site]) return;
-
-    if (lc->queue_len >= lc->queue_cap) mps_lazy_flush(lc);
-
-    int D2 = MPS_PHYS * MPS_PHYS;
-    MpsDeferredGate *g = &lc->queue[lc->queue_len];
-    g->type = 0;
-    g->site = site;
-    memcpy(g->U_re, &lc->pending_1site_re[(size_t)site * D2], D2 * sizeof(double));
-    memcpy(g->U_im, &lc->pending_1site_im[(size_t)site * D2], D2 * sizeof(double));
-    g->G_re = NULL;
-    g->G_im = NULL;
-    g->applied = 0;
-
-    lc->queue_len++;
-    lc->stats.gates_queued++;
-    lc->pending_1site_valid[site] = 0;
-}
-
-void mps_lazy_gate_1site(MpsLazyChain *lc, int site,
-                         const double *U_re, const double *U_im)
-{
-    int D = MPS_PHYS;
-    int D2 = D * D;
-    size_t off = (size_t)site * D2;
-
-    if (lc->pending_1site_valid[site]) {
-        /*  #10: Eager fusion — compose B × A in-place */
-        double C_re[MPS_PHYS * MPS_PHYS], C_im[MPS_PHYS * MPS_PHYS];
-        fuse_1site_gates(&lc->pending_1site_re[off], &lc->pending_1site_im[off],
-                         U_re, U_im, C_re, C_im);
-        memcpy(&lc->pending_1site_re[off], C_re, D2 * sizeof(double));
-        memcpy(&lc->pending_1site_im[off], C_im, D2 * sizeof(double));
-        lc->stats.gates_fused++;
-    } else {
-        /* First gate for this site — store as pending */
-        memcpy(&lc->pending_1site_re[off], U_re, D2 * sizeof(double));
-        memcpy(&lc->pending_1site_im[off], U_im, D2 * sizeof(double));
-        lc->pending_1site_valid[site] = 1;
-        lc->stats.gates_queued++;
-    }
-
-    lc->site_dirty[site] = 1;
-}
-
-void mps_lazy_gate_2site(MpsLazyChain *lc, int site,
-                         const double *G_re, const double *G_im)
-{
-    /*  #10: Drain pending 1-site gates on affected sites first */
-    drain_pending_1site(lc, site);
-    if (site + 1 < lc->n_sites)
-        drain_pending_1site(lc, site + 1);
-
-    if (lc->queue_len >= lc->queue_cap) mps_lazy_flush(lc);
-
-    int D2 = MPS_PHYS * MPS_PHYS;
-    int sz = D2 * D2;
-
-    MpsDeferredGate *g = &lc->queue[lc->queue_len];
-    g->type = 1;
-    g->site = site;
-    g->G_re = (double *)malloc(sz * sizeof(double));
-    g->G_im = (double *)malloc(sz * sizeof(double));
-    memcpy(g->G_re, G_re, sz * sizeof(double));
-    memcpy(g->G_im, G_im, sz * sizeof(double));
-    g->applied = 0;
-
-    lc->queue_len++;
-    lc->site_dirty[site] = 1;
-    if (site + 1 < lc->n_sites)
-        lc->site_dirty[site + 1] = 1;
-    lc->stats.gates_queued++;
-}
-
-/* Gate fusion: C = B × A */
-static void fuse_1site_gates(const double *A_re, const double *A_im,
-                             const double *B_re, const double *B_im,
-                             double *C_re, double *C_im)
-{
-    int D = MPS_PHYS;
-    for (int i = 0; i < D; i++)
-        for (int j = 0; j < D; j++) {
-            double sr = 0, si = 0;
-            for (int k = 0; k < D; k++) {
-                double br = B_re[i * D + k], bi = B_im[i * D + k];
-                double ar = A_re[k * D + j], ai = A_im[k * D + j];
-                sr += br * ar - bi * ai;
-                si += br * ai + bi * ar;
-            }
-            C_re[i * D + j] = sr;
-            C_im[i * D + j] = si;
-        }
-}
-
-static void apply_gate(MpsLazyChain *lc, MpsDeferredGate *g)
-{
-    if (g->applied) return;
-
-    if (g->type == 0) {
-        lazy_ensure_site(lc, g->site);
-        mps_gate_1site(lc->eng, lc->quhits, lc->n_sites,
-                       g->site, g->U_re, g->U_im);
-    } else {
-        lazy_ensure_site(lc, g->site);
-        lazy_ensure_site(lc, g->site + 1);
-        mps_gate_2site(lc->eng, lc->quhits, lc->n_sites,
-                       g->site, g->G_re, g->G_im);
-    }
-
-    g->applied = 1;
-    lc->stats.gates_materialized++;
-}
-
-uint32_t mps_lazy_measure(MpsLazyChain *lc, int target_idx)
-{
-    /*  #10: Drain pending 1-site gates before measuring */
-    for (int s = 0; s < lc->n_sites; s++)
-        drain_pending_1site(lc, s);
-
-    /* Gate fusion pass */
-    for (int i = 0; i < lc->queue_len - 1; i++) {
-        if (lc->queue[i].applied) continue;
-        if (lc->queue[i].type != 0) continue;
-
-        int j = i + 1;
-        while (j < lc->queue_len &&
-               lc->queue[j].type == 0 &&
-               lc->queue[j].site == lc->queue[i].site &&
-               !lc->queue[j].applied) {
-            double C_re[MPS_PHYS * MPS_PHYS], C_im[MPS_PHYS * MPS_PHYS];
-            fuse_1site_gates(lc->queue[i].U_re, lc->queue[i].U_im,
-                             lc->queue[j].U_re, lc->queue[j].U_im,
-                             C_re, C_im);
-            memcpy(lc->queue[i].U_re, C_re, sizeof(C_re));
-            memcpy(lc->queue[i].U_im, C_im, sizeof(C_im));
-            lc->queue[j].applied = 1;
-            lc->stats.gates_fused++;
-            j++;
-        }
-    }
-
-    /* Apply all pending gates */
-    for (int i = 0; i < lc->queue_len; i++) {
-        if (!lc->queue[i].applied)
-            apply_gate(lc, &lc->queue[i]);
-    }
-
-    lazy_ensure_site(lc, target_idx);
-    return mps_overlay_measure(lc->eng, lc->quhits, lc->n_sites, target_idx);
-}
-
-void mps_lazy_flush(MpsLazyChain *lc)
-{
-    /*  #10: Drain all pending 1-site gates first */
-    for (int s = 0; s < lc->n_sites; s++)
-        drain_pending_1site(lc, s);
-
-    /* Fusion pass */
-    for (int i = 0; i < lc->queue_len - 1; i++) {
-        if (lc->queue[i].applied) continue;
-        if (lc->queue[i].type != 0) continue;
-
-        int j = i + 1;
-        while (j < lc->queue_len &&
-               lc->queue[j].type == 0 &&
-               lc->queue[j].site == lc->queue[i].site &&
-               !lc->queue[j].applied) {
-            double C_re[MPS_PHYS * MPS_PHYS], C_im[MPS_PHYS * MPS_PHYS];
-            fuse_1site_gates(lc->queue[i].U_re, lc->queue[i].U_im,
-                             lc->queue[j].U_re, lc->queue[j].U_im,
-                             C_re, C_im);
-            memcpy(lc->queue[i].U_re, C_re, sizeof(C_re));
-            memcpy(lc->queue[i].U_im, C_im, sizeof(C_im));
-            lc->queue[j].applied = 1;
-            lc->stats.gates_fused++;
-            j++;
-        }
-    }
-
-    for (int i = 0; i < lc->queue_len; i++) {
-        if (!lc->queue[i].applied)
-            apply_gate(lc, &lc->queue[i]);
-    }
-
-    for (int i = 0; i < lc->queue_len; i++) {
-        if (lc->queue[i].type == 1) {
-            free(lc->queue[i].G_re);
-            free(lc->queue[i].G_im);
-            lc->queue[i].G_re = NULL;
-            lc->queue[i].G_im = NULL;
-        }
-    }
-    lc->queue_len = 0;
-}
-
-void mps_lazy_finalize_stats(MpsLazyChain *lc)
-{
-    uint64_t skipped = 0;
-    for (int i = 0; i < lc->queue_len; i++)
-        if (!lc->queue[i].applied) skipped++;
-    lc->stats.gates_skipped = skipped;
-
-    uint64_t alloc = 0;
-    for (int i = 0; i < lc->n_sites; i++)
-        if (lc->site_allocated[i]) alloc++;
-    lc->stats.sites_allocated = alloc;
-    lc->stats.sites_lazy = lc->n_sites - alloc;
-
-    lc->stats.memory_actual = alloc * sizeof(MpsTensor)
-                            + lc->queue_len * sizeof(MpsDeferredGate)
-                            + sizeof(MpsLazyChain);
-}
-
-void mps_lazy_write_tensor(MpsLazyChain *lc, int site, int k,
-                           int alpha, int beta, double re, double im)
-{
-    lc->site_allocated[site] = 1;
-    mps_write_tensor(site, k, alpha, beta, re, im);
-}
-
-void mps_lazy_zero_site(MpsLazyChain *lc, int site)
-{
-    lc->site_allocated[site] = 1;
-    mps_zero_site(site);
-    mps_write_tensor(site, 0, 0, 0, 1.0, 0.0);
 }
