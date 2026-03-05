@@ -162,12 +162,26 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
                 return;
             }
 
-            /* Check Pattern B: paired off-diag at (0,3),(1,4),(2,5) = d0 */
+            /* Check Pattern B: paired off-diag at (0,3),(1,4),(2,5) = d0
+             * AND all other off-diag elements must be near zero */
             int is_paired = 1;
             for (int p = 0; p < 3 && is_paired; p++) {
                 int ia = TSVD_PAIR_A[p], ib = TSVD_PAIR_B[p];
                 if (fabs(H_re[ia*6+ib] - d0) > 1e-10 * fabs(d0)) is_paired = 0;
                 if (fabs(H_im[ia*6+ib]) > 1e-10 * fabs(d0)) is_paired = 0;
+            }
+
+            /* Verify non-paired off-diagonals are near zero */
+            if (is_paired) {
+                double non_paired_off = 0;
+                for (int i = 0; i < 6 && is_paired; i++)
+                    for (int j = i + 1; j < 6; j++) {
+                        /* Skip the 3 paired positions */
+                        if ((i == 0 && j == 3) || (i == 1 && j == 4) || (i == 2 && j == 5))
+                            continue;
+                        non_paired_off += H_re[i*6+j]*H_re[i*6+j] + H_im[i*6+j]*H_im[i*6+j];
+                    }
+                if (non_paired_off > 1e-16 * d0 * d0) is_paired = 0;
             }
 
             if (is_paired) {
@@ -218,7 +232,7 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
 
     /* ─── General case: Full Jacobi iteration (<0.5% of calls) ─── */
 
-    for (int sweep = 0; sweep < 30; sweep++) {  /* L7: 30 max (Probe 8: converges in 6-29) */
+    for (int sweep = 0; sweep < 100; sweep++) {  /* increased from 30 for n>6 convergence */
         /* LAYER 7: Kahan compensated summation for off-diagonal norm.
          * Probe 2 showed addition loses ~1 bit per op. For n=36,
          * the sum has n(n-1)/2 = 630 terms → ~10 bits lost without
@@ -253,10 +267,12 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
               double tau = (hqq - hpp) / (2.0 * mag);
               double t, c, s;
               if (fabs(tau) < 1e-15) {
-                  /* hpp ≈ hqq: optimal rotation is 45° */
-                  t = 1.0;
+                  /* hpp ≈ hqq: use t = -1 so that H'[p,p] = hpp + mag
+                   * (larger eigenvalue at position p) with eigenvector
+                   * (c, s) = (1/√2, -1/√2) correctly paired. */
+                  t = -1.0;
                   c = TSVD_INV_SQRT2;
-                  s = TSVD_INV_SQRT2;
+                  s = -TSVD_INV_SQRT2;
               } else {
                   t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau) + fabs(tau) * born_fast_isqrt(1.0 + 1.0/(tau*tau)));
                   c = born_fast_isqrt(1.0 + t*t);
@@ -266,11 +282,12 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
              /* Phase to make H[p][q] real: e^{-iθ} */
              double er = apr / mag, ei = -api / mag;
 
-             /* Rotate H: diagonal update from G†HG expansion
-              * H'[p,p] = c²·hpp + 2cs·Re(e^{-iθ}·h_pq) + s²·hqq = hpp + t·mag
-              * H'[q,q] = s²·hpp - 2cs·Re(e^{-iθ}·h_pq) + c²·hqq = hqq - t·mag */
-             H_re[p*n+p] += t * mag;
-             H_re[q*n+q] -= t * mag;
+             /* Rotate H: standard Jacobi diagonal update
+              * H'[p,p] = hpp - t·mag, H'[q,q] = hqq + t·mag
+              * For t = -1 (tau=0): H'[p,p] = hpp + mag (larger)
+              * For t > 0 (tau > 0): H'[p,p] = hpp - t·mag (smaller) */
+             H_re[p*n+p] -= t * mag;
+             H_re[q*n+q] += t * mag;
              H_re[p*n+q] = 0; H_im[p*n+q] = 0;
              H_re[q*n+p] = 0; H_im[q*n+p] = 0;
 
@@ -280,14 +297,18 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
                  double gpr = H_re[k*n+p], gpi = H_im[k*n+p];
                  double gqr = H_re[k*n+q], gqi = H_im[k*n+q];
 
-                 /* Apply phase: gq' = e^{iθ} gq */
-                 double gqr2 =  er * gqr + ei * gqi;
-                 double gqi2 = -ei * gqr + er * gqi;
+                 /* Apply phase: gq' = ε·gq where ε = e^{-iθ} = (er + i·ei) */
+                 double gqr2 =  er * gqr - ei * gqi;
+                 double gqi2 =  ei * gqr + er * gqi;
+
+                 /* Apply conjugate phase: gp' = ε̄·gp where ε̄ = (er - i·ei) */
+                 double gpr2 =  er * gpr + ei * gpi;
+                 double gpi2 = -ei * gpr + er * gpi;
 
                  H_re[k*n+p] =  c * gpr + s * gqr2;
                  H_im[k*n+p] =  c * gpi + s * gqi2;
-                 H_re[k*n+q] = -s * gpr + c * gqr2;
-                 H_im[k*n+q] = -s * gpi + c * gqi2;
+                 H_re[k*n+q] = -s * gpr2 + c * gqr;
+                 H_im[k*n+q] = -s * gpi2 + c * gqi;
 
                  /* Hermitian: H[p][k] = conj(H[k][p]) */
                  H_re[p*n+k] =  H_re[k*n+p]; H_im[p*n+k] = -H_im[k*n+p];
