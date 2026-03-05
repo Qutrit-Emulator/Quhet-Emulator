@@ -251,9 +251,17 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
 
               double hpp = H_re[p*n+p], hqq = H_re[q*n+q];
               double tau = (hqq - hpp) / (2.0 * mag);
-              double t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau) + fabs(tau) * born_fast_isqrt(1.0 + 1.0/(tau*tau)));
-              double c = born_fast_isqrt(1.0 + t*t);
-             double s = t * c;
+              double t, c, s;
+              if (fabs(tau) < 1e-15) {
+                  /* hpp ≈ hqq: optimal rotation is 45° */
+                  t = 1.0;
+                  c = TSVD_INV_SQRT2;
+                  s = TSVD_INV_SQRT2;
+              } else {
+                  t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau) + fabs(tau) * born_fast_isqrt(1.0 + 1.0/(tau*tau)));
+                  c = born_fast_isqrt(1.0 + t*t);
+                  s = t * c;
+              }
 
              /* Phase to make H[p][q] real: e^{-iθ} */
              double er = apr / mag, ei = -api / mag;
@@ -611,13 +619,14 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
      * Jacobi-diagonalize. Bypasses coordinate compression, random
      * projection, and power iteration entirely.
      * Cost: O(nnz²) vs O(nnz × ℓ × 8) with ℓ ≈ 20. */
-    if (nnz <= 36) {
+    if (nnz <= 512) {
         /* Build G = sp† × sp  (nnz × nnz Gram matrix in COO-col space) */
         /* Each entry sp[i] is (row_i, col_i, val_i). G[i][j] = conj(val_i)*val_j
          * if col_i == col_j, weighted by row overlap. But simpler: form M (mr × mc)
-         * directly as dense since nnz is tiny. */
+         * directly as dense since nnz is small. */
         int mr = 0, mc = 0;
-        int rows[36], cols[36];
+        int *rows = (int *)malloc(nnz * sizeof(int));
+        int *cols = (int *)malloc(nnz * sizeof(int));
         /* Extract unique rows and cols */
         for (int e = 0; e < nnz; e++) {
             int found_r = 0, found_c = 0;
@@ -627,8 +636,9 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
             if (!found_c) cols[mc++] = sp[e].col;
         }
         /* Build small dense matrix (mr × mc) */
-        int dm = mr < 36 ? mr : 36, dn = mc < 36 ? mc : 36;
-        double Md_re[36*36] = {0}, Md_im[36*36] = {0};
+        int dm = mr, dn = mc;
+        double *Md_re = (double *)calloc((size_t)dm * dn, sizeof(double));
+        double *Md_im = (double *)calloc((size_t)dm * dn, sizeof(double));
         for (int e = 0; e < nnz; e++) {
             int ri = -1, ci = -1;
             for (int i = 0; i < dm; i++) if (rows[i] == sp[e].row) { ri = i; break; }
@@ -638,7 +648,7 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
                 Md_im[ri*dn+ci] += sp[e].im;
             }
         }
-        /* Dense truncated SVD on the tiny matrix */
+        /* Dense truncated SVD on the small matrix */
         int trank = rank < dn ? rank : dn;
         if (trank > dm) trank = dm;
         double *tU_re = (double *)calloc((size_t)dm * trank, sizeof(double));
@@ -659,7 +669,9 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
                 Vc_im[j*n + cols[i]] = tV_im[j*dn+i];
             }
         }
+        free(Md_re); free(Md_im);
         free(tU_re); free(tU_im); free(tS); free(tV_re); free(tV_im);
+        free(rows); free(cols);
         return;
     }
 
