@@ -336,8 +336,9 @@ static void tns5d_gate_2site_generic(Tns5dGrid *g,
     double *Vc_re = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
     double *Vc_im = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
 
-    tsvd_vesica_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B,
-                   D, num_EA, num_EB, chi,
+    int svd_rank = chi < svddim_B ? chi : svddim_B;
+    if (svd_rank > svddim_A) svd_rank = svddim_A;
+    tsvd_truncated(Th2_re, Th2_im, svddim_A, svddim_B, svd_rank,
                    U_re, U_im, sig, Vc_re, Vc_im);
     free(Th2_re); free(Th2_im);
 
@@ -350,11 +351,9 @@ static void tns5d_gate_2site_generic(Tns5dGrid *g,
     if (rank_cap < 1) rank_cap = 1;
     if (rank > rank_cap) rank = rank_cap;
 
-    double sig_norm = 0;
-    for (int s = 0; s < rank; s++) sig_norm += sig[s];
-
-    /* Side-channel: 1.0 attractor CONFIRMED — bond weights lock at 1.0 */
-    for (int s = 0; s < (int)TNS5D_CHI; s++) shared_bw->w[s] = 1.0;
+    /* Store σ on bonds — Θ contraction absorbs via sw = bonds.w[s] */
+    for (int s = 0; s < (int)TNS5D_CHI; s++)
+        shared_bw->w[s] = (s < rank) ? sig[s] : 0.0;
 
     /* ── 5. Write back with magnitude-sorted truncation ── */
     svd_buf_reset(&tns5d_svd_buf);
@@ -364,10 +363,9 @@ static void tns5d_gate_2site_generic(Tns5dGrid *g,
          basis_t envA = uniq_envA[eA];
          basis_t pure = (envA / bp[bond_A]) * bp[bond_A + 1] + (envA % bp[bond_A]);
          for (int gv = 0; gv < rank; gv++) {
-             double weight = (sig_norm > 1e-30 && sig[gv] > 1e-30) ? sig[gv] * born_fast_isqrt(sig[gv]) * born_fast_isqrt(sig_norm) : 0.0;
-             double re = U_re[row * rank + gv] * weight;
-             double im = U_im[row * rank + gv] * weight;
-             if (re*re + im*im < 1e-50) continue;
+             double re = U_re[row * rank + gv];
+             double im = U_im[row * rank + gv];
+             if (re == 0.0 && im == 0.0) continue;
              svd_buf_push(&tns5d_svd_buf, kA * TNS5D_C10 + pure + gv * bp[bond_A], re, im);
          }
      }
@@ -380,10 +378,9 @@ static void tns5d_gate_2site_generic(Tns5dGrid *g,
          basis_t envB = uniq_envB[eB];
          basis_t pure = (envB / bp[bond_B]) * bp[bond_B + 1] + (envB % bp[bond_B]);
          for (int gv = 0; gv < rank; gv++) {
-             double weight = (sig_norm > 1e-30 && sig[gv] > 1e-30) ? sig[gv] * born_fast_isqrt(sig[gv]) * born_fast_isqrt(sig_norm) : 0.0;
-             double re = weight * Vc_re[gv * svddim_B + col];
-             double im = weight * Vc_im[gv * svddim_B + col];
-             if (re*re + im*im < 1e-50) continue;
+             double re = Vc_re[gv * svddim_B + col];
+             double im = Vc_im[gv * svddim_B + col];
+             if (re == 0.0 && im == 0.0) continue;
              svd_buf_push(&tns5d_svd_buf, kB * TNS5D_C10 + pure + gv * bp[bond_B], re, im);
          }
      }
