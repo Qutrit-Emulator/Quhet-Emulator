@@ -317,6 +317,9 @@ void mps_gate_1site(QuhitEngine *eng, uint32_t *quhits, int n,
 
 #include "tensor_svd.h"
 
+/* Temp entry struct matching QuhitRegister::entries[] layout */
+typedef struct { basis_t basis_state; double amp_re, amp_im; } TmpEntry;
+
 #define DCHI (MPS_PHYS * MPS_CHI)
 
 /* ──  #7: Static scratch pool ──
@@ -375,12 +378,14 @@ static void gb_ensure(int chi, int max_entries) {
 
 static void gb_build(GammaBuckets *gb, QuhitRegister *reg, int chi) {
     memset(gb->counts, 0, chi * sizeof(uint16_t));
-    /* Count entries per gamma */
+    /* Bucket regB by LEFT bond (alpha = shared bond with regA's right bond β)
+     * Encoding: bs = k * chi² + alpha * chi + beta
+     * alpha = (bs / chi) % chi */
     for (uint32_t e = 0; e < reg->num_nonzero; e++) {
         double ar = reg->entries[e].amp_re, ai = reg->entries[e].amp_im;
         if (ar*ar + ai*ai < 1e-30) continue;
-        int gamma = (int)(reg->entries[e].basis_state % chi);
-        if (gamma < chi) gb->counts[gamma]++;
+        int alpha = (int)((reg->entries[e].basis_state / chi) % chi);
+        if (alpha < chi) gb->counts[alpha]++;
     }
     /* Compute offsets */
     uint16_t off = 0;
@@ -394,9 +399,9 @@ static void gb_build(GammaBuckets *gb, QuhitRegister *reg, int chi) {
     for (uint32_t e = 0; e < reg->num_nonzero; e++) {
         double ar = reg->entries[e].amp_re, ai = reg->entries[e].amp_im;
         if (ar*ar + ai*ai < 1e-30) continue;
-        int gamma = (int)(reg->entries[e].basis_state % chi);
-        if (gamma < chi)
-            gb->indices[pos[gamma]++] = (uint16_t)e;
+        int alpha = (int)((reg->entries[e].basis_state / chi) % chi);
+        if (alpha < chi)
+            gb->indices[pos[alpha]++] = (uint16_t)e;
     }
 }
 
@@ -603,7 +608,21 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
         Th_out_im = g2_Th2_im;
     }
 
-    /* ── Step 4: SVD → truncate to χ ── */
+    /* ── Step 4: Renormalize Θ → SVD → truncate to χ ── */
+
+    /* Pre-normalize Θ to unit Frobenius norm to prevent σ explosion */
+    double th_norm2 = 0;
+    for (size_t i = 0; i < (size_t)dchi * dchi; i++)
+        th_norm2 += Th_out_re[i] * Th_out_re[i] + Th_out_im[i] * Th_out_im[i];
+    double th_norm = (th_norm2 > 1e-60) ? sqrt(th_norm2) : 1.0;
+    if (th_norm > 1e-30 && th_norm != 1.0) {
+        double inv_norm = 1.0 / th_norm;
+        for (size_t i = 0; i < (size_t)dchi * dchi; i++) {
+            Th_out_re[i] *= inv_norm;
+            Th_out_im[i] *= inv_norm;
+        }
+    }
+
     memset(g2_U_re, 0, (size_t)dchi * chi * sizeof(double));
     memset(g2_U_im, 0, (size_t)dchi * chi * sizeof(double));
     memset(g2_sig, 0, chi * sizeof(double));
@@ -613,17 +632,33 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     tsvd_truncated_sparse(Th_out_re, Th_out_im, dchi, dchi, chi,
                    g2_U_re, g2_U_im, g2_sig, g2_Vc_re, g2_Vc_im);
 
+    /* Rescale σ by original Θ norm */
+    for (int g = 0; g < chi; g++)
+        g2_sig[g] *= th_norm;
+
     /* ── Step 5: Write back —  #11: √σ pre-computed ── */
     int rank = chi < dchi ? chi : dchi;
 
     /* Pre-compute √σ once — not per entry ( #11) */
     double sqrt_sig[MPS_CHI];
     for (int g = 0; g < rank; g++)
-        sqrt_sig[g] = g2_sig[g] > 1e-20
+        sqrt_sig[g] = g2_sig[g] > 1e-30
                       ? g2_sig[g] * born_fast_isqrt(g2_sig[g]) : 0;
 
+    /* ── Write-back with magnitude-sorted truncation ──
+     * Collect ALL entries into a temp buffer, then keep the top 4096
+     * by |amplitude|². This prevents random drops that cascade to zero. */
+
+    /* Static temp buffer (allocated once alongside pool) */
+    static TmpEntry *g2_tmp_buf = NULL;
+    static int g2_tmp_init = 0;
+    if (!g2_tmp_init) {
+        g2_tmp_buf = (TmpEntry *)malloc(16384 * sizeof(TmpEntry));
+        g2_tmp_init = 1;
+    }
+
     /* A'[kA', α, γ] = √σ[γ] × U[(kA'*χ+α), γ] */
-    regA->num_nonzero = 0;
+    uint32_t nA = 0;
     for (int kA = 0; kA < D; kA++)
      for (int a = 0; a < chi; a++) {
          int row = kA * chi + a;
@@ -632,18 +667,38 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
              if (sq < 1e-30) continue;
              double re = sq * g2_U_re[row * rank + g];
              double im = sq * g2_U_im[row * rank + g];
-             if (re*re + im*im > 1e-30 && regA->num_nonzero < 4096) {
-                 basis_t bs = (basis_t)kA * chi2 + (basis_t)a * chi + g;
-                 regA->entries[regA->num_nonzero].basis_state = bs;
-                 regA->entries[regA->num_nonzero].amp_re = re;
-                 regA->entries[regA->num_nonzero].amp_im = im;
-                 regA->num_nonzero++;
+             if (re*re + im*im > 1e-30 && nA < 16384) {
+                 g2_tmp_buf[nA].basis_state = (basis_t)kA * chi2 + (basis_t)a * chi + g;
+                 g2_tmp_buf[nA].amp_re = re;
+                 g2_tmp_buf[nA].amp_im = im;
+                 nA++;
              }
          }
      }
+    /* Partial selection sort to keep top-4096 by magnitude */
+    if (nA > 4096) {
+        for (uint32_t i = 0; i < 4096; i++) {
+            uint32_t best = i;
+            double best_m = g2_tmp_buf[i].amp_re * g2_tmp_buf[i].amp_re +
+                            g2_tmp_buf[i].amp_im * g2_tmp_buf[i].amp_im;
+            for (uint32_t j = i + 1; j < nA; j++) {
+                double m = g2_tmp_buf[j].amp_re * g2_tmp_buf[j].amp_re +
+                           g2_tmp_buf[j].amp_im * g2_tmp_buf[j].amp_im;
+                if (m > best_m) { best = j; best_m = m; }
+            }
+            if (best != i) {
+                TmpEntry tmp = g2_tmp_buf[i];
+                g2_tmp_buf[i] = g2_tmp_buf[best];
+                g2_tmp_buf[best] = tmp;
+            }
+        }
+        nA = 4096;
+    }
+    regA->num_nonzero = nA;
+    memcpy(regA->entries, g2_tmp_buf, nA * sizeof(TmpEntry));
 
     /* B'[kB', γ, β] = √σ[γ] × V†[γ, (kB'*χ+β)] */
-    regB->num_nonzero = 0;
+    uint32_t nB = 0;
     for (int kB = 0; kB < D; kB++)
      for (int g = 0; g < rank; g++) {
           double sq = sqrt_sig[g];
@@ -652,15 +707,34 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
              int col = kB * chi + b;
              double re = sq * g2_Vc_re[g * dchi + col];
              double im = sq * g2_Vc_im[g * dchi + col];
-             if (re*re + im*im > 1e-30 && regB->num_nonzero < 4096) {
-                 basis_t bs = (basis_t)kB * chi2 + (basis_t)g * chi + b;
-                 regB->entries[regB->num_nonzero].basis_state = bs;
-                 regB->entries[regB->num_nonzero].amp_re = re;
-                 regB->entries[regB->num_nonzero].amp_im = im;
-                 regB->num_nonzero++;
+             if (re*re + im*im > 1e-30 && nB < 16384) {
+                 g2_tmp_buf[nB].basis_state = (basis_t)kB * chi2 + (basis_t)g * chi + b;
+                 g2_tmp_buf[nB].amp_re = re;
+                 g2_tmp_buf[nB].amp_im = im;
+                 nB++;
              }
          }
      }
+    if (nB > 4096) {
+        for (uint32_t i = 0; i < 4096; i++) {
+            uint32_t best = i;
+            double best_m = g2_tmp_buf[i].amp_re * g2_tmp_buf[i].amp_re +
+                            g2_tmp_buf[i].amp_im * g2_tmp_buf[i].amp_im;
+            for (uint32_t j = i + 1; j < nB; j++) {
+                double m = g2_tmp_buf[j].amp_re * g2_tmp_buf[j].amp_re +
+                           g2_tmp_buf[j].amp_im * g2_tmp_buf[j].amp_im;
+                if (m > best_m) { best = j; best_m = m; }
+            }
+            if (best != i) {
+                TmpEntry tmp = g2_tmp_buf[i];
+                g2_tmp_buf[i] = g2_tmp_buf[best];
+                g2_tmp_buf[best] = tmp;
+            }
+        }
+        nB = 4096;
+    }
+    regB->num_nonzero = nB;
+    memcpy(regB->entries, g2_tmp_buf, nB * sizeof(TmpEntry));
 
 
     /* ── Mirror to triality sites (replaces engine quhit CZ mirror) ── */
