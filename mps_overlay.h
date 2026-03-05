@@ -10,6 +10,7 @@
 #define MPS_OVERLAY_H
 
 #include "quhit_engine.h"
+#include "triality_overlay.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -33,9 +34,10 @@ typedef struct {
     int reg_idx;   /* Index into engine's register array */
 } MpsTensor;
 
-extern MpsTensor   *mps_store;
-extern int          mps_store_n;
-extern QuhitEngine *mps_eng;   /* Engine reference for register access */
+extern MpsTensor        *mps_store;
+extern int               mps_store_n;
+extern QuhitEngine      *mps_eng;   /* Engine reference for register access */
+extern TriOverlaySite   *mps_tri_sites;  /* Per-site triality state */
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * TENSOR ACCESS  (via register — O(1))
@@ -151,6 +153,8 @@ typedef struct {
     uint8_t  *pending_1site_valid; /* n_sites × 1 */
 
     LazyStats stats;
+
+    TriOverlaySite *tri_sites;  /* Per-site triality state */
 } MpsLazyChain;
 
 /* ── Lifecycle ── */
