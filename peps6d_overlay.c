@@ -242,7 +242,8 @@ static void tns6d_gate_2site_generic(Tns6dGrid *g, int sA, int sB,
     double *Vr=(double*)calloc((size_t)chi*sdB,sizeof(double));
     double *Vi=(double*)calloc((size_t)chi*sdB,sizeof(double));
 
-    tsvd_vesica_truncated_sparse(T2r,T2i,sdA,sdB,D,nEA,nEB,chi,Ur,Ui,sig,Vr,Vi);
+    int svd_rank=chi<sdB?chi:sdB; if(svd_rank>sdA) svd_rank=sdA;
+    tsvd_truncated(T2r,T2i,sdA,sdB,svd_rank,Ur,Ui,sig,Vr,Vi);
     free(T2r);free(T2i);
 
     int rank=chi<sdB?chi:sdB; if(rank>sdA) rank=sdA;
@@ -251,9 +252,8 @@ static void tns6d_gate_2site_generic(Tns6dGrid *g, int sA, int sB,
     int rank_cap=max_env>0?4096/(D*max_env):rank;
     if(rank_cap<1) rank_cap=1;
     if(rank>rank_cap) rank=rank_cap;
-    double sn=0; for(int s=0;s<rank;s++) sn+=sig[s];
-    /* Side-channel: 1.0 attractor CONFIRMED — bond weights lock at 1.0 */
-    for(int s=0;s<(int)TNS6D_CHI;s++) bw->w[s]=1.0;
+    /* Store σ on bonds — Θ contraction absorbs via sw = bw->w[s] */
+    for(int s=0;s<(int)TNS6D_CHI;s++) bw->w[s]=(s<rank)?sig[s]:0.0;
 
     svd_buf_reset(&tns6d_svd_buf);
     for (int kA=0;kA<D;kA++)
@@ -262,9 +262,8 @@ static void tns6d_gate_2site_generic(Tns6dGrid *g, int sA, int sB,
          basis_t envA=ueA[eA];
          basis_t pure=(envA/bp[bond_A])*bp[bond_A+1]+(envA%bp[bond_A]);
          for (int gv=0;gv<rank;gv++) {
-             double wt=(sn>1e-30&&sig[gv]>1e-30)?sig[gv]*born_fast_isqrt(sig[gv])*born_fast_isqrt(sn):0.0;
-             double re=Ur[row*rank+gv]*wt, im=Ui[row*rank+gv]*wt;
-             if (re*re+im*im<1e-50) continue;
+             double re=Ur[row*rank+gv], im=Ui[row*rank+gv];
+             if (re==0.0&&im==0.0) continue;
              svd_buf_push(&tns6d_svd_buf, kA*TNS6D_C12+pure+gv*bp[bond_A], re, im);
          }
      }
@@ -277,9 +276,8 @@ static void tns6d_gate_2site_generic(Tns6dGrid *g, int sA, int sB,
          basis_t envB=ueB[eB];
          basis_t pure=(envB/bp[bond_B])*bp[bond_B+1]+(envB%bp[bond_B]);
          for (int gv=0;gv<rank;gv++) {
-             double wt=(sn>1e-30&&sig[gv]>1e-30)?sig[gv]*born_fast_isqrt(sig[gv])*born_fast_isqrt(sn):0.0;
-             double re=wt*Vr[gv*sdB+col], im=wt*Vi[gv*sdB+col];
-             if (re*re+im*im<1e-50) continue;
+             double re=Vr[gv*sdB+col], im=Vi[gv*sdB+col];
+             if (re==0.0&&im==0.0) continue;
              svd_buf_push(&tns6d_svd_buf, kB*TNS6D_C12+pure+gv*bp[bond_B], re, im);
          }
      }
