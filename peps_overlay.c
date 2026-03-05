@@ -79,6 +79,11 @@ PepsGrid *peps_init(int Lx, int Ly)
         g->tensors[i].reg_idx = g->site_reg[i];
     }
 
+    /* ── Per-site Triality state ── */
+    g->tri_sites = (TriOverlaySite *)calloc(N, sizeof(TriOverlaySite));
+    for (int i = 0; i < N; i++)
+        tri_site_init(&g->tri_sites[i]);
+
     return g;
 }
 
@@ -98,6 +103,7 @@ void peps_free(PepsGrid *grid)
     }
     free(grid->q_phys);
     free(grid->site_reg);
+    free(grid->tri_sites);
     free(grid);
 }
 
@@ -142,65 +148,20 @@ void peps_gate_1site(PepsGrid *grid, int x, int y,
 {
     int site = y * grid->Lx + x;
 
-    /* ── Manual register-based 1-site gate on physical index k ── */
+    /* ── Triality-masked register gate on physical index k ── */
     if (grid->eng && grid->site_reg) {
         int reg_idx = grid->site_reg[site];
         if (reg_idx >= 0) {
             QuhitRegister *reg = &grid->eng->registers[reg_idx];
-            int D = PEPS_D;
-
-            uint32_t max_out = reg->num_nonzero * D + 1;
-            if (max_out < 4096) max_out = 4096;
-            struct tmp_entry *tmp = calloc(max_out, sizeof(*tmp));
-            uint32_t nout = 0;
-
-            for (uint32_t e = 0; e < reg->num_nonzero; e++) {
-                basis_t bs = reg->entries[e].basis_state;
-                double ar = reg->entries[e].amp_re;
-                double ai = reg->entries[e].amp_im;
-                int k = (int)(bs / PEPS_CHI4);
-                basis_t bond = bs % PEPS_CHI4;
-
-                for (int kp = 0; kp < D; kp++) {
-                    double ur = U_re[kp * D + k];
-                    double ui = U_im[kp * D + k];
-                    double nr = ur * ar - ui * ai;
-                    double ni = ur * ai + ui * ar;
-                    if (nr*nr + ni*ni < 1e-10) continue;
-
-                    if (nout < max_out) {
-                        tmp[nout].basis = (basis_t)kp * PEPS_CHI4 + bond;
-                        tmp[nout].re = nr;
-                        tmp[nout].im = ni;
-                        nout++;
-                    }
-                }
-            }
-
-            /* Sort by basis state to accumulate duplicates in O(K log K) */
-            qsort(tmp, nout, sizeof(struct tmp_entry), cmp_basis);
-
-            reg->num_nonzero = 0;
-            for (uint32_t t = 0; t < nout; t++) {
-                double acc_re = tmp[t].re;
-                double acc_im = tmp[t].im;
-                /* Accumulate duplicates */
-                while (t + 1 < nout && tmp[t+1].basis == tmp[t].basis) {
-                    t++;
-                    acc_re += tmp[t].re;
-                    acc_im += tmp[t].im;
-                }
-                if (acc_re*acc_re + acc_im*acc_im >= 1e-10 &&
-                    reg->num_nonzero < 4096) {
-                    reg->entries[reg->num_nonzero].basis_state = tmp[t].basis;
-                    reg->entries[reg->num_nonzero].amp_re = acc_re;
-                    reg->entries[reg->num_nonzero].amp_im = acc_im;
-                    reg->num_nonzero++;
-                }
-            }
-            free(tmp);
+            uint8_t mask = grid->tri_sites ? grid->tri_sites[site].active_mask : 0x3F;
+            unsigned __int128 chi_power = (unsigned __int128)PEPS_CHI4;
+            tri_reg_gate_1site_masked(reg, U_re, U_im, mask, chi_power);
         }
     }
+
+    /* Mirror to triality site */
+    if (grid->tri_sites)
+        tri_site_apply_gate(&grid->tri_sites[site], U_re, U_im);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -505,8 +466,10 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
     free(Vc_re); free(Vc_im);
     free(uniq_envA); free(uniq_envB);
 
-    /* Mirror to engine quhits */
-    if (grid->eng && grid->q_phys)
+    /* Mirror to triality sites (replaces engine quhit CZ) */
+    if (grid->tri_sites)
+        tri_site_apply_cz(&grid->tri_sites[sA], &grid->tri_sites[sB]);
+    else if (grid->eng && grid->q_phys)
         quhit_apply_cz(grid->eng, grid->q_phys[sA], grid->q_phys[sB]);
 
     free(wu_A); free(wd_A); free(wl_A);
@@ -777,8 +740,10 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
     free(Vc_re); free(Vc_im);
     free(uniq_envA); free(uniq_envB);
 
-    /* Mirror to engine quhits */
-    if (grid->eng && grid->q_phys)
+    /* Mirror to triality sites (replaces engine quhit CZ) */
+    if (grid->tri_sites)
+        tri_site_apply_cz(&grid->tri_sites[sA], &grid->tri_sites[sB]);
+    else if (grid->eng && grid->q_phys)
         quhit_apply_cz(grid->eng, grid->q_phys[sA], grid->q_phys[sB]);
 
     free(wu_A); free(wl_A); free(wr_A);
