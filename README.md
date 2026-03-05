@@ -2,6 +2,11 @@
 HEAP COMPILE. Otherwise you will get segfault!
 </p>
 
+<p align="center">
+If there is no test folder, don't clone this!
+</p>
+
+
 # HexState 3.6
 
 **A D=6 hexagonal quantum simulator built on the Triality Quhit.**
