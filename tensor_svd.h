@@ -162,47 +162,10 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
                 return;
             }
 
-            /* Check Pattern B: paired off-diag at (0,3),(1,4),(2,5) = d0
-             * AND all other off-diag elements must be near zero */
-            int is_paired = 1;
-            for (int p = 0; p < 3 && is_paired; p++) {
-                int ia = TSVD_PAIR_A[p], ib = TSVD_PAIR_B[p];
-                if (fabs(H_re[ia*6+ib] - d0) > 1e-10 * fabs(d0)) is_paired = 0;
-                if (fabs(H_im[ia*6+ib]) > 1e-10 * fabs(d0)) is_paired = 0;
-            }
-
-            /* Verify non-paired off-diagonals are near zero */
-            if (is_paired) {
-                double non_paired_off = 0;
-                for (int i = 0; i < 6 && is_paired; i++)
-                    for (int j = i + 1; j < 6; j++) {
-                        /* Skip the 3 paired positions */
-                        if ((i == 0 && j == 3) || (i == 1 && j == 4) || (i == 2 && j == 5))
-                            continue;
-                        non_paired_off += H_re[i*6+j]*H_re[i*6+j] + H_im[i*6+j]*H_im[i*6+j];
-                    }
-                if (non_paired_off > 1e-16 * d0 * d0) is_paired = 0;
-            }
-
-            if (is_paired) {
-                /* ─── PATTERN B: Rank-3 paired spectrum (12.5% of calls) ───
-                 * Eigenvalues: [2d0, 2d0, 2d0, 0, 0, 0]
-                 * V columns 0-2: (|ia⟩+|ib⟩)/√2 (sym, eigenvalue 2d0)
-                 * V columns 3-5: (|ia⟩-|ib⟩)/√2 (antisym, eigenvalue 0) */
-                double eig_nz = 2.0 * d0;
-                diag[0] = eig_nz; diag[1] = eig_nz; diag[2] = eig_nz;
-                diag[3] = 0;      diag[4] = 0;      diag[5] = 0;
-
-                memset(W_re, 0, 36 * sizeof(double));
-                for (int p = 0; p < 3; p++) {
-                    int ia = TSVD_PAIR_A[p], ib = TSVD_PAIR_B[p];
-                    W_re[ia*6+p]   =  TSVD_INV_SQRT2;  /* sym */
-                    W_re[ib*6+p]   =  TSVD_INV_SQRT2;
-                    W_re[ia*6+p+3] =  TSVD_INV_SQRT2;  /* antisym */
-                    W_re[ib*6+p+3] = -TSVD_INV_SQRT2;
-                }
-                return;
-            }
+            /* Pattern B disabled: the paired-off-diagonal check with 1e-10
+             * tolerance incorrectly triggers for DFT·CZ-evolved states that
+             * have nearly-uniform structure but rank > 3. The generic Jacobi
+             * sweeps handle all cases correctly. */
         }
     }
 
