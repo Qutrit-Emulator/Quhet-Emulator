@@ -1,184 +1,95 @@
 /*
- * mps_overlay.h — MPS Side-Channel for N-Body States
+ * mps_overlay.h — 1D Matrix Product State (MPS) Tensor Network
  *
  * Pure Magic Pointer implementation — no classical tensor arrays.
- * Tensors stored as QuhitRegisters (3 qudits: k, α, β).
+ * Each site's register holds a 3-qudit state |k, α, β⟩.
  * RAM-agnostic: O(1) per site regardless of χ.
+ *
+ * Modeled directly on peps3d_overlay.h, adapted for 1D chains.
  */
 
 #ifndef MPS_OVERLAY_H
 #define MPS_OVERLAY_H
 
-#include "quhit_engine.h"
-#include "triality_overlay.h"
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * CONSTANTS
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
-#define MPS_CHI  512
-#ifndef MPS_PHYS
-#define MPS_PHYS 6
-#endif
+#define MPS_D     6         /* Physical dimension (SU(6) native)        */
+#define MPS_CHI   256ULL    /* Bond dimension per axis                  */
 
-/* Basis encoding: |k, α, β⟩ → k * χ² + α * χ + β */
-#define MPS_TENSOR_SIZE (MPS_PHYS * MPS_CHI * MPS_CHI)
+/* Derived powers of χ — for basis encoding (ULL to prevent overflow) */
+#define MPS_C2    (MPS_CHI * MPS_CHI)
+#define MPS_TSIZ  (MPS_D * MPS_C2)    /* D × χ² = max basis + 1        */
+
+/* 3-index tensor basis encoding: |k, α, β⟩
+ * k ∈ [0,D), α,β ∈ [0,χ)
+ * Register encodes: β + α*χ + k*χ²
+ * Position 0 = β (least sig), position 1 = α, position 2 = k (most sig)
+ * gate_1site operates at position 2 (physical index k) */
+#define MPS_IDX(k, alpha, beta) \
+    ((uint64_t)(k) * MPS_C2 + (uint64_t)(alpha) * MPS_CHI + (uint64_t)(beta))
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * TENSOR STORE — Magic Pointer based (register IS the tensor)
+ * DATA STRUCTURES — Magic Pointer based
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
+#include "quhit_engine.h"
+#include "triality_overlay.h"
+
+/* Lightweight tensor stub — register IS the tensor */
 typedef struct {
-    int reg_idx;   /* Index into engine's register array */
+    int reg_idx;
 } MpsTensor;
 
-extern MpsTensor        *mps_store;
-extern int               mps_store_n;
-extern QuhitEngine      *mps_eng;   /* Engine reference for register access */
-extern TriOverlaySite   *mps_tri_sites;  /* Per-site triality state */
+typedef struct {
+    double *w;  /* Heap-allocated: χ singular values */
+} MpsBondWeight;
+
+typedef struct {
+    int L;                     /* Chain length                          */
+    MpsTensor *tensors;        /* [L] site metadata                    */
+    MpsBondWeight *bonds;      /* [L-1] bonds between site i and i+1   */
+    /* ── Magic Pointer integration ── */
+    uint32_t *q_phys;         /* [L] per-site physical quhit IDs       */
+    QuhitEngine *eng;          /* HexState Engine reference             */
+    int *site_reg;             /* [L] per-site register indices         */
+    TriOverlaySite *tri_sites; /* [L] per-site triality state           */
+} MpsChain;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * TENSOR ACCESS  (via register — O(1))
+ * API
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
-static inline void mps_write_tensor(int site, int k, int alpha, int beta,
-                                    double re, double im)
-{
-    uint64_t basis = (uint64_t)k * (MPS_CHI * MPS_CHI) + alpha * MPS_CHI + beta;
-    if (mps_eng && mps_store && mps_store[site].reg_idx >= 0)
-        quhit_reg_sv_set(mps_eng, mps_store[site].reg_idx, basis, re, im);
-}
+MpsChain *mps_init(int L);
+void mps_free(MpsChain *c);
 
-static inline void mps_read_tensor(int site, int k, int alpha, int beta,
-                                   double *re, double *im)
-{
-    uint64_t basis = (uint64_t)k * (MPS_CHI * MPS_CHI) + alpha * MPS_CHI + beta;
-    if (mps_eng && mps_store && mps_store[site].reg_idx >= 0) {
-        SV_Amplitude a = quhit_reg_sv_get(mps_eng, mps_store[site].reg_idx, basis);
-        *re = a.re; *im = a.im;
-    } else {
-        *re = 0; *im = 0;
-    }
-}
+void mps_set_product_state(MpsChain *c, int site,
+                           const double *amps_re, const double *amps_im);
 
-static inline void mps_zero_site(int site)
-{
-    if (mps_eng && mps_store && mps_store[site].reg_idx >= 0)
-        mps_eng->registers[mps_store[site].reg_idx].num_nonzero = 0;
-}
+void mps_gate_1site(MpsChain *c, int site,
+                    const double *U_re, const double *U_im);
+void mps_gate_bond(MpsChain *c, int site,
+                   const double *G_re, const double *G_im);
 
-/* ═══════════════════════════════════════════════════════════════════════════════
- * STATE MANAGEMENT API
- * ═══════════════════════════════════════════════════════════════════════════════ */
+void mps_local_density(MpsChain *c, int site, double *probs);
 
-void mps_overlay_init(QuhitEngine *eng, uint32_t *quhits, int n);
-void mps_overlay_free(void);
+/* Batch gates */
+void mps_gate_bond_all(MpsChain *c, const double *G_re, const double *G_im);
+void mps_gate_1site_all(MpsChain *c, const double *U_re, const double *U_im);
+void mps_trotter_step(MpsChain *c, const double *G_re, const double *G_im);
+void mps_normalize_site(MpsChain *c, int site);
 
-void mps_overlay_write_w_state(QuhitEngine *eng, uint32_t *quhits, int n);
-void mps_overlay_write_zero(QuhitEngine *eng, uint32_t *quhits, int n);
-
-uint32_t mps_overlay_measure(QuhitEngine *eng, uint32_t *quhits, int n, int target_idx);
-
-void mps_overlay_amplitude(QuhitEngine *eng, uint32_t *quhits, int n,
-                           const uint32_t *basis, double *out_re, double *out_im);
-
-/* ═══════════════════════════════════════════════════════════════════════════════
- * GATE LAYER
- * ═══════════════════════════════════════════════════════════════════════════════ */
-
-void mps_gate_1site(QuhitEngine *eng, uint32_t *quhits, int n,
-                    int site, const double *U_re, const double *U_im);
-
-void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
-                    int site, const double *G_re, const double *G_im);
-
-/* ═══════════════════════════════════════════════════════════════════════════════
- * GATE CONSTRUCTORS
- * ═══════════════════════════════════════════════════════════════════════════════ */
-
+/* Gate constructors */
 void mps_build_dft6(double *U_re, double *U_im);
 void mps_build_cz(double *G_re, double *G_im);
-void mps_build_controlled_phase(double *G_re, double *G_im, int power);
-void mps_build_hadamard2(double *U_re, double *U_im);
-
-double mps_overlay_norm(QuhitEngine *eng, uint32_t *quhits, int n);
-
-/* ═══════════════════════════════════════════════════════════════════════════════
- * CANONICAL SWEEP DIRECTION
- * ═══════════════════════════════════════════════════════════════════════════════ */
-
-extern int mps_sweep_right;
-
-/* Legacy full-chain renormalization (O(N) — for verification only) */
-extern int mps_defer_renorm;
-void mps_renormalize_chain(QuhitEngine *eng, uint32_t *quhits, int n);
-
-/* ═══════════════════════════════════════════════════════════════════════════════
- * LAZY EVALUATION LAYER
- * ═══════════════════════════════════════════════════════════════════════════════ */
-
-#include "lazy_stats.h"
-
-#define MAX_LAZY_GATES 65536
-
-/* Deferred gate descriptor */
-typedef struct {
-    int     type;
-    int     site;
-    double  U_re[MPS_PHYS * MPS_PHYS];
-    double  U_im[MPS_PHYS * MPS_PHYS];
-    double *G_re;
-    double *G_im;
-    int     applied;
-} MpsDeferredGate;
-
-/* Lazy chain: wraps mps_store with deferred gate queue */
-typedef struct {
-    QuhitEngine *eng;
-    uint32_t    *quhits;
-    int          n_sites;
-
-    MpsDeferredGate *queue;
-    int              queue_len;
-    int              queue_cap;
-
-    uint8_t  *site_allocated;
-    uint8_t  *site_dirty;
-
-    /*  #10: Per-site pending 1-site gate for eager fusion */
-    double   *pending_1site_re;   /* n_sites × D² */
-    double   *pending_1site_im;   /* n_sites × D² */
-    uint8_t  *pending_1site_valid; /* n_sites × 1 */
-
-    LazyStats stats;
-
-    TriOverlaySite *tri_sites;  /* Per-site triality state */
-} MpsLazyChain;
-
-/* ── Lifecycle ── */
-MpsLazyChain *mps_lazy_init(QuhitEngine *eng, uint32_t *quhits, int n);
-void          mps_lazy_free(MpsLazyChain *lc);
-
-/* ── Gate queuing (NO immediate application) ── */
-void mps_lazy_gate_1site(MpsLazyChain *lc, int site,
-                         const double *U_re, const double *U_im);
-void mps_lazy_gate_2site(MpsLazyChain *lc, int site,
-                         const double *G_re, const double *G_im);
-
-/* ── Measurement (TRIGGERS materialization) ── */
-uint32_t mps_lazy_measure(MpsLazyChain *lc, int target_idx);
-
-/* ── Force-apply all pending gates (escape hatch) ── */
-void mps_lazy_flush(MpsLazyChain *lc);
-
-/* ── Finalize stats (call before reading lc->stats) ── */
-void mps_lazy_finalize_stats(MpsLazyChain *lc);
-
-/* ── Write initial state (marks site as allocated) ── */
-void mps_lazy_write_tensor(MpsLazyChain *lc, int site, int k,
-                           int alpha, int beta, double re, double im);
-void mps_lazy_zero_site(MpsLazyChain *lc, int site);
 
 #endif /* MPS_OVERLAY_H */
