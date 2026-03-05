@@ -60,17 +60,11 @@ static void tns4d_reg_write(Tns4dGrid *g, int site,
     int reg = g->site_reg[site];
     if (reg < 0 || !g->eng) return;
     QuhitRegister *r = &g->eng->registers[reg];
-    r->num_nonzero = 0;
+    svd_buf_reset(&tns4d_svd_buf);
     for (basis_t bs = 0; bs < (basis_t)TNS4D_TSIZ; bs++) {
-        if (T_re[bs]*T_re[bs] + T_im[bs]*T_im[bs] > 1e-30) {
-            if (r->num_nonzero < 4096) {
-                r->entries[r->num_nonzero].basis_state = bs;
-                r->entries[r->num_nonzero].amp_re = T_re[bs];
-                r->entries[r->num_nonzero].amp_im = T_im[bs];
-                r->num_nonzero++;
-            }
-        }
+        svd_buf_push(&tns4d_svd_buf, bs, T_re[bs], T_im[bs]);
     }
+    svd_buf_flush(&tns4d_svd_buf, r);
 }
 
 /* ═══════════════ LIFECYCLE ═══════════════ */
