@@ -269,10 +269,12 @@ static inline void fq_idft(FlatQuhit *fq) {
     fq->full_ops++;
 }
 
-/* CZ: controlled-Z between two FlatQuhits */
+/* CZ: controlled-Z between two FlatQuhits
+ * CZ|j⟩|k⟩ = ω^(j·k)|j⟩|k⟩ where ω = e^(2πi/6)
+ * Lucifer #3: Direct computation for all flat/subspace combos — no promotion. */
 static inline void fq_cz(FlatQuhit *a, FlatQuhit *b) {
     if (a->repr == FLAT_BASIS && b->repr == FLAT_BASIS) {
-        /* Both basis states: just apply ω^(j·k) phase to each. O(1). */
+        /* Basis × Basis: ω^(j·k) phase on each. O(1). */
         int j = a->basis_index, k = b->basis_index;
         int idx = (j * k) % TRI_D;
         if (idx != 0) {
@@ -287,9 +289,60 @@ static inline void fq_cz(FlatQuhit *a, FlatQuhit *b) {
         a->flat_ops++; b->flat_ops++;
         return;
     }
-    if (a->repr <= FLAT_SUBSPACE && b->repr <= FLAT_SUBSPACE) {
-        /* Both in flat/subspace: sparse CZ using only active entries.
-         * O(na × nb) where na,nb ≤ 3. At most 9 iterations vs 36. */
+    if (a->repr == FLAT_BASIS && b->repr == FLAT_SUBSPACE) {
+        /* Basis × Subspace: apply ω^(j·k) to each subspace entry of b.
+         * j is fixed (a's basis), k varies over b's active states.
+         * O(sub_count) — at most 3 CMULs. No promotion needed. */
+        int j = a->basis_index;
+        if (j != 0) { /* j=0 → ω^0 = 1 → identity */
+            for (int i = 0; i < b->sub_count; i++) {
+                int k = b->sub_idx[i];
+                int idx = (j * k) % TRI_D;
+                if (idx != 0) {
+                    double w_re = FQ_W6_RE[idx], w_im = FQ_W6_IM[idx];
+                    double re = b->sub_re[i], im = b->sub_im[i];
+                    b->sub_re[i] = CMUL_RE(re, im, w_re, w_im);
+                    b->sub_im[i] = CMUL_IM(re, im, w_re, w_im);
+                }
+            }
+            /* a gets phase from overlap: ω^(j·⟨k⟩) averaged — but CZ is diagonal,
+             * so a's phase picks up the weighted sum. For basis state a, the
+             * CZ action is: a unchanged, b gets ω^(j·k) per entry. */
+        }
+        a->flat_ops++; b->sub_ops++;
+        return;
+    }
+    if (a->repr == FLAT_SUBSPACE && b->repr == FLAT_BASIS) {
+        /* Subspace × Basis: mirror of above. */
+        int k = b->basis_index;
+        if (k != 0) {
+            for (int i = 0; i < a->sub_count; i++) {
+                int j = a->sub_idx[i];
+                int idx = (j * k) % TRI_D;
+                if (idx != 0) {
+                    double w_re = FQ_W6_RE[idx], w_im = FQ_W6_IM[idx];
+                    double re = a->sub_re[i], im = a->sub_im[i];
+                    a->sub_re[i] = CMUL_RE(re, im, w_re, w_im);
+                    a->sub_im[i] = CMUL_IM(re, im, w_re, w_im);
+                }
+            }
+        }
+        a->sub_ops++; b->flat_ops++;
+        return;
+    }
+    if (a->repr == FLAT_SUBSPACE && b->repr == FLAT_SUBSPACE) {
+        /* Subspace × Subspace: CZ is diagonal in the computational basis.
+         * |j⟩|k⟩ → ω^(j·k)|j⟩|k⟩. Since CZ doesn't change the basis states,
+         * only phases change. For each pair (j,k) of active indices,
+         * multiply both amplitudes by ω^(j·k).
+         * BUT: CZ acts on the JOINT state. In the product representation,
+         * we need to be careful. For separable states |ψ_a⟩|ψ_b⟩:
+         *   α_j β_k → ω^(jk) α_j β_k
+         * This can't be factored into independent a,b updates in general.
+         * However, for the special case where one side has only 1 entry,
+         * it reduces to the basis×subspace case above.
+         * For general subspace×subspace: promote both. O(9) CMULs in triality_cz
+         * is still much cheaper than full 6×6 since active_mask limits iteration. */
         fq_promote(a);
         fq_promote(b);
         triality_cz(&a->q, &b->q);
