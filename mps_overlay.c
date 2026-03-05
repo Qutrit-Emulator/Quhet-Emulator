@@ -17,11 +17,12 @@
 #include <pmmintrin.h>    /* _MM_SET_DENORMALS_ZERO_MODE */
 
 /* ─── Global tensor store ──────────────────────────────────────────────────── */
-MpsTensor   *mps_store   = NULL;
-int          mps_store_n = 0;
-QuhitEngine *mps_eng     = NULL;
-int          mps_defer_renorm = 0;
-int          mps_sweep_right  = 1;
+MpsTensor        *mps_store     = NULL;
+int               mps_store_n   = 0;
+QuhitEngine      *mps_eng       = NULL;
+TriOverlaySite   *mps_tri_sites = NULL;
+int               mps_defer_renorm = 0;
+int               mps_sweep_right  = 1;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * INIT / FREE
@@ -52,6 +53,12 @@ void mps_overlay_init(QuhitEngine *eng, uint32_t *quhits, int n)
             quhit_reg_sv_set(eng, mps_store[i].reg_idx, 0, 1.0, 0.0);
         }
     }
+
+    /* ── Triality per-site state ── */
+    if (mps_tri_sites) { free(mps_tri_sites); mps_tri_sites = NULL; }
+    mps_tri_sites = (TriOverlaySite *)calloc((size_t)n, sizeof(TriOverlaySite));
+    for (int i = 0; i < n; i++)
+        tri_site_init(&mps_tri_sites[i]);
 }
 
 void mps_overlay_free(void)
@@ -60,6 +67,8 @@ void mps_overlay_free(void)
     mps_store = NULL;
     mps_store_n = 0;
     mps_eng = NULL;
+    free(mps_tri_sites);
+    mps_tri_sites = NULL;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -274,71 +283,19 @@ static int mps_cmp_basis(const void *a, const void *b)
 void mps_gate_1site(QuhitEngine *eng, uint32_t *quhits, int n,
                     int site, const double *U_re, const double *U_im)
 {
-    /* Register-based: manually rotate the physical index k
-     * Register basis: k*χ² + α*χ + β, where k is the physical index (0..D-1)
-     * We can't use quhit_reg_apply_unitary_pos because reg dim=χ, not D */
+    /* Register-based: rotate the physical index k using triality-masked gate */
     if (eng && mps_store && mps_store[site].reg_idx >= 0) {
         int reg_idx = mps_store[site].reg_idx;
         QuhitRegister *reg = &eng->registers[reg_idx];
-        int chi = MPS_CHI, D = MPS_PHYS;
-        int chi2 = chi * chi;
-
-        /* Build output in temporary arrays */
-        uint32_t max_out = reg->num_nonzero * D + 1;
-        if (max_out < 4096) max_out = 4096;
-        struct { basis_t basis; double re, im; } *tmp =
-            calloc(max_out, sizeof(*tmp));
-        uint32_t nout = 0;
-
-        for (uint32_t e = 0; e < reg->num_nonzero; e++) {
-            basis_t bs = reg->entries[e].basis_state;
-            double ar = reg->entries[e].amp_re;
-            double ai = reg->entries[e].amp_im;
-            int k = (int)(bs / chi2);           /* physical index */
-            basis_t bond = bs % chi2;          /* α*χ + β */
-
-            for (int kp = 0; kp < D; kp++) {
-                double ur = U_re[kp * D + k];
-                double ui = U_im[kp * D + k];
-                double nr = ur * ar - ui * ai;
-                double ni = ur * ai + ui * ar;
-                if (nr*nr + ni*ni < 1e-10) continue;
-
-                if (nout < max_out) {
-                    tmp[nout].basis = (basis_t)kp * chi2 + bond;
-                    tmp[nout].re = nr;
-                    tmp[nout].im = ni;
-                    nout++;
-                }
-            }
-        }
-
-        /* Sort by basis state to accumulate duplicates in O(K log K) */
-        qsort(tmp, nout, sizeof(*tmp), mps_cmp_basis);
-
-        /* Write back with combine */
-        reg->num_nonzero = 0;
-        for (uint32_t t = 0; t < nout; t++) {
-            double acc_re = tmp[t].re;
-            double acc_im = tmp[t].im;
-            while (t + 1 < nout && tmp[t+1].basis == tmp[t].basis) {
-                t++;
-                acc_re += tmp[t].re;
-                acc_im += tmp[t].im;
-            }
-            if (acc_re*acc_re + acc_im*acc_im >= 1e-10 &&
-                reg->num_nonzero < 4096) {
-                reg->entries[reg->num_nonzero].basis_state = tmp[t].basis;
-                reg->entries[reg->num_nonzero].amp_re = acc_re;
-                reg->entries[reg->num_nonzero].amp_im = acc_im;
-                reg->num_nonzero++;
-            }
-        }
-        free(tmp);
+        uint8_t mask = mps_tri_sites ? mps_tri_sites[site].active_mask : 0x3F;
+        unsigned __int128 chi_power = (unsigned __int128)MPS_CHI * MPS_CHI;
+        tri_reg_gate_1site_masked(reg, U_re, U_im, mask, chi_power);
     }
 
-    /* Mirror to physical quhit (marginal readout) */
-    if (eng && quhits && site < n)
+    /* Mirror to triality site (replaces standard quhit mirror) */
+    if (mps_tri_sites && site < n)
+        tri_site_apply_gate(&mps_tri_sites[site], U_re, U_im);
+    else if (eng && quhits && site < n)
         quhit_apply_unitary(eng, quhits[site], U_re, U_im);
 }
 
@@ -706,9 +663,10 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
      }
 
 
-
-    /* ── Mirror to engine quhits ── */
-    if (eng && quhits && sB < n)
+    /* ── Mirror to triality sites (replaces engine quhit CZ mirror) ── */
+    if (mps_tri_sites && sB < n)
+        tri_site_apply_cz(&mps_tri_sites[sA], &mps_tri_sites[sB]);
+    else if (eng && quhits && sB < n)
         quhit_apply_cz(eng, quhits[sA], quhits[sB]);
 }
 
@@ -870,6 +828,7 @@ MpsLazyChain *mps_lazy_init(QuhitEngine *eng, uint32_t *quhits, int n)
     lc->n_sites = n;
 
     mps_overlay_init(eng, quhits, n);
+    lc->tri_sites = mps_tri_sites;  /* Link to per-site triality state */
 
     lc->queue_cap = MAX_LAZY_GATES;
     lc->queue = (MpsDeferredGate *)calloc(lc->queue_cap, sizeof(MpsDeferredGate));
