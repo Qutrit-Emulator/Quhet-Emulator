@@ -127,6 +127,11 @@ Tns4dGrid *tns4d_init(int Lx, int Ly, int Lz, int Lw)
         g->tensors[i].reg_idx = g->site_reg[i];
     }
 
+    /* ── Per-site Triality state ── */
+    g->tri_sites = (TriOverlaySite *)calloc(N, sizeof(TriOverlaySite));
+    for (int i = 0; i < N; i++)
+        tri_site_init(&g->tri_sites[i]);
+
     return g;
 }
 
@@ -153,6 +158,7 @@ void tns4d_free(Tns4dGrid *g)
     }
     free(g->q_phys);
     free(g->site_reg);
+    free(g->tri_sites);
     free(g);
 }
 
@@ -195,73 +201,13 @@ void tns4d_gate_1site(Tns4dGrid *g, int x, int y, int z, int w,
     if (reg < 0) return;
 
     QuhitRegister *r = &g->eng->registers[reg];
-    int D = TNS4D_D;
-    uint32_t old_nnz = r->num_nonzero;
-    if (old_nnz == 0) return;
+    uint8_t mask = g->tri_sites ? g->tri_sites[site].active_mask : 0x3F;
+    unsigned __int128 chi_power = (unsigned __int128)TNS4D_C8;
+    tri_reg_gate_1site_masked(r, U_re, U_im, mask, chi_power);
 
-    /* Save old sparse entries */
-    basis_t *old_bs = (basis_t *)malloc(old_nnz * sizeof(basis_t));
-    double   *old_re = (double *)malloc(old_nnz * sizeof(double));
-    double   *old_im = (double *)malloc(old_nnz * sizeof(double));
-    for (uint32_t e = 0; e < old_nnz; e++) {
-        old_bs[e] = r->entries[e].basis_state;
-        old_re[e] = r->entries[e].amp_re;
-        old_im[e] = r->entries[e].amp_im;
-    }
-
-    /* Apply gate at physical position (most significant) */
-    size_t cap = (size_t)old_nnz * D;
-    struct tmp4d_entry *tmp = (struct tmp4d_entry *)calloc(cap, sizeof(*tmp));
-    size_t ntmp = 0;
-
-    for (uint32_t e = 0; e < old_nnz; e++) {
-        basis_t bs_old = old_bs[e];
-        int k_old = (int)(bs_old / TNS4D_C8);
-        basis_t bond_part = bs_old % TNS4D_C8;
-
-        for (int k_new = 0; k_new < D; k_new++) {
-            double ure = U_re[k_new * D + k_old];
-            double uim = U_im[k_new * D + k_old];
-            if (ure*ure + uim*uim < 1e-30) continue;
-
-            double tre = ure * old_re[e] - uim * old_im[e];
-            double tim = ure * old_im[e] + uim * old_re[e];
-
-            basis_t new_bs = (basis_t)k_new * TNS4D_C8 + bond_part;
-
-            /* Try to accumulate */
-            int found = 0;
-            for (size_t i = 0; i < ntmp; i++) {
-                if (tmp[i].basis == new_bs) {
-                    tmp[i].re += tre;
-                    tmp[i].im += tim;
-                    found = 1;
-                    break;
-                }
-            }
-            if (!found && ntmp < cap) {
-                tmp[ntmp].basis = new_bs;
-                tmp[ntmp].re = tre;
-                tmp[ntmp].im = tim;
-                ntmp++;
-            }
-        }
-    }
-
-    free(old_bs); free(old_re); free(old_im);
-
-    /* Write back (sparse) */
-    r->num_nonzero = 0;
-    for (size_t i = 0; i < ntmp; i++) {
-        if (tmp[i].re*tmp[i].re + tmp[i].im*tmp[i].im < 1e-30) continue;
-        if (r->num_nonzero < 4096) {
-            r->entries[r->num_nonzero].basis_state = tmp[i].basis;
-            r->entries[r->num_nonzero].amp_re = tmp[i].re;
-            r->entries[r->num_nonzero].amp_im = tmp[i].im;
-            r->num_nonzero++;
-        }
-    }
-    free(tmp);
+    /* Mirror to triality site */
+    if (g->tri_sites)
+        tri_site_apply_gate(&g->tri_sites[site], U_re, U_im);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
