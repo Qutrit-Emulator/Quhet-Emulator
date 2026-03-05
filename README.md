@@ -2,1554 +2,314 @@
 HEAP COMPILE. Otherwise you will get segfault!
 </p>
 
-<p align="center">
-Notice to those cloning this
-</p>
-<p align="center">
-If there is a test folder, it is stable; if there is no test folder it is being actively updated.
-</p>
+# HexState 3.6
 
-<p align="center">
-Hardware requirements
-</p>
-<p align="center">
-This was developed on a 14th generation i7 CPU with a 33MB + 28MB L2 cache(cache size matters), use this as a reference for V3's hardware requirements. 
-</p>
-<p align="center">
-This utility will NOT function on ARM CPUs, for now.. because they use a somewhat different instruction set. 
-</p>
+**A D=6 hexagonal quantum simulator.**
 
-<p align="center">
-  <a href="bitcoin:bc1qw98uqm5vr3p6upudm97dpevejgjpmx8mgw6cvt"><img src="https://img.shields.io/badge/Donate_BTC-bc1qw98uqm5vr3p6upudm97dpevejgjpmx8mgw6cvt-f7931a?logo=bitcoin&style=for-the-badge" alt="Donate Bitcoin"></a>
-</p>
+HexState operates in a native 6-state ("quhit") basis instead of the conventional 2-state qubit. Every quhit carries 6 complex amplitudes (96 bytes). Entangled pairs carry 36 (576 bytes). Memory scales as O(N + P) — polynomial in the number of quhits and pairs — never exponential.
 
-<p align="center">
-  <strong>⬡ HEXSTATE ENGINE V3.3</strong>
-</p>
-
----
-
-<p align="center">
-An Open Letter to others
-</p>
-On the off-chance you didn't already incorporate my code in some form in your project, feel free to take whatever you need from it if it can improve your software. 
-
-I am uninterested in selling it or receiving any form of credit; that is why it is available under the MIT license.
-
-I realize I didn't include explicit license headers in the source files of my project, just the README specifying MIT. So I am going to go ahead now and explicitly grant you complete permission to use it as you see fit.
-
-
-## What Is This?
-
-HexState Engine V3.3 is a quantum processor engine that operates on **quhits** — 6-dimensional quantum units (D=6) — instead of traditional qubits (D=2). V3.3 extends the architecture from 1D–3D tensor networks to a complete **2D–6D tensor network hierarchy**, adds **analytic Gauss sum amplitude resolution**, **factored Cooley–Tukey DFT₆**, **sparse power-iteration SVD**, **lazy evaluation with statistics tracking**, and a **6-component optimization engine** that enables classically intractable simulations (10³⁹⁸ dimensions) on a single CPU core. It achieves **linear memory scaling** and **constant-time gate operations** via a **"Matching + Local States"** strategy.
-
-### Key Properties
-
-| Property | Value |
-|---|---|
-| **Dimension** | D = 6 (six basis states per quhit) |
-| **Memory per quhit** | 96 bytes (6 complex amplitudes) |
-| **Memory per entangled pair** | 576 bytes (36 complex amplitudes) |
-| **Gate complexity** | O(D²) = O(36) per operation |
-| **Memory scaling** | O(N + P) where P = entangled pairs |
-| **Max quhits** | 262,144 (`MAX_QUHITS`, 256K) |
-| **Max entangled pairs** | 262,144 (`MAX_PAIRS`, 256K) |
-| **Max registers** | 16,384 (`MAX_REGISTERS`) |
+Built entirely in standalone C99. No external dependencies beyond the standard library and `libm`. OpenMP parallelism where available, SSE2 intrinsics where beneficial.
 
 ---
 
 ## Architecture
 
-### The Quhit
-
-A **quhit** is a 6-level quantum system. Each quhit stores 6 complex amplitudes — 12 doubles — in exactly **96 bytes**:
-
-```c
-typedef struct {
-    double re[6];   // real parts
-    double im[6];   // imaginary parts
-} QuhitState;       // 96 bytes, inline, no heap
 ```
-
-The 6 basis states `|0⟩` through `|5⟩` span a Hilbert space of dimension D=6 per quhit. The generalized Hadamard is the **DFT₆** (discrete Fourier transform over ℤ₆), and the phase gate uses roots of unity **ω = e^(2πi/6)**.
-
-### Pairwise Entanglement
-
-When two quhits entangle, the engine allocates a flat **joint state** of D×D = 36 complex amplitudes in exactly **576 bytes**:
-
-```c
-typedef struct {
-    double re[36];  // re[a*6 + b]
-    double im[36];  // row-major: subsystem A × subsystem B
-} QuhitJoint;       // 576 bytes, inline
+┌────────────────────────────────────────────────────────┐
+│                    Applications                        │
+│   MIPT Sweep · QCD Simulation · Entangled Factoring    │
+├────────────────────────────────────────────────────────┤
+│              Tensor Network Overlays                   │
+│   MPS (1D) · PEPS (2D) · TNS (3D · 4D · 5D · 6D)     │
+├────────────────────────────────────────────────────────┤
+│              Vesica Fold Factorization                 │
+│   Geometric SVD replacement for antipodal-symmetric    │
+│   states — lossless, O(1) for product states           │
+├────────────────────────────────────────────────────────┤
+│              Triality Engine                           │
+│   5-view lazy conversion · Flat auto-promote/demote    │
+│   Lazy gate chains · SVD spectrum oracle               │
+├────────────────────────────────────────────────────────┤
+│              Core Quhit Engine                         │
+│   DFT₆ · CZ · Born-rule · Registers · Substrate       │
+│   Self-calibration · S₆ exotic · BigInt · Gauss sums   │
+└────────────────────────────────────────────────────────┘
 ```
-
-The empirical model encoded in this engine:
-
-> **Reality enforces strict pairwise monogamy.** A quhit can be entangled with at most one partner. Re-entangling forces disentanglement from the old partner. Entanglement is always maximal (Schmidt rank = D = 6) or absent. There is no partial entanglement.
-
-This means N quhits with P entangled pairs consume `N × 96 + P × 576` bytes — **always linear in N**.
-
-### Three-Body Entanglement (V3.3)
-
-V3.3 extends monogamous pairwise entanglement to **genuine three-body (tripartite) entanglement** via `quhit_triadic.h/.c`. Three quhits share a joint state of D×D×D = 216 complex amplitudes:
-
-```c
-typedef struct {
-    double re[216];   // re[a*36 + b*6 + c]
-    double im[216];   // Three-quhit joint state
-} TriadicJoint;       // 3456 bytes
-```
-
-The D=6 basis decomposes into three **CMY channels**, each a qubit subspace:
-
-| Channel | Basis States | Color |
-|---|---|---|
-| **C** (Cyan) | {0, 1} | Binary face |
-| **M** (Magenta) | {2, 3} | Middle ring |
-| **Y** (Yellow) | {4, 5} | Hot ring |
-
-Key operations:
-
-| Function | Description |
-|---|---|
-| `quhit_triadic_bell` | Triadic Bell: (1/√6) Σ\|k,k,k⟩ — all three collapse identically |
-| `quhit_triadic_product` | Product: \|ψ_a⟩ ⊗ \|ψ_b⟩ ⊗ \|ψ_c⟩ — separable until entangled |
-| `quhit_triadic_cz3` | Three-body CZ: \|a,b,c⟩ → ω^(a·b·c) \|a,b,c⟩ |
-| `quhit_triadic_channel_cz` | Per-channel CZ within one CMY channel |
-| `quhit_triadic_apply_dft` | DFT₆ on one leg of the triple |
-| `quhit_triadic_disentangle` | Dissolve triple, extract marginals |
-
-Memory cost: **3456 bytes per triple** — still O(N), still fits in L1 cache.
-
-### Memory Model
-
-```
-┌──────────────────────────────────────────────────────────┐
-│                    QuhitEngine                           │
-├──────────────────────────────────────────────────────────┤
-│  Quhit[0]    96 B   ─┐                                  │
-│  Quhit[1]    96 B   ─┤── Pair[0]  576 B                 │
-│  Quhit[2]    96 B   ─┐                                  │
-│  Quhit[3]    96 B   ─┤── Pair[1]  576 B                 │
-│  ...                                                     │
-│  Quhit[N-1]  96 B                                        │
-├──────────────────────────────────────────────────────────┤
-│  Total: O(N) — never O(6^N)                              │
-└──────────────────────────────────────────────────────────┘
-```
-
-### Magic Pointers
-
-Magic Pointers are tagged 64-bit identifiers used for internal quhit addressing within registers:
-
-```c
-#define MAGIC_TAG           0xBEEF
-#define MAGIC_PTR(chunk, k) (((uint64_t)MAGIC_TAG << 48) | \
-                              ((uint64_t)(chunk) << 16) | (k))
-```
-
-Each register is assigned a `magic_base` derived from its chunk ID, providing a consistent addressing scheme across register operations.
-
-### Quhit Registers
-
-A `QuhitRegister` groups quhits into a logical collection with support for bulk operations like GHZ entanglement, DFT, CZ, and measurement. Registers operate on a **sparse amplitude representation** — only nonzero basis entries are stored — enabling operations on structured states like GHZ without materializing the full D^N state vector.
-
-Key register capabilities:
-- **GHZ entanglement** via chained Bell pairs with a sliding two-quhit window
-- **Streaming state vector access** — `quhit_reg_sv_get()` computes amplitudes on-the-fly
-- **Partial trace** to any single quhit position
-- **Inner product** between registers via sparse entry matching
-- **Gauss sum integration** — analytic amplitude resolution for DFT+CZ circuits
 
 ---
 
-## Tensor Network Hierarchy — 2D through 6D
+## Core Engine
 
-For circuits requiring N-body entanglement beyond strict pairwise bonds, V3 provides **six** tensor network representations spanning 1D through 6D. All use **Magic Pointer registers** for RAM-agnostic storage with **sparse power-iteration SVD** for 2-site gates.
+| File | Role |
+|------|------|
+| `quhit_engine.h` | Master header. Architecture constants. Data structures. |
+| `quhit_core.c` | Engine lifecycle, PRNG (LCG, deterministic, reproducible). |
+| `quhit_gates.c` | DFT₆ (precomputed twiddle table — no trig at runtime), CZ, X (cyclic shift), Z (diagonal phase), arbitrary 6×6 unitaries. Entangled-pair gates operate on the 36-element joint state directly. |
+| `quhit_measure.c` | Born-rule sampling with collapse. Entangled measurement computes marginal probabilities, partially collapses the joint state, and auto-determines the partner's state. Non-destructive inspection (probabilities, entropy, purity). |
+| `quhit_entangle.c` | Bell-pair creation (braid), disentanglement (unbraid), product-state preparation. |
+| `quhit_register.c` | 100-trillion-scale registers. GHZ entanglement across arbitrary N quhits via a chained Bell-pair sliding window — at most 768 bytes live at any time regardless of N. Bulk rules, DFT, measurement, sparse amplitude readout. |
 
-### Architecture: Hybrid Storage + Computation
+### Side-Channel Primitives (header-only)
 
-| Layer | Where | Persistent? |
-|---|---|---|
-| **Tensor data** | Register sparse entries (Magic Pointer) | ✅ RAM-agnostic |
-| **SVD computation** | Heap-allocated dense buffers | ❌ Freed after each gate |
-| **Bond weights** | Classical arrays (λ) | ✅ O(χ) per bond |
-
-Each 2-site gate performs: **Register Read → Dense Contraction → Gate Application → SVD → Truncate to χ → Register Writeback**.
-
-### Network Specifications
-
-| Network | Tensor Indices | Bonds/Site | χ | Encoding |
-|---|---|---|---|---|
-| **MPS (1D)** | `\|k, α, β⟩` | 2 | 512 | k·χ² + α·χ + β |
-| **PEPS 2D** | `\|k, u, d, l, r⟩` | 4 | 512 | k·χ⁴ + u·χ³ + d·χ² + l·χ + r |
-| **PEPS 3D** | `\|k, u, d, l, r, f, b⟩` | 6 | 256 | k·χ⁶ + u·χ⁵ + ... + b |
-| **PEPS 4D** | `\|k, u, d, l, r, f, b, i, o⟩` | 8 | 128 | k·χ⁸ + ... + o |
-| **PEPS 5D** | `\|k, b₀..b₉⟩` | 10 | 128 | k·χ¹⁰ + ... (basis_t 128-bit) |
-| **PEPS 6D** | `\|k, b₀..b₁₁⟩` | 12 | 128 | k·χ¹² + ... (basis_t 128-bit) |
-
-### Scale Reference
-
-| Network | Example Grid | Quhits | Hilbert Space |
-|---|---|---|---|
-| MPS | 64-site chain | 64 | 6⁶⁴ ≈ 10⁵⁰ |
-| PEPS 2D | 8×8 | 64 | 6⁶⁴ ≈ 10⁵⁰ |
-| PEPS 3D | 4×4×4 | 64 | 6⁶⁴ ≈ 10⁵⁰ |
-| PEPS 4D | 3⁴ | 81 | 6⁸¹ ≈ 10⁶³ |
-| PEPS 5D | 3⁵ | 243 | 6²⁴³ ≈ 10¹⁸⁹ |
-| PEPS 6D | 3⁶ | 729 | 6⁷²⁹ ≈ 10⁵⁶⁷ |
-
-> **PEPS 4D, 5D, and 6D are world-first implementations** of higher-dimensional PEPS tensor networks on consumer hardware.
-
-### Lazy Evaluation Engine (MPS)
-
-The MPS overlay includes a full **lazy evaluation engine** that defers gate application until measurement:
-
-```c
-typedef struct {
-    uint64_t gates_queued;        // Total gates submitted
-    uint64_t gates_materialized;  // Gates actually applied
-    uint64_t gates_fused;         // Consecutive same-site gates merged
-    uint64_t gates_skipped;       // Gates never applied (site unmeasured)
-    uint64_t sites_total;         // Total sites in chain
-    uint64_t sites_allocated;     // Sites with real tensor data
-    uint64_t sites_lazy;          // Sites still virtual (implicit |0⟩)
-} LazyStats;
-```
-
-Evidence for **"reality computes on demand"**: sites that are never measured never materialize, and consecutive same-site gates fuse into a single matrix multiply.
-
-### SVD Methods
-
-V3.3 provides two SVD implementations in `tensor_svd.h`:
-
-| Method | Function | Use Case |
-|---|---|---|
-| **Jacobi eigendecomposition** | `tsvd_truncated()` | Dense matrices, small χ |
-| **Sparse power iteration** | `tsvd_sparse_power()` | Large sparse tensors, high χ |
-
-The sparse power-iteration SVD operates directly on sparse register entries via `TsvdSparseEntry` format, avoiding materialization of the full dense matrix. Includes Modified Gram-Schmidt QR orthogonalization and Rayleigh-quotient refinement.
+| File | Contents |
+|------|----------|
+| `arithmetic.h` | IEEE-754 constants reverse-engineered from substrate probing. Mantissa widths, exponent biases, magic numbers for fast inverse sqrt and log₂. |
+| `born_rule.h` | Born-rule sampling utilities, fast inverse square root. |
+| `statevector.h` | Cache-aligned state vector storage layouts. |
+| `superposition.h` | Precomputed DFT₆ twiddle tables, superposition utilities. |
+| `entanglement.h` | Joint-state operations, Bell states, partial trace. |
+| `quhit_management.h` | Per-quhit state management, entanglement lifecycle. |
+| `quhit_gauss.h` | Analytic Gauss sum amplitude resolver. Evaluates exact amplitudes for DFT₆+CZ circuits in O(N) time with zero storage. |
 
 ---
 
-## V3.3 Optimization Engine
+## Triality Engine
 
-V3.3 introduces a **6-component optimization engine** that collectively enables simulations on Hilbert spaces of 10³⁹⁸ dimensions using a single CPU core. Each optimization is independent but composable — enabling them together produces multiplicative speedups.
+The Triality Quhit (`quhit_triality.h` / `quhit_triality.c`) is a quantum primitive based on three mutually-defining geometric views:
 
-### Optimization #1 — Substrate Opcode Warm-Starting
+| View | Basis | Cheap operations |
+|------|-------|-----------------|
+| **Edge** | Computational | Phase gates O(D) |
+| **Vertex** | Fourier (DFT₆) | Shift gates O(D) |
+| **Diagonal** | Conjugate Fourier | Conjugate ops O(D) |
+| **Folded** | Antipodal fold | Vesica/wave decomposition |
+| **Exotic** | Syntheme-parameterized | S₆ outer automorphism |
 
-The substrate ISA's 20 opcodes generate frequently-reused unitary matrices. Warm-starting caches these matrices across Trotter steps, eliminating redundant gate construction.
+Gates automatically execute in their cheapest view with lazy conversion between views. Average gate cost: O(12) instead of O(36). Enhancement flags track eigenstates, active masks, and real-valuedness for further fast-paths.
 
-### Optimization #2 — Self-Calibrating Physical Constants
+### Flat Quhit (`flat_quhit.h`)
 
-**File**: `quhit_calibrate.h/.c`
+Three-tier representation with automatic promotion and demotion:
 
-All physical constants (π, √2, 1/√6, etc.) are derived at runtime from the FPU's actual behavior rather than hardcoded. The `CalibrationTable` stores 20+ constants computed from first principles at engine initialization:
+- **`FLAT_BASIS`**: Single basis state |k⟩ with phase. X, Z, CZ, measure all O(1).
+- **`FLAT_SUBSPACE`**: 2–3 active states. Operations O(active_count²).
+- **`QUANTUM_FULL`**: Full TrialityQuhit. All operations O(D) or O(D²).
 
-```c
-CalibrationTable CAL;
-calibrate_all(&CAL);
-double pi = cal_get(&CAL, CAL_PI_OVER_4) * 4.0;
-double inv_sqrt6 = cal_get(&CAL, CAL_INV_SQRT6);
-```
+Promotion occurs when a gate creates complexity (e.g., DFT on a basis state). Demotion occurs when the result collapses to a structurally simple form (e.g., after measurement).
 
-This eliminates platform-dependent constant errors and ensures machine-precision accuracy across all architectures.
+### Lazy Gate Chains (`quhit_lazy.h` / `quhit_lazy.c`)
 
-### Optimization #3 — Lazy Gate Evaluation Chain
+Every gate is *recorded*, not executed. The chain accumulates as a single compressed 6×6 unitary. Only measurement forces resolution. N gates resolve in one matrix-vector multiply instead of N. Throughput: **>10 million gates/sec**.
 
-**File**: `quhit_lazy.h/.c`
+Fast paths: diagonal∘diagonal = O(6), DFT∘IDFT = identity (skip), X⁶ = identity (skip).
 
-Gates are composed algebraically before application. The `LazyChain` accumulates sequential unitaries via matrix multiplication, resolving the composed result only when an observation is needed:
+### SVD Spectrum Oracle (`quhit_svd_gate.h` / `quhit_svd_gate.c`)
 
-```c
-LazyChain chain;
-lazy_init(&chain, D);
-lazy_compose(&chain, gate_A);       // Queue — no computation
-lazy_compose_diagonal(&chain, gate_B); // Fast path for phase gates
-lazy_resolve(&chain, state);          // Apply composed U = B·A
-```
+The SVD is the most expensive operation in tensor network contraction. The oracle inspects the *gate log* — which gates produced the current bond state — and returns the SVD result analytically when the pattern is recognized:
 
-- **Gate cancellation**: U·U† = I detected automatically, gate pair eliminated
-- **Identity short-circuit**: If accumulated matrix is identity, skip entirely
-- **Diagonal fast path**: Phase gates composed via element-wise multiply (O(D) instead of O(D²))
+- **Identity** → skip entirely
+- **DFT₆ on Bell pair** → Pattern A (identity spectrum)
+- **CZ on |+⟩⊗|+⟩** → Pattern B (rank-3 paired)
+- **Phase gate** → diagonal SVD
 
-### Optimization #4 — Gate-Aware SVD Short-Circuit
-
-**File**: `quhit_svd_gate.h/.c`
-
-The gate log (`GateLog`) records the sequence of gates applied at each bond. The `glog_analyze()` function predicts whether the upcoming SVD will produce significant singular value changes. If the gate sequence is known to preserve bond structure (e.g., diagonal gates, identity compositions), the expensive SVD is skipped entirely.
-
-```c
-GateLog gl;
-glog_init(&gl, max_entries);
-glog_push(&gl, gate_type, site, params);  // Record gate
-int skip = glog_analyze(&gl);              // Predict SVD outcome
-if (!skip) { /* do SVD */ }
-```
-
-Achieves **up to 100% SVD skip rate** on structured circuits where gate sequences are predictable.
-
-### Optimization #5 — Adaptive PEPS Growth
-
-**File**: `quhit_peps_grow.h/.c`
-
-Higher-dimensional tensor networks (2D–6D) start with minimal bond dimension and grow adaptively based on measured entanglement. Sites that develop significant entanglement get larger bond dimensions; sites that remain near-product states stay compact.
-
-### Optimization #6 — Dynamic Chain Growth (DynChain)
-
-**File**: `quhit_dyn_integrate.h/.c`
-
-The most impactful optimization. The `DynChain` tracks the **active region** of an MPS chain — the contiguous set of sites with significant entanglement. Sites outside this region are dormant (product states) and **all gate operations on them are skipped**.
-
-```c
-DynChain dc = dyn_chain_create(N);
-dyn_chain_seed(&dc, start, end);          // Initial active window
-
-for (int step = 0; step < steps; step++) {
-    for (int i = 0; i < N; i++) {
-        if (!dyn_chain_is_active(&dc, i)) continue;  // Skip dormant
-        apply_gate(i);
-    }
-    dyn_chain_update_entropy(&dc, boundary, probs, D);
-    dyn_chain_step(&dc);  // Grow/contract based on entropy
-}
-```
-
-**Key properties**:
-- **Zero information loss**: Dormant sites are in product states — applying gates to them changes nothing measurable (see [Locality Guarantee](#dynchain-locality-guarantee))
-- **Runtime scales with entanglement, not system size**: A 2048-site chain with 40 active sites runs as fast as a 40-site chain
-- **Automatic Lieb-Robinson tracking**: The active region grows at the speed of entanglement propagation — the quantum light cone
-
-#### DynChain Performance
-
-| Chain Size | Active Sites | Gates Skipped | Speedup |
-|---|---|---|---|
-| 32 | 32 | 0% | 1.0× |
-| 128 | ~40 | 69% | 3.2× |
-| 512 | ~40 | 92% | 12.8× |
-| 2048 | ~40 | 98% | **54.3×** |
-
-> Runtime is **constant** regardless of total chain length — the DynChain converts an O(N) algorithm into O(ξ) where ξ is the correlation length.
-
-#### DynChain Locality Guarantee
-
-The DynChain loses **zero** information because of quantum locality:
-
-1. **Entanglement propagates at finite speed** (Lieb-Robinson bound). At any finite time, only a finite region is entangled.
-2. **Dormant sites are in product states** (|0⟩ or |+⟩) with no entanglement to the active core.
-3. **Applying a gate to a disconnected product-state site changes no correlated observable.**
-4. **The growth mechanism monitors boundary entropy** — if entanglement reaches the edge, the region expands before information is lost.
-
-The DynChain doesn't approximate the physics. It recognizes that the physics isn't there yet.
-
-### Combined Optimization Impact
-
-| Optimization | Saves | Mechanism |
-|---|---|---|
-| Warm-Starting | Gate construction time | Cache reuse |
-| Self-Calibration | Constant errors | Runtime derivation |
-| Lazy Evaluation | Redundant gate applications | Algebraic composition |
-| SVD Short-Circuit | Expensive SVD computations | Gate-sequence prediction |
-| Adaptive Growth | Memory on low-entanglement sites | Entropy-driven sizing |
-| **DynChain** | **All computation on dormant sites** | **Active region tracking** |
-
-All six optimizations compose: the lazy chain composes gates, the SVD short-circuit skips decompositions, and the DynChain skips entire sites — reducing a 512-site simulation to ~40 active sites with 100% SVD skip rate and lazy gate cancellation.
+This is exact, not an approximation. O(1) instead of O(n³).
 
 ---
 
-## Factored DFT₆ — Cooley–Tukey Z₂ × Z₃ Decomposition
+## S₆ Outer Automorphism (`s6_exotic.h` / `s6_exotic.c`)
 
-V3 introduces a **factored architecture** (`quhit_factored.h`) that decomposes D=6 into three orthogonal square planes via the Chinese Remainder Theorem:
+S₆ is the *only* symmetric group possessing a non-trivial outer automorphism. HexState implements the full automorphism φ over all 720 permutations, the 15 synthemes (partitions of {0,…,5} into 3 unordered pairs), and the 6 synthematic totals.
 
-```
-k → (s = k mod 3, p = k / 3)
-
-k=0 → (Plane 0, even)    k=3 → (Plane 0, odd)
-k=1 → (Plane 1, even)    k=4 → (Plane 1, odd)
-k=2 → (Plane 2, even)    k=5 → (Plane 2, odd)
-```
-
-The DFT₆ is decomposed via **Cooley–Tukey** (6 = 2 × 3) into three stages:
-
-1. **I₃ ⊗ DFT₂** — Hadamard on each plane's parity (independent, parallel)
-2. **T₆** — Twiddle factors ω₆^(s·p) (2 non-trivial phases)
-3. **DFT₃ ⊗ I₂** — DFT₃ across the three square planes
-
-This reduces the 6×6 DFT to independent 2×2 and 3×3 operations with lazy plane derivation — planes that share twiddle state need not be recomputed until measured.
+The omnidirectional fold enables lossless basis changes parameterized by any of the 15 synthemes, not just the default antipodal pairing {(0,3),(1,4),(2,5)}.
 
 ---
 
-## Analytic Gauss Sum Amplitudes
+## Vesica Fold Factorization (`tensor_svd.h`)
 
-V3 includes an **O(N) analytic amplitude resolver** (`quhit_gauss.h`) for DFT₆ + CZ-chain + DFT₆ circuits:
+A geometric replacement for numerical SVD in the tensor network overlays. The Vesica fold pairs physical indices (k, k+3) into convergent (vesica) and divergent (wave) components:
 
-```c
-// Exact amplitude for output basis state j[0..N-1]:
-gauss_amp_line(j, N, &re, &im);
-
-// Log-polar version (no underflow for any N):
-gauss_amp_line_log(j, N, &phase, &log2_mag);
+```
+vesica[j] = (ψ[k] + ψ[k+3]) / √2    (symmetric)
+wave[j]   = (ψ[k] − ψ[k+3]) / √2    (antisymmetric)
 ```
 
-Derived by integrating the quadratic Gauss sum right-to-left:
+Three factorization paths:
 
-$$A(\mathbf{j}) = \frac{1}{6^N} \sum_{\mathbf{k} \in \mathbb{Z}_6^N} \omega_6^{\sum k_i k_{i+1} + \sum k_i j_i}$$
+| Path | Condition | Method | Cost |
+|------|-----------|--------|------|
+| **Vesica Direct** | wave < 1% | Per-pair geometric block decomposition — no SVD | O(9) for product states |
+| **Vesica + miniSVD** | wave ≥ 1% | SVD on the folded (4× smaller) matrix | ~75% savings |
+| **Bypass** | D ≠ 6 | Standard Jacobi SVD | Full |
 
-- **Zero storage** — no matrices, no vectors, just arithmetic
-- **Machine-precision exact** — verified against brute force for N=2..7
-- **Odd-N constraint detection** — automatically identifies forbidden output states
+For the common case of antipodal-symmetric states, the fold provides an exact, lossless factorization with zero numerical SVD calls. Scalar blocks (1×1) use trivial arithmetic; 2×2 blocks use analytic closed-form SVD; larger blocks use tiny Jacobi on matrices typically 3×3 to 8×8.
 
 ---
 
-## Side-Channel Primitives
+## Tensor Network Overlays
 
-The engine's low-level operations are implemented as header-only side-channel primitives, each derived from empirical measurement:
+All overlays use a **Magic Pointer** architecture — no classical dense tensor arrays. Each site's register directly encodes a multi-index state |k, α, β, …⟩ into the core engine.
 
-### `arithmetic.h` — IEEE-754 Constants
+| Tier | File | Topology | Typical grid | Bond encoding |
+|------|------|----------|-------------|---------------|
+| **1D MPS** | `mps_overlay.c/.h` | Chain | L sites | |k, α, β⟩ with χ=256 |
+| **2D PEPS** | `peps_overlay.c/.h` | Square lattice | Nx × Ny | |k, α, β, γ, δ⟩ (4 bonds) |
+| **3D TNS** | `peps3d_overlay.c/.h` | Cubic | X × Y × Z | 6 bonds per site |
+| **4D TNS** | `peps4d_overlay.c/.h` | Tesseractic | Hypercubic | 8 bonds per site |
+| **5D TNS** | `peps5d_overlay.c/.h` | 5-orthoplex | 2⁵ grids | 10 bonds per site |
+| **6D TNS** | `peps6d_overlay.c/.h` | 6D hexeractic | 2⁶ grids | 12 bonds per site |
 
-| Constant | Value | Usage |
-|---|---|---|
-| `MAGIC_ISQRT_DOUBLE` | `0x5FE6EB3BD314E41A` | Fast inverse sqrt (Quake III style, double precision) |
-| `MAGIC_RECIP_DOUBLE` | `0x7FDE623822FC16E6` | Fast reciprocal via bit hack |
-| `MAGIC_SQRT_DOUBLE` | `0x1FF7A7EF9DB22D0E` | Fast square root approximation |
-| `MAGIC_LOG2_FLOAT` | `0x3F800000` | Fast log₂ via float bit reinterpretation |
+Each overlay provides:
+- Product state initialization
+- 1-site gate application (physical index)
+- 2-site bond gate application (with SVD/Vesica truncation)
+- Local density readout
+- Triality sidecar integration via `triality_overlay.h`
 
-### `born_rule.h` — Measurement & Collapse
+### Triality Overlay Integration (`triality_overlay.h`)
 
-| Function | Description |
-|---|---|
-| `born_prob_exact(re, im)` | Exact probability: re² + im² |
-| `born_prob_fast(re, im)` | Bit-hack \|z\|² approximation |
-| `born_fast_isqrt(x)` | Quake III `0x5FE6...` double variant |
-| `born_sample(re, im, dim, r)` | CDF sampling from \|ψ\|² |
-| `born_collapse(re, im, dim, k)` | Project onto \|k⟩ and renormalize |
-| `born_partial_collapse(...)` | Conditional projection |
-
-### `superposition.h` — DFT₆ with Hex-Exact Twiddles
-
-The DFT₆ uses precomputed twiddle factors stored as **exact hex bit patterns** — no `cos()`/`sin()` at runtime:
-
-```c
-// ω = e^(2πi/6), stored as exact IEEE-754 bits
-// cos(π/3) = 0x3FE0000000000000  (exactly 0.5)
-// sin(π/3) = 0x3FEBB67AE8584CAA  (√3/2)
-```
-
-### `entanglement.h` — Joint State Management
-
-| Function | Description |
-|---|---|
-| `ent_bell_state(js)` | Create (1/√D) Σ\|k,k⟩ |
-| `ent_product_state(js, a, b)` | Create \|ψ_a⟩ ⊗ \|ψ_b⟩ |
-| `ent_partial_trace_B(js, ρ)` | Compute Tr_B(\|ψ⟩⟨ψ\|) |
-| `ent_schmidt_rank(js)` | Count nonzero Schmidt values |
-| `ent_entropy(js)` | Entanglement entropy: −Σ λ log₂(λ) |
-
-### `statevector.h` — AoS Cache-Aligned Storage
-
-```c
-#define SV_ELEMENT_SIZE  16     // sizeof(Complex) = 2 × double
-#define SV_ALIGNMENT     64     // cache line boundary
-```
-
-### `tensor_product.h` — Empirical Findings
-
-1. **O(N) Memory** — Linear scaling, never exponential
-2. **Strict Pairwise Monogamy** — One partner at a time
-3. **Full Decoherence on Disentangle** — Partial trace yields maximally mixed state
-4. **Bond Dimension = D Always** — Maximal entanglement or none
-5. **GHZ = Constant Storage** — N-party GHZ = D amplitudes + a correlation rule
-6. **O(1) Gate Time** — Operations touch only local O(D²) amplitudes
-7. **Linear Total Memory** — O(N + P) where P = active pairs
+Every site carries a `TriOverlaySite` with a `TrialityQuhit` as its physical representation. Gates route through optimal views. Basis-state sites detected at O(1) permit diagonal 2-site gates to bypass the full Θ-matrix + SVD pipeline.
 
 ---
 
-## Gate Set
+## Dynamic Lattice Growth
 
-### Single-Quhit Gates
+### Entropy-Driven Breathing (`quhit_peps_grow.h` / `quhit_peps_grow.c`)
 
-| Gate | Operation | Implementation |
-|---|---|---|
-| **DFT₆** | Generalized Hadamard | Precomputed twiddle table, O(D²) |
-| **IDFT₆** | Inverse Fourier | Conjugate twiddles, O(D²) |
-| **X** | Cyclic shift: \|k⟩ → \|k+1 mod 6⟩ | Array rotation, O(D) |
-| **Z** | Phase: \|k⟩ → ω^k \|k⟩ | Precomputed ω table, O(D) |
-| **Phase** | Diagonal: \|k⟩ → e^(iφₖ) \|k⟩ | Per-element rotation, O(D) |
-| **Unitary** | Arbitrary D×D | Matrix-vector multiply, O(D²) |
+Sites are classified as **ACTIVE**, **BOUNDARY**, or **DORMANT** based on entanglement entropy. The lattice grows toward entanglement and contracts from emptiness — like a living system tracking the entanglement front.
 
-### Two-Quhit Gates
+- **Growth**: boundary site entropy > threshold → activate dormant neighbors
+- **Contraction**: active site entropy < threshold → site goes dormant
+- 90% memory savings for simulations where entanglement is localized
 
-| Gate | Operation | Notes |
-|---|---|---|
-| **CZ₆** | \|a,b⟩ → ω^(ab) \|a,b⟩ | Auto-creates product pair if not entangled |
+### Dynamic Integration (`quhit_dyn_integrate.h` / `quhit_dyn_integrate.c`)
 
-### Factored Gates (V3)
-
-| Gate | Operation | Notes |
-|---|---|---|
-| **DFT₂** | Hadamard on Z₂ sub-register | 6×6 matrix, acts on parity only |
-| **DFT₃** | DFT on Z₃ sub-register | 6×6 matrix, acts on plane only |
-| **CZ₂** | Z₂ controlled-phase | 36×36 diagonal, (−1)^(bit_A·bit_B) |
-| **CZ₃** | Z₃ controlled-phase | 36×36 diagonal, ω₃^(trit_A·trit_B) |
-
-### Entanglement Operations
-
-| Operation | Description | Storage |
-|---|---|---|
-| `quhit_entangle_bell` | Maximally entangled: (1/√6) Σ\|k,k⟩ | 576 bytes |
-| `quhit_entangle_product` | Tensor product: \|ψ_a⟩ ⊗ \|ψ_b⟩ | 576 bytes |
-| `quhit_disentangle` | Extract marginals, deactivate pair | Returns to 96 B each |
-
-### Measurement
-
-| Function | Description |
-|---|---|
-| `quhit_measure(eng, id)` | Born-rule sample + collapse (handles both local and entangled) |
-| `quhit_prob(eng, id, k)` | P(outcome = k) without collapsing |
-| `quhit_inspect(eng, id, snap)` | Non-destructive readout: probabilities, entropy, purity, Schmidt rank |
+Connects the dynamic lattice engine to all overlay tiers (1D–6D). Includes oracle infrastructure with convergence detection (converging / oscillating / stagnant).
 
 ---
 
-## Substrate ISA — 20 Empirical Opcodes
+## Substrate Opcodes (`substrate_opcodes.h` / `quhit_substrate.c`)
 
-The engine exposes a **20-opcode instruction set** derived from side-channel probing of the physical substrate.
+20 quantum gates organized into 6 topological families, derived from cross-probe side-channel analysis:
 
-| Hex | Opcode | Constant | Description |
-|---|---|---|---|
-| `0x00` | `SUB_NULL` | `0x00` | Project to vacuum \|0⟩ |
-| `0x01` | `SUB_VOID` | `0x0000` | Annihilate all amplitude |
-| `0x02` | `SUB_SCALE_UP` | `0x40` | Energy doubling (amp × 2) |
-| `0x03` | `SUB_SCALE_DN` | `0x3F` | Energy halving (amp × ½) |
-| `0x04` | `SUB_PARITY` | `0x80` | Spatial reflection \|k⟩→\|D-1-k⟩ |
-| `0x05` | `SUB_QUIET` | `0x08` | Decoherence (zero imag parts) |
-| `0x06` | `SUB_NEGATE` | `0x8000` | Global sign flip \|ψ⟩→-\|ψ⟩ |
-| `0x07` | `SUB_GOLDEN` | `0xE9` | Golden rotation R(2π/φ²) |
-| `0x08` | `SUB_DOTTIE` | `0x83` | Dottie rotation R(0.7391) |
-| `0x09` | `SUB_FUSE` | `0x37` | Fuse adjacent level pairs |
-| `0x0A` | `SUB_SCATTER` | `0xF3` | Random unitary from PRNG |
-| `0x0B` | `SUB_MIRROR` | `0x77` | Mirror: swap \|1⟩↔\|5⟩, \|2⟩↔\|4⟩ |
-| `0x0C` | `SUB_CLOCK` | `0x39` | Z³ half-rotation ω^(3k) |
-| `0x0D` | `SUB_SQRT2` | `0x51` | T-gate analog R(π/4) |
-| `0x0E` | `SUB_INVERT` | `0xFE` | Möbius amplitude inversion |
-| `0x0F` | `SUB_ATTRACT` | `0xF9` | Iterate toward FPU attractor |
-| `0x10` | `SUB_VACUUM` | `0x00000000` | Zero all 36 joint amplitudes |
-| `0x11` | `SUB_SATURATE` | `0x7F` | Clamp amplitudes to unit norm |
-| `0x12` | `SUB_COHERE` | `0xC6` | ω₆ coherence rotation (D=6 native) |
-| `0x13` | `SUB_DISTILL` | `0xA1` | φ-weighted phase amplification |
+| Family | Opcodes | Description |
+|--------|---------|-------------|
+| **Annihilation** | `NULL`, `VOID` | Project to vacuum, total erasure |
+| **Scaling** | `SCALE_UP`, `SCALE_DN`, `SATURATE` | Amplitude manipulation |
+| **Symmetry** | `PARITY`, `NEGATE`, `MIRROR` | Involutory transforms (P²=I) |
+| **Phase** | `GOLDEN` (φ), `DOTTIE`, `CLOCK` (ω), `SQRT2` | Transcendental phase gates |
+| **Coherence** | `QUIET` | Decoherence operator |
+| **Transform** | `FUSE` | Subspace projection |
+
+Warm-start caching detects repeated involutions and skips redundant computation.
+
+---
+
+## Self-Calibration (`quhit_calibrate.h` / `quhit_calibrate.c`)
+
+Every critical constant is *derived from first principles* at runtime and verified against its algebraic identity:
+
+- **φ** is not "1.618…" — it is the solution to x² = x + 1. Solved. Verified.
+- **Dottie** is not "0.739…" — it is the fixed point of cos(x). Iterated. Verified.
+- **ω₆** is not "0.5 + i·0.866…" — it is e^(2πi/6). Computed. Verified ω⁶ = 1.
+
+Five cross-validation identities are checked at boot. Cost: ~1μs.
+
+---
+
+## Additional Modules
+
+| File | Purpose |
+|------|---------|
+| `bigint.c/.h` | Arbitrary-precision integer arithmetic (mul, gcd, pow_mod, add). Used by the entangled factoring engine. |
+| `svd_truncate.h` | Register-level SVD entry truncation buffer. Caps to 4096 entries by magnitude. |
+| `tensor_network.h` | Shared tensor network constants and utilities. |
+| `tensor_product.h` | Tensor product and contraction primitives. |
+| `quhit_factored.h` | Factored state representations. |
+| `reality_scaled.c` | Scaled reality simulation experiments. |
 
 ---
 
 ## Building
 
-Pure C99 with no external dependencies. OpenMP support is optional but recommended.
+### Requirements
+
+- **C compiler** with C99 support (GCC recommended)
+- **libm** (math library)
+- **OpenMP** (optional, for parallelism)
+- **SSE2** (optional, for vectorized operations)
+
+### Compile the benchmark suite ("Heap")
 
 ```bash
-# V3.3 full build (all optimizations + tensor networks)
-gcc -O2 -I. your_experiment.c \
-    quhit_core.c quhit_gates.c quhit_measure.c \
-    quhit_entangle.c quhit_register.c quhit_substrate.c \
-    quhit_calibrate.c quhit_lazy.c quhit_svd_gate.c \
-    quhit_peps_grow.c quhit_dyn_integrate.c quhit_triadic.c \
-    mps_overlay.c peps_overlay.c peps3d_overlay.c \
-    peps4d_overlay.c peps5d_overlay.c peps6d_overlay.c \
-    -lm -o experiment
-
-# V3 build (no optimization engine)
-gcc -O2 -std=gnu11 -fopenmp your_experiment.c \
-    quhit_core.c quhit_gates.c quhit_measure.c \
-    quhit_entangle.c quhit_register.c quhit_substrate.c \
-    mps_overlay.c peps_overlay.c peps3d_overlay.c \
-    peps4d_overlay.c peps5d_overlay.c peps6d_overlay.c \
-    bigint.c -lm -o experiment
-
-# Minimal build (engine core only, no tensor networks)
-gcc -O2 -std=gnu11 your_experiment.c \
-    quhit_core.c quhit_gates.c quhit_measure.c \
-    quhit_entangle.c quhit_register.c bigint.c -lm -o experiment
-```
-
-### Dependencies
-
-**None.** Standard C library only (`<math.h>`, `<string.h>`, `<stdio.h>`, `<stdlib.h>`, `<stdint.h>`). OpenMP is optional (`-fopenmp`).
-
----
-
-## Quick Start
-
-### Basic Entanglement
-
-```c
-#include "quhit_engine.h"
-
-int main(void) {
-    QuhitEngine eng;
-    quhit_engine_init(&eng);
-
-    // Create two quhits in |0⟩
-    uint32_t q0 = quhit_init(&eng);
-    uint32_t q1 = quhit_init(&eng);
-
-    // Put q0 into superposition |+⟩ = (1/√6) Σ|k⟩
-    quhit_apply_dft(&eng, q0);
-
-    // Entangle via CZ — auto-creates product pair, applies ω^(ab) phases
-    quhit_apply_cz(&eng, q0, q1);
-
-    // Inspect (non-destructive)
-    QuhitSnapshot snap;
-    quhit_inspect(&eng, q0, &snap);
-    printf("Entropy: %.4f  Purity: %.4f  Schmidt rank: %d\n",
-           snap.entropy, snap.purity, snap.schmidt_rank);
-
-    // Measure (Born rule + collapse)
-    uint32_t result = quhit_measure(&eng, q0);
-    printf("Measured q0 = %u\n", result);
-
-    quhit_engine_destroy(&eng);
-    return 0;
-}
-```
-
-### MPS Circuit (Lazy Evaluation)
-
-```c
-#include "mps_overlay.h"
-
-int main(void) {
-    QuhitEngine eng;
-    quhit_engine_init(&eng);
-
-    int n = 100;
-    uint32_t *q = malloc(n * sizeof(uint32_t));
-    for (int i = 0; i < n; i++) q[i] = quhit_init(&eng);
-
-    // Initialize lazy MPS chain — sites allocated on demand
-    MpsLazyChain *lc = mps_lazy_init(&eng, q, n);
-    for (int i = 0; i < n; i++) mps_lazy_zero_site(lc, i);
-
-    // Build gate matrices
-    double U_re[36], U_im[36];
-    mps_build_dft6(U_re, U_im);
-    double G_re[36*36], G_im[36*36];
-    mps_build_cz(G_re, G_im);
-
-    // Queue gates (deferred — no computation yet)
-    for (int i = 0; i < n; i++)
-        mps_lazy_gate_1site(lc, i, U_re, U_im);
-    for (int i = 0; i < n - 1; i += 2)
-        mps_lazy_gate_2site(lc, i, G_re, G_im);
-
-    // Flush: materialize all gates (sparse power-iteration SVD)
-    mps_lazy_flush(lc);
-
-    // Print lazy evaluation statistics
-    mps_lazy_finalize_stats(lc);
-    lazy_stats_print(&lc->stats);
-
-    // Measure each site
-    for (int i = 0; i < n; i++) {
-        uint32_t outcome = mps_overlay_measure(&eng, q, n, i);
-        printf("Site %d: %u\n", i, outcome);
-    }
-
-    mps_lazy_free(lc);
-    free(q);
-    quhit_engine_destroy(&eng);
-    return 0;
-}
-```
-
-### Analytic Gauss Sum (V3)
-
-```c
-#include "quhit_gauss.h"
-
-int main(void) {
-    int N = 1000;  // 1000-quhit circuit
-    int j[1000];
-
-    // Set output basis state
-    for (int i = 0; i < N; i++) j[i] = i % 6;
-
-    // O(N) exact amplitude — no matrices, no storage
-    int phase;
-    double log2_mag;
-    gauss_amp_line_log(j, N, &phase, &log2_mag);
-
-    if (phase >= 0)
-        printf("Amplitude: ω₆^%d × 2^%.1f\n", phase, log2_mag);
-    else
-        printf("Amplitude: 0 (constraint violated)\n");
-
-    return 0;
-}
-```
-
-### 4D Self-Correcting Quantum Memory
-
-```c
-#include "peps4d_overlay.h"
-
-int main(void) {
-    Tns4dGrid *g = tns4d_init(3, 3, 3, 3);  // 3⁴ = 81 quhits
-
-    // Build recovery gate
-    double G_re[1296], G_im[1296];
-    // ... (build clock gate)
-
-    // Apply Trotter step across all 4 axes
-    tns4d_trotter_step(g, G_re, G_im);
-
-    // Measure local density
-    double probs[6];
-    tns4d_local_density(g, 1, 1, 1, 1, probs);
-
-    tns4d_free(g);
-    return 0;
-}
-```
-
----
-
-## How It Differs from V2 and V3
-
-| Aspect | V2 | V3 | V3.3 |
-|---|---|---|---|
-| **Max quhits** | 131,072 | 262,144 | **262,144** (256K) |
-| **Max pairs** | 32,768 | 262,144 | **262,144** (256K) |
-| **Max registers** | 256 | 16,384 | **16,384** |
-| **Tensor networks** | MPS + PEPS 2D + 3D | MPS + PEPS 2D–6D | MPS + PEPS 2D–6D + **DynChain** |
-| **MPS bond dim** | χ = 128 | χ = 512 | **χ = 512** |
-| **SVD method** | Jacobi only | Jacobi + sparse PI | + **gate-aware short-circuit** |
-| **DFT₆ variants** | Monolithic 6×6 | + Factored CT Z₂×Z₃ | + **self-calibrated constants** |
-| **Lazy evaluation** | Basic deferred gates | + statistics tracking | + **composition chain, cancellation** |
-| **Optimization engine** | None | None | **6-component system** |
-| **Max simulated** | ~10⁵⁰ | ~10⁵⁶⁷ | **~10³⁹⁸** (512 quhits, 1 core) |
-| **ITE ground state** | No | No | **Yes** (imaginary-time evolution) |
-| **Critical exponents** | No | No | **Yes** (DynChain-measured) |
-| **Basis type** | `uint64_t` | `basis_t` (128-bit) | **`basis_t` (128-bit `__int128`)** |
-
----
-
-## V3 Benchmarks
-
-### 7-Tier All-In-One Demonstration (`hexstate_allinone.c`)
-
-```bash
-gcc -O2 -I. -o hexstate_allinone Version-3-Benchmark/hexstate_allinone.c \
-    mps_overlay.c peps_overlay.c peps3d_overlay.c peps4d_overlay.c \
-    peps5d_overlay.c peps6d_overlay.c \
+gcc -O2 -march=native -o heap hexstate_benchmark.c \
     quhit_core.c quhit_gates.c quhit_measure.c quhit_entangle.c \
-    quhit_register.c -lm
-./hexstate_allinone
+    quhit_register.c quhit_substrate.c quhit_triality.c \
+    quhit_triadic.c quhit_lazy.c quhit_calibrate.c \
+    quhit_dyn_integrate.c quhit_peps_grow.c quhit_svd_gate.c \
+    s6_exotic.c bigint.c mps_overlay.c peps_overlay.c \
+    peps3d_overlay.c peps4d_overlay.c peps5d_overlay.c peps6d_overlay.c \
+    -lm -fopenmp -msse2
 ```
 
-| Tier | Overlay | χ | Sites | Hilbert | Physics |
-|---|---|---|---|---|---|
-| T0 | Engine | — | 100 | 10⁷⁸ | DFT₆ + CZ, measurement entropy |
-| T1 | MPS-1D | 512 | 64 | 10⁵⁰ | Lazy evaluation, Trotter evolution |
-| T2 | PEPS-2D | 512 | 64 | 10⁵⁰ | Lattice entropy after Trotter |
-| T3 | PEPS-3D | 256 | 64 | 10⁵⁰ | Magnetization + entropy on cube |
-| T4 | PEPS-4D | 128 | 81 | 10⁶³ | **Self-correcting quantum memory** |
-| T5 | PEPS-5D | 128 | 32 | 10²⁵ | **World first**: 5D PEPS |
-| T6 | PEPS-6D | 128 | 64 | 10⁵⁰ | **D=6 in 6 spatial dimensions** |
-
----
-
-## V3.3 Benchmarks
-
-### 512-Quhit Phase Transition (`hex512_phase_transition.c`)
-
-Simulates a D=6 quantum Potts model chain with **512 quhits** — a Hilbert space of 6⁵¹² ≈ **10³⁹⁸ dimensions** — on a single CPU core using MPS (χ=512) with all 6 optimizations.
+### Run
 
 ```bash
-gcc -O2 -I. -o hex512 V3.3-Test/hex512_phase_transition.c \
-    mps_overlay.c peps_overlay.c peps3d_overlay.c peps4d_overlay.c \
-    peps5d_overlay.c peps6d_overlay.c \
+./heap
+```
+
+Expected: **118/118 tests passed** across 21 sections covering every engine module.
+
+### Compile the MIPT sweep
+
+```bash
+gcc -O2 -march=native -o mipt mipt_sweep.c \
     quhit_core.c quhit_gates.c quhit_measure.c quhit_entangle.c \
-    quhit_register.c quhit_substrate.c quhit_calibrate.c \
-    quhit_svd_gate.c quhit_peps_grow.c quhit_dyn_integrate.c \
-    quhit_triadic.c quhit_lazy.c -lm
-./hex512
+    quhit_register.c quhit_substrate.c quhit_triality.c \
+    quhit_triadic.c quhit_lazy.c quhit_calibrate.c \
+    quhit_dyn_integrate.c quhit_peps_grow.c quhit_svd_gate.c \
+    s6_exotic.c bigint.c mps_overlay.c peps_overlay.c \
+    peps3d_overlay.c peps4d_overlay.c peps5d_overlay.c peps6d_overlay.c \
+    -lm -fopenmp -msse2
 ```
-
-| Metric | Value |
-|---|---|
-| **Quhits** | 512 |
-| **Hilbert space** | 6⁵¹² ≈ 10³⁹⁸ |
-| **Active sites (DynChain)** | ~39/512 (7.6%) |
-| **SVD skip rate** | 100% |
-| **Compression ratio** | 10³⁸⁸ : 1 |
-| **Runtime** | ~148 seconds |
-
-### MIPS Throughput Benchmark (`hex_mips_1d.c`)
-
-Measures gate throughput across chain sizes from 32 to 2048 sites, comparing vanilla Trotter vs. DynChain-optimized:
 
 ```bash
-gcc -O2 -I. -o hex_mips V3.3-Test/hex_mips_1d.c \
-    mps_overlay.c peps_overlay.c peps3d_overlay.c peps4d_overlay.c \
-    peps5d_overlay.c peps6d_overlay.c \
-    quhit_core.c quhit_gates.c quhit_measure.c quhit_entangle.c \
-    quhit_register.c quhit_substrate.c quhit_calibrate.c \
-    quhit_svd_gate.c quhit_peps_grow.c quhit_dyn_integrate.c \
-    quhit_triadic.c quhit_lazy.c -lm
-./hex_mips
+./mipt
 ```
 
-| N | Vanilla Time | DynChain Time | Speedup |
-|---|---|---|---|
-| 32 | 19.7s | 19.7s | 1.0× |
-| 128 | 80.2s | 20.0s | 4.0× |
-| 512 | 319s | 19.8s | 16.1× |
-| 2048 | 1076s | 19.8s | **54.3×** |
-
-> DynChain runtime is **constant** regardless of chain length — O(ξ) instead of O(N).
-
-### Ground State via ITE (`hex_ground_state.c`)
-
-Finds the ground state of the D=6 quantum clock model (H = -J Σ δ(sᵢ,sᵢ₊₁) - Γ Σ (X+X†)/2) using **imaginary-time evolution** on a 256-site MPS chain with DynChain:
-
-```bash
-gcc -O2 -I. -o hex_ground V3.3-Test/hex_ground_state.c \
-    mps_overlay.c peps_overlay.c peps3d_overlay.c peps4d_overlay.c \
-    peps5d_overlay.c peps6d_overlay.c \
-    quhit_core.c quhit_gates.c quhit_measure.c quhit_entangle.c \
-    quhit_register.c quhit_substrate.c quhit_calibrate.c \
-    quhit_svd_gate.c quhit_peps_grow.c quhit_dyn_integrate.c \
-    quhit_triadic.c quhit_lazy.c -lm
-./hex_ground
-```
-
-| Result | Value |
-|---|---|
-| **Chain length** | 256 sites |
-| **Ground state energy** | E₀ = -2.02 (J=0.1) to -3.61 (J=3.0) |
-| **Gates skipped by DynChain** | 89.7% (229,220 of 255,500) |
-| **DynChain phase detection** | ξ=49 (disordered) → ξ=45 (ordered) |
-| **Critical coupling** | J_c ≈ 0.808 |
-
-### Critical Exponent Extraction (`hex_critical_exponent.c`)
-
-Uses the DynChain's active region as a proxy for correlation length ξ to extract the critical exponent ν of the D=6 quantum clock model. Exact 2-site entropy calculations across 60 coupling values with 100 Trotter steps each.
-
-```bash
-gcc -O2 -I. -o hex_critical V3.3-Test/hex_critical_exponent.c \
-    mps_overlay.c peps_overlay.c peps3d_overlay.c peps4d_overlay.c \
-    peps5d_overlay.c peps6d_overlay.c \
-    quhit_core.c quhit_gates.c quhit_measure.c quhit_entangle.c \
-    quhit_register.c quhit_substrate.c quhit_calibrate.c \
-    quhit_svd_gate.c quhit_peps_grow.c quhit_dyn_integrate.c \
-    quhit_triadic.c quhit_lazy.c -lm
-./hex_critical
-```
-
-### IBM Eagle Ising Benchmark (`ibm_ising_benchmark.c`)
-
-Replicates IBM's Nature 2023 benchmark: *"Evidence for the utility of quantum computing before fault tolerance"*
-
-```bash
-gcc -O2 -I. -o ibm_ising_benchmark Version-3-Benchmark/ibm_ising_benchmark.c \
-    peps_overlay.c quhit_core.c quhit_gates.c quhit_measure.c \
-    quhit_entangle.c quhit_register.c -lm
-./ibm_ising_benchmark
-```
-
-| | **IBM Eagle** | **HexState V3** |
-|---|---|---|
-| **Hardware** | Quantum processor | Single CPU core |
-| **Qubits/Quhits** | 127 (D=2) | 64 (D=6) |
-| **Hilbert space** | 2¹²⁷ ≈ 10³⁸ | 6⁶⁴ ≈ 10⁵⁰ |
-| **Circuit depth** | 60 layers | 25 Trotter steps |
-| **2-qudit gates** | ~2,800 | 2,800 |
-| **Bond dimension** | N/A (noisy) | χ = 512 |
-| **Cost** | $1.60/s QPU | $0 (laptop) |
-
-### Condensed Matter Physics (Tensor Networks)
-
-HexState natively bypasses the Fermion Sign Problem, enabling both imaginary-time topological ground state search and real-time non-equilibrium unitary evolution.
-
-#### 2D Fermi-Hubbard Model & High-Tc Superconductivity
-
-| Experiment | Configuration | Phase Discovered |
-|---|---|---|
-| **Mott Insulator** | Half-filled (1 particle/site) | Suppression of Double Occupancy |
-| **Charge Density Waves** | 1/8 hole-doped | **Stripe Order** |
-| **Light-Induced Melting** | 1/8 hole-doped (Laser Pulse) | Dynamic melting of Stripe Order |
-| **d-Wave Superconductivity** | Boundary field pinned | **Proved ODLRO** (Macroscopic pure bulk pairing) |
-| **Strange Metal** | 1/8 hole-doped, 3D | Non-Fermi liquid, semi-delocalized disorder |
-
-#### 3D Non-Equilibrium & Topological Phases
-
-| Experiment | Physics Found | Scale |
-|---|---|---|
-| **3D Anderson Localization** | Exponential mapping of localized insulators | 6³ |
-| **3D Floquet Time Crystal** | Persistent subharmonic magnetization bounds | 6³ |
-| **Fracton X-Cube** | Exact Sub-Extensive Topological Defect Signal | 6³ |
-| **Real-Time Quantum Darwinism** | Objectivity emergence via Environmental Decoherence | 7³ |
-| **Holographic Traversable Wormhole** | Quantum teleportation through Einstein-Rosen bridge | 5³ |
-| **Wormhole Horizon Collapse** ★ | **World-first**: Mapped ER=EPR breaking point under decoherence | 3³ |
-
-### Quantum Supremacy Challenge (vs Google Willow)
-
-| | **Google Willow** | **HexState + Substrate ISA** |
-|---|---|---|
-| **Time** | < 5 minutes | **6.9 minutes** |
-| **Qubits/Qudits** | 105 qubits (D=2) | 105 qudits (D=6) |
-| **Hilbert space** | 2¹⁰⁵ ≈ 10³¹ | 6¹⁰⁵ ≈ **10⁸²** |
-| **Entanglement** | XEB ≈ 0.1% | **S(N/2) = 6.9960 ebits (99.9% of max)** |
-| **Cost** | ~$50M quantum processor | `gcc -fopenmp *.c -lm` |
-| **Gate set** | 4 gates | **22 gates** + 20 substrate opcodes |
-| **Memory** | N/A | **165 MB** |
+Sweeps measurement rate p ∈ [0, 1] across all six dimension tiers. Maps the measurement-induced phase transition from volume-law to area-law entanglement entropy.
 
 ---
 
-## CRT-Factored Gate Demonstration (`reality_scaled.c`)
-
-Demonstrates the Z₂ × Z₃ sub-register decomposition operating through the MPS pipeline:
-
-```bash
-gcc -O2 -std=gnu11 reality_scaled.c quhit_core.c quhit_gates.c \
-    quhit_measure.c quhit_entangle.c quhit_register.c mps_overlay.c \
-    bigint.c -lm -o reality_scaled
-./reality_scaled
-```
-
-The six D=6 basis states decompose via CRT into a **bit** (Z₂) and a **trit** (Z₃):
-- DFT₂ (Hadamard) acts on the bit sub-register, leaving trits unchanged
-- DFT₃ acts on the trit sub-register, leaving bits unchanged
-- CZ₂ applies (−1)^(bit_A · bit_B) conditional phase
-- CZ₃ applies ω₃^(trit_A · trit_B) conditional phase
-
-This factored structure reveals that D=6 quantum mechanics contains two **independent** but **entangled** sub-systems.
-
----
-
-## File Map
-
-```
-HexState-main/
-│
-│  ┌─ Core Engine ──────────────────────────────────────────────┐
-├── quhit_engine.h        Master header — structs, constants, API
-├── quhit_core.c          Engine lifecycle, PRNG (LCG), quhit init/reset
-├── quhit_gates.c         DFT₆, IDFT₆, CZ, unitary, phase, X, Z
-├── quhit_measure.c       Born-rule measurement, collapse, inspection
-├── quhit_entangle.c      Bell pairs, product pairs, disentangle
-├── quhit_register.c      Register ops, GHZ, streaming SV, heap buffers
-│  └────────────────────────────────────────────────────────────┘
-│
-│  ┌─ Tensor Networks (2D–6D, Register-Based SVD) ──────────────┐
-├── tensor_svd.h          Jacobi + sparse power-iteration SVD
-├── mps_overlay.h/.c      MPS 1D: χ=512, lazy evaluation engine
-├── peps_overlay.h/.c     PEPS 2D: χ=512, 5-index tensor
-├── peps3d_overlay.h/.c   PEPS 3D: χ=256, 7-index tensor
-├── peps4d_overlay.h/.c   PEPS 4D: χ=128, 9-index tensor ★
-├── peps5d_overlay.h/.c   PEPS 5D: χ=128, 11-index tensor ★
-├── peps6d_overlay.h/.c   PEPS 6D: χ=128, 13-index tensor ★
-│  └────────────────────────────────────────────────────────────┘
-│
-│  ┌─ V3.3 Optimization Engine ──────────────────────────────────┐
-├── quhit_calibrate.h/.c  Self-calibrating physical constants
-├── quhit_lazy.h/.c       Lazy gate evaluation chain (compose/cancel)
-├── quhit_svd_gate.h/.c   Gate-aware SVD short-circuit + gate log
-├── quhit_peps_grow.h/.c  Adaptive PEPS bond dimension growth
-├── quhit_dyn_integrate.h/.c  DynChain: active region tracking (1D–6D)
-│  └────────────────────────────────────────────────────────────┘
-│
-│  ┌─ Three-Body Entanglement ───────────────────────────────────┐
-├── quhit_triadic.h/.c    Tripartite (3-body) entanglement with CMY channels
-│  └────────────────────────────────────────────────────────────┘
-│
-│  ┌─ V3 Analytical Engines ─────────────────────────────────────┐
-├── quhit_factored.h      Cooley–Tukey DFT₆ (Z₂×Z₃ decomposition)
-├── quhit_gauss.h         O(N) analytic Gauss sum amplitude resolver
-├── lazy_stats.h          Lazy evaluation statistics tracker
-│  └────────────────────────────────────────────────────────────┘
-│
-│  ┌─ Substrate ISA ─────────────────────────────────────────────┐
-├── substrate_opcodes.h   20-opcode enum, metadata, API declarations
-├── quhit_substrate.c     Opcode dispatch table + MPS bridge
-│  └────────────────────────────────────────────────────────────┘
-│
-│  ┌─ Side-Channel Primitives (header-only) ────────────────────┐
-├── arithmetic.h          IEEE-754 constants and magic numbers
-├── born_rule.h           Born rule: exact, fast, Quake, sample, collapse
-├── superposition.h       DFT₆ twiddle tables, superposition utilities
-├── entanglement.h        Joint state, partial trace, Schmidt, entropy
-├── statevector.h         AoS state vector storage, cache-line aligned
-├── quhit_management.h    Per-quhit state management primitives
-├── tensor_product.h      Empirical tensor product findings
-├── tensor_network.h      TN/MPS data structures and API declarations
-│  └────────────────────────────────────────────────────────────┘
-│
-│  ┌─ V3.3 Benchmarks ───────────────────────────────────────────┐
-├── V3.3-Test/
-│   ├── hexstate_allinone.c          7-tier + optimizations benchmark
-│   ├── hex512_phase_transition.c    512-quhit D=6 phase transition
-│   ├── hex_mips_1d.c                MIPS throughput benchmark
-│   ├── hex_ground_state.c           ITE ground state finder
-│   └── hex_critical_exponent.c      Critical exponent extraction
-│  └────────────────────────────────────────────────────────────┘
-│
-│  ┌─ V3 Benchmarks ─────────────────────────────────────────────┐
-├── Version-3-Benchmark/
-│   ├── hexstate_allinone.c    7-tier capability demonstration
-│   └── ibm_ising_benchmark.c  IBM Eagle Ising model comparison
-│  └────────────────────────────────────────────────────────────┘
-│
-│  ┌─ S₆ Outer Automorphism & Triality ──────────────────────────┐
-├── s6_exotic.h/.c        S₆ outer automorphism, exotic invariant Δ
-├── quhit_triality.h/.c   CMY triality engine (C/M/Y qubit channels)
-│  └────────────────────────────────────────────────────────────┘
-│
-│  ┌─ Physics Experiments ────────────────────────────────────────┐
-├── reality_scaled.c      CRT-factored Z₂×Z₃ gate demonstration
-├── anderson_3d.c         3D Anderson Localization phase diagram
-├── floquet_3d.c          3D Discrete Time Crystal (Floquet)
-├── fracton_3d.c          3D Fracton X-Cube Topological Entropy
-├── darwinism_3d.c        Real-Time Quantum Darwinism (7³ grid)
-├── wormhole_3d.c         Holographic Traversable Wormhole (AdS/CFT)
-├── wormhole_collapse.c   ★ World-First: Wormhole Horizon Collapse
-│  └────────────────────────────────────────────────────────────┘
-│
-│  ┌─ Foundational Physics Probes ─────────────────────────────────┐
-├── bell_test.c           D=6 Bell/CHSH/CGLMP inequality tests
-├── bell_dual.c           ★ Dual-processor Bell violation (shared λ)
-├── quantum_eraser.c      Delayed-Choice Quantum Eraser in S₆ space
-├── wigner_friend.c       ★ Wigner's Friend — nested observer paradox
-├── reality_probe.c       Hardware entropy structure analysis
-├── riemann_probe.c       Riemann Zeta zero distribution analysis
-│  └────────────────────────────────────────────────────────────┘
-│
-│  ┌─ Applied Simulations ─────────────────────────────────────────┐
-├── nash_equilibrium.c    D=6 Adversarial Nash Equilibrium Solver
-├── complex_systems.c     Financial contagion / LLM alignment / protein folding
-├── tesseract_factor.c    Holographic Ouroboros integer factoring engine
-│  └────────────────────────────────────────────────────────────┘
-│
-│  ┌─ BigInt Library ───────────────────────────────────────────┐
-├── bigint.h              4096-bit integer header
-└── bigint.c              4096-bit integer implementation
-   └────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Theory
-
-### The Quhit Advantage
-
-A single quhit encodes log₂(6) ≈ 2.585 bits of quantum information, compared to 1 bit for a qubit. Two entangled quhits span a 36-dimensional joint space vs. 4 for qubits — a **9× information density** per pair.
-
-### Why D=6?
-
-The dimension D=6 is an empirical choice with useful properties:
-
-- **CRT factorization**: 6 = 2 × 3, enabling Z₂ × Z₃ decomposition and Cooley–Tukey FFT
-- The DFT₆ has non-trivial structure (ω⁶ = 1 with ω ∉ {±1, ±i})
-- Twiddle factors include exact rational values (cos(π/3) = 0.5 exactly in IEEE-754)
-- The 36-amplitude joint state fits efficiently in cache
-- Pairwise monogamy produces GHZ states with constant storage
-- **6D tensor networks**: D=6 in 6 spatial dimensions — the physical dimension matches the lattice dimension
-
-### Monogamy and GHZ
-
-The engine's strict pairwise monogamy produces GHZ states with a property: regardless of N, the GHZ state is fully specified by D=6 amplitudes plus the rule "all quhits measure the same value." The register stores only the nonzero entries, making GHZ state operations O(D) regardless of N.
-
-### Comparison with Standard Quantum Computing
-
-| Property | Qubit (D=2) | Quhit (D=6) |
-|---|---|---|
-| Basis states | \|0⟩, \|1⟩ | \|0⟩ through \|5⟩ |
-| Hadamard analog | DFT₂ (2×2) | DFT₆ (6×6) |
-| Controlled gate | CNOT / CZ₂ | CZ₆: ω^(ab) phases |
-| Pair Hilbert space | 4 amplitudes | 36 amplitudes |
-| Info per unit | 1 bit | 2.585 bits |
-| Phase gate | Z: \|k⟩ → (−1)^k \|k⟩ | Z₆: \|k⟩ → ω^k \|k⟩ |
-| Sub-registers | None | Z₂ (bit) × Z₃ (trit) via CRT |
-
----
-
-## Build & Run
-
-```bash
-# V3 7-Tier All-In-One Demonstration
-gcc -O2 -std=gnu11 -I. -o hexstate_allinone Version-3-Benchmark/hexstate_allinone.c \
-    mps_overlay.c peps_overlay.c peps3d_overlay.c peps4d_overlay.c \
-    peps5d_overlay.c peps6d_overlay.c \
-    quhit_core.c quhit_gates.c quhit_measure.c quhit_entangle.c \
-    quhit_register.c -lm
-./hexstate_allinone
-
-# IBM Eagle Ising Model Benchmark
-gcc -O2 -std=gnu11 -I. -o ibm_ising_benchmark Version-3-Benchmark/ibm_ising_benchmark.c \
-    peps_overlay.c quhit_core.c quhit_gates.c quhit_measure.c \
-    quhit_entangle.c quhit_register.c -lm
-./ibm_ising_benchmark
-
-# CRT-Factored Gate Demonstration
-gcc -O2 -std=gnu11 reality_scaled.c quhit_core.c quhit_gates.c \
-    quhit_measure.c quhit_entangle.c quhit_register.c mps_overlay.c \
-    bigint.c -lm -o reality_scaled
-./reality_scaled
-
-# Substrate-enriched Willow (105 qudits, 25 cycles, 20 opcodes)
-gcc -O2 -std=gnu11 -fopenmp willow_substrate.c quhit_core.c \
-    quhit_gates.c quhit_measure.c quhit_entangle.c quhit_register.c \
-    quhit_substrate.c mps_overlay.c bigint.c -lm -o willow_substrate
-./willow_substrate
-
-# 3D Real-Time Quantum Darwinism
-gcc -O2 -std=gnu11 -fopenmp darwinism_3d.c quhit_core.c quhit_gates.c \
-    quhit_measure.c quhit_entangle.c quhit_register.c peps_overlay.c -lm -o darwinism_3d
-./darwinism_3d
-
-# Phase 10B: ★ World-First — Wormhole Horizon Collapse
-gcc -O2 -std=gnu11 -fopenmp wormhole_collapse.c quhit_core.c quhit_gates.c \
-    quhit_measure.c quhit_entangle.c quhit_register.c \
-    peps_overlay.c peps3d_overlay.c -lm -o wormhole_collapse
-./wormhole_collapse
-```
-
----
-
-## S₆ Outer Automorphism & Exotic Invariant
-
-**Files**: `s6_exotic.h`, `s6_exotic.c`
-
-The symmetric group S₆ is the **only** symmetric group possessing an outer automorphism — a structure-preserving map that cannot be achieved by conjugation. This is a mathematical anomaly unique to exactly six elements, and it gives the D=6 architecture properties unavailable at any other dimension.
-
-The exotic invariant **Δ** measures the deviation between a state's S₆ representation and its image under the outer automorphism. When Δ = 0, the two representations are indistinguishable — the state lives in a subspace where the automorphism is transparent.
-
-```c
-#include "s6_exotic.h"
-
-s6_exotic_init();  // Precompute S₆ permutation tables
-
-// Compute Δ for a D=6 state
-double delta = s6_exotic_invariant(state_re, state_im);
-
-// Compute exotic entropy
-double deltaS = s6_exotic_entropy(state_re, state_im);
-```
-
-**Key findings**:
-- Δ **inversely tracks entanglement**: high Δ = separable, Δ → 0 = entangled
-- Δ spikes exclusively at Re(s) = 0.5 for Riemann Zeta zeros
-- The outer automorphism becomes transparent under maximal D=6 entanglement
-
----
-
-## Foundational Physics Experiments
-
-### Bell's Theorem in D=6 Space (`bell_test.c`)
-
-Tests quantum non-locality within the D=6 tesseract using maximally entangled states.
-
-```bash
-gcc -O2 -o bell_test bell_test.c quhit_triality.c s6_exotic.c -lm
-./bell_test
-```
-
-**5 Experiments**:
-
-| Experiment | Result |
-|---|---|
-| **CHSH inequality sweep** | **S = +2.500** (classical bound: \|S\| ≤ 2.0) |
-| **CGLMP inequality (D=6)** | I₆ = 0.887 (within classical limits at tested angles) |
-| **Δ vs entanglement** | Δ drops 200 → 0 as entanglement increases |
-| **S₆ fingerprint** | Angle-invariant — topologically protected |
-| **Quantum vs classical** | Entangled state violates; product/uncorrelated obey |
-
-Optimal CHSH violation occurs at **α₁=0°, α₂=60°, β₁=60°, β₂=120°** — angles that are exact multiples of the hexagonal quantum π/3. The D=6 topology selects its own optimal non-locality angles.
-
----
-
-### ★ Dual-Processor Bell Test (`bell_dual.c`)
-
-> **Two independent classical processors, sharing only a deterministic entropy stream, violate Bell's inequality through D=6 topology alone.**
-
-```bash
-gcc -O2 -o bell_dual bell_dual.c quhit_triality.c s6_exotic.c -lm
-./bell_dual
-```
-
-**Architecture**:
-
-```
-  ┌─────────────────────────────────┐
-  │      SHARED ENTROPY POOL        │
-  │    (deterministic seed λ)       │
-  └──────────┬──────────┬───────────┘
-             │          │
-       ┌─────▼─────┐  ┌─▼──────────┐
-       │  ALICE     │  │  BOB       │
-       │  D=6       │  │  D=6       │
-       │  Tesseract │  │  Tesseract │
-       │  R(α)      │  │  R(β)      │
-       └─────┬──────┘  └──┬─────────┘
-             │            │
-       ┌─────▼────────────▼──────────┐
-       │     CORRELATION ANALYSIS     │
-       │     (post-hoc comparison)     │
-       └──────────────────────────────┘
-```
-
-**Results**: **S = +2.500 across ALL entropy sources**:
-
-| Entropy Source | CHSH S | Violates \|S\| ≤ 2? |
-|---|---|---|
-| xorshift64 (PRNG) | **+2.500** | **YES** |
-| /dev/urandom | **+2.500** | **YES** |
-| Clock jitter | **+2.500** | **YES** |
-
-The violation is **entropy-independent** — it comes from the D=6 topology, not the data.
-
-**Reproducibility**: 100% deterministic (same λ → same outcome, always). This IS a local hidden variable model: λ = entropy stream, A(α,λ) and B(β,λ) are deterministic functions. Yet it violates Bell. The S₆ outer automorphism introduces correlations that the entropy alone does not contain.
-
----
-
-### Delayed-Choice Quantum Eraser (`quantum_eraser.c`)
-
-Tests retro-causal information erasure through topology.
-
-```bash
-gcc -O2 -o quantum_eraser quantum_eraser.c quhit_triality.c s6_exotic.c -lm
-./quantum_eraser
-```
-
-**Protocol**: Alice records full interference pattern. Bob independently chooses MEASURE or ERASE (separate PRNG). Post-selection sorts Alice's data by Bob's choice.
-
-**Result**: **No eraser effect.** Alice's distribution is statistically identical regardless of Bob's choice (max difference: 0.0005, χ² = 0.045 vs critical 11.07). The D=6 topology produces Bell-violating *correlations* but blocks retro-causal *influence*. This is the correct quantum behavior: **non-locality without signaling**.
-
----
-
-### ★ Wigner's Friend (`wigner_friend.c`)
-
-Nested observer paradox: Alice measures inside a closed lab, then her state is re-embedded into the tesseract for Wigner to operate on from outside.
-
-```bash
-gcc -O2 -o wigner_friend wigner_friend.c quhit_triality.c s6_exotic.c -lm
-./wigner_friend
-```
-
-**4 Experiments**:
-
-| Experiment | Result |
-|---|---|
-| **Wigner PEEKS** | 83.5% disagreement — observer-dependent reality |
-| **Wigner REVERSES** | Entropy 1.475 → 0.000 — measurement fully undone |
-| **INTERFERENCE** | Visibility = 1.000 — fringes survive Alice's measurement |
-| **FRAUCHIGER-RENNER** | **69.7%** simultaneous contradictions |
-
-**Key findings**:
-- Alice has certainty 0.37, Wigner has certainty **1.0** — both think they know the answer, both are right from their own perspective
-- Wigner can **completely undo** Alice's measurement from outside (zero decoherence)
-- Interference fringes **survive** internal measurement — the lab IS in superposition to external observers
-- Δ = 0 when Alice measures, Δ = 204.6 when she doesn't — S₆ sees the difference even when interference doesn't
-- Two Wigners agree 100%, two Friends agree 16.6% (random), cross-agreement 16.8%
-
-The D=6 topology natively supports **observer-dependent reality** and multiple incompatible perspectives within the 216-state tesseract.
-
----
-
-### Hardware Entropy Probe (`reality_probe.c`)
-
-Probes 4 hardware entropy sources (/dev/urandom, CPU clock jitter, heap timing, scheduling noise) plus 1 PRNG control through the Devil's Oracle pipeline. Measures Δ and autocorrelation to detect hidden deterministic structure in physical entropy.
-
-```bash
-gcc -O2 -o reality_probe reality_probe.c quhit_triality.c s6_exotic.c -lm
-./reality_probe
-```
-
-**Finding**: Entropy amplitude is random, but temporal correlations reveal classical signatures. The S₆ invariant detects structure invisible to standard statistical tests.
-
----
-
-### Riemann Zeta Probe (`riemann_probe.c`)
-
-Analyzes the distribution of Riemann Zeta non-trivial zeros using D=6 topology.
-
-```bash
-gcc -O2 -o riemann_probe riemann_probe.c quhit_triality.c s6_exotic.c -lm
-./riemann_probe
-```
-
-**Finding**: Δ exhibits a dramatic spike **exclusively at Re(s) = 0.5** — the critical line. The exotic entropy ΔS inverts sign precisely at σ = 1/2. The D=6 topology detects a geometric structure binding the zeros to the critical line.
-
----
-
-## Optical Hardware Architecture — D=6 Prism-Gated Laser Implementation
-
-The D=6 topology maps naturally onto photonic hardware. The DFT₆ gate IS dispersive optics; the Z₆ gate IS phase modulation; the Ouroboros loop IS an optical cavity. This section specifies a physical implementation.
-
-### Core Insight: A Prism IS the DFT
-
-A dispersive element (prism, diffraction grating) maps equally-spaced frequency modes to equally-spaced spatial positions — this is exactly the discrete Fourier transform. The DFT₆ that underlies every D=6 gate is already a physical operation: pass 6 laser wavelengths through a prism.
-
-### State Encoding — Three Degrees of Freedom
-
-The 216-state tesseract (6×6×6) maps onto three orthogonal photonic degrees of freedom:
-
-| Channel | Physical Encoding | States | Hardware |
-|---|---|---|---|
-| **A** | Wavelength (λ) | λ₁=630nm, λ₂=640nm, λ₃=650nm, λ₄=660nm, λ₅=670nm, λ₆=680nm | 6-line laser array |
-| **B** | Spatial mode | 6 positions in hexagonal geometry | 6-core PM fiber bundle |
-| **C** | Orbital Angular Momentum | ℓ = 0, 1, 2, 3, 4, 5 | Spiral phase plates |
-
-Each photon simultaneously encodes one state in each channel. A single photon carries the full 216-state Hilbert space.
-
-### Gate-to-Hardware Mapping
-
-#### DFT₆ → Dispersive Element (Prism/Grating)
-
-```
-    6λ superposition          After dispersion
-    (single beam)            (6 spatial positions)
-                    
-    ════════►     /     λ₁ (630nm) ──► position 0
-                 / /    λ₂ (640nm) ──► position 1
-                / / /   λ₃ (650nm) ──► position 2
-               / / / /  λ₄ (660nm) ──► position 3
-              / / / / / λ₅ (670nm) ──► position 4
-               GRATING   λ₆ (680nm) ──► position 5
-```
-
-A **diffraction grating** (1200 lines/mm, blazed) provides linear dispersion, mapping directly to equally-spaced DFT basis vectors. The inverse DFT₆† is a second grating that recombines the beams. For maximum precision, use a holographic grating — the linear dispersion gives exact DFT spacing.
-
-#### Z₆ → Phase Plate Array
-
-After the grating separates the 6 wavelengths spatially, a **6-element phase modulator array** at the focal plane applies the Z₆ gate:
-
-```
-    λ₁ ──► [φ = 0°]   ──► λ₁ · e^{i·0}
-    λ₂ ──► [φ = 60°]  ──► λ₂ · e^{i·π/3}
-    λ₃ ──► [φ = 120°] ──► λ₃ · e^{i·2π/3}
-    λ₄ ──► [φ = 180°] ──► λ₄ · e^{i·π}
-    λ₅ ──► [φ = 240°] ──► λ₅ · e^{i·4π/3}
-    λ₆ ──► [φ = 300°] ──► λ₆ · e^{i·5π/3}
-```
-
-Implementation options:
-- **Static**: Thin glass wedges with precisely controlled optical path lengths (λ/360 thickness precision)
-- **Dynamic**: LiNbO₃ electro-optic modulators (EOMs) — sub-nanosecond switching, arbitrary phase per channel
-- **Programmable**: Spatial Light Modulator (SLM) at the grating's focal plane
-
-The phases are the 6th roots of unity — the vertices of the hexagon in phase space.
-
-#### Rotation Gate R(θ) → Prism Sandwich
-
-The full rotation gate from `bell_test.c` is:
-
-```
-R(θ) = DFT₆† · Z₆(θ) · DFT₆
-```
-
-Optically, this is a **prism-phase-prism sandwich**:
-
-```
-    Input ──► [Grating₁] ──► [Phase Plates] ──► [Grating₂] ──► Output
-              (DFT₆)         (Z₆ phases)        (DFT₆†)
-```
-
-One physical pass through this assembly = one `build_rotation()` call = one D=6 measurement basis change.
-
-#### CZ₆ Entanglement → Nonlinear Crystal
-
-Cross-channel entanglement (coupling wavelength to spatial mode) uses a **χ⁽²⁾ nonlinear crystal**:
-
-| Crystal | Mechanism | Advantage |
-|---|---|---|
-| **PPLN** (periodically-poled lithium niobate) | Quasi-phase-matched sum-frequency generation | Multiple wavelength pairs simultaneously |
-| **BBO** (β-barium borate) | Type-I/II parametric interaction | Broadband, high efficiency |
-| **KTP** (potassium titanyl phosphate) | Spontaneous parametric down-conversion | Entangled photon pair generation |
-
-The crystal's phase-matching condition naturally selects which wavelength-spatial mode combinations interact, implementing the conditional phase shift `ω^(a·b)` at the hardware level.
-
-#### CNOT₆ (Alice's Measurement) → Controlled Sum-Frequency Mixing
-
-The CNOT₆ gate (used in Wigner's Friend for Alice's measurement) maps:
-
-```
-|a, b⟩ → |a, (a+b) mod 6⟩
-```
-
-Optically: a **cascaded sum-frequency interaction** where the wavelength in channel A shifts the spatial mode in channel B by the corresponding amount. This requires a precisely engineered multi-stage nonlinear element or an acousto-optic modulator (AOM) array.
-
-### The Ouroboros Cavity
-
-The Ouroboros DynChain loop maps to a **ring cavity** — light circulating through the gate sequence repeatedly:
-
-```
-    ┌───── Grating ─── Phase Array ─── Grating⁻¹ ─── NL Crystal ───┐
-    │         (DFT₆)      (Z₆)          (DFT₆†)       (CZ₆)        │
-    │                                                                │
-    └─── HR Mirror ◄────── HR Mirror ◄────── Output Coupler ────────┘
-                                                  │
-                                              ▼ Tap (1-5%)
-                                           Detector Array
-```
-
-| Parameter | Value | Effect |
-|---|---|---|
-| Mirror reflectivity | R > 99.9% | High-finesse cavity |
-| Cavity Q | ~10⁶ | Thousands of Ouroboros passes per photon |
-| Round-trip time | ~3 ns (1m cavity) | ~333 MHz iteration rate |
-| Output coupler | 1-5% transmission | Tap off for measurement |
-| Free spectral range | Matched to 10nm laser spacing | Resonant for all 6 wavelengths |
-
-A high-finesse cavity with Q ~ 10⁶ gives thousands of Ouroboros passes automatically. Each round trip applies DFT₆ → Z₆ → DFT₆† → CZ₆ — the complete gate cycle. The light eats its own tail.
-
-### The S₆ Hexagonal Prism Geometry
-
-The S₆ outer automorphism maps:
-- **Transpositions** (swap 2 elements) → **Pairwise beam splitter operations** (mixing two wavelengths)
-- **Products of 3-cycles** (3-element rotation) → **Three-way interference** (three wavelengths at a junction)
-
-A **hexagonal prism geometry** provides both interaction types at the same physical structure:
-
-```
-           λ₁
-          / \
-         /   \
-        /     \
-      λ₆───────λ₂
-       |       |
-       |  HEX  |
-       |       |
-      λ₅───────λ₃
-        \     /
-         \   /
-          \ /
-           λ₄
-```
-
-- **Edges** (6 edges of hexagon): Pairwise interactions → transpositions in S₆
-- **Triangular faces** (2 triangles: λ₁λ₃λ₅ and λ₂λ₄λ₆): Three-way interactions → 3-cycles in S₆
-- **The outer automorphism swaps edges ↔ triangles**: The hexagonal geometry makes this swap a physical rotation
-
-This is why D=6 is special in optics: the hexagonal beam arrangement is the **only** geometry where both transposition and 3-cycle interactions are first-class operations accessible at the same routing structure.
-
-### Full Optical Circuit
-
-```
-    ╔══════════════════════════════════════════════════════════════════╗
-    ║                    D=6 OPTICAL PROCESSOR                        ║
-    ╠══════════════════════════════════════════════════════════════════╣
-    ║                                                                  ║
-    ║   6-λ Laser Array                                                ║
-    ║   ┌────┬────┬────┬────┬────┬────┐                                ║
-    ║   │630 │640 │650 │660 │670 │680 │ nm                             ║
-    ║   └─┬──┴─┬──┴─┬──┴─┬──┴─┬──┴─┬──┘                               ║
-    ║     └────┴────┴────┴────┴────┘                                   ║
-    ║              │                                                   ║
-    ║     ┌────────▼────────┐     Dichroic combiner                    ║
-    ║     │  WDM COMBINER   │     6 λ → single beam                    ║
-    ║     └────────┬────────┘                                          ║
-    ║              │                                                   ║
-    ║     ╔════════▼════════╗                                          ║
-    ║     ║  OUROBOROS RING  ║◄──────────────────────┐                  ║
-    ║     ║    CAVITY        ║                       │                  ║
-    ║     ║                  ║                       │                  ║
-    ║     ║  ┌──────────┐   ║                       │                  ║
-    ║     ║  │ GRATING₁ │   ║  DFT₆ (dispersion)   │                  ║
-    ║     ║  └────┬─────┘   ║                       │                  ║
-    ║     ║       │         ║                       │                  ║
-    ║     ║  ┌────▼─────┐   ║                       │                  ║
-    ║     ║  │ 6× PHASE │   ║  Z₆ (phase shift)    │                  ║
-    ║     ║  │  PLATES   │   ║                       │                  ║
-    ║     ║  └────┬─────┘   ║                       │                  ║
-    ║     ║       │         ║                       │                  ║
-    ║     ║  ┌────▼─────┐   ║                       │                  ║
-    ║     ║  │ GRATING₂ │   ║  DFT₆† (recombine)   │                  ║
-    ║     ║  └────┬─────┘   ║                       │                  ║
-    ║     ║       │         ║                       │                  ║
-    ║     ║  ┌────▼─────┐   ║                       │                  ║
-    ║     ║  │ PPLN     │   ║  CZ₆ (entangle)      │                  ║
-    ║     ║  │ CRYSTAL  │   ║                       │                  ║
-    ║     ║  └────┬─────┘   ║                       │                  ║
-    ║     ║       │         ║                       │                  ║
-    ║     ║  ┌────▼─────┐   ║                       │                  ║
-    ║     ║  │ OUTPUT   │───╫───►  1-5% tap         │                  ║
-    ║     ║  │ COUPLER  │   ║                       │                  ║
-    ║     ║  └────┬─────┘   ║                       │                  ║
-    ║     ║       │         ║                       │                  ║
-    ║     ║       └─────────╫───────────────────────┘                  ║
-    ║     ║   HR mirrors    ║   99.9% reflection                      ║
-    ║     ╚═════════════════╝                                          ║
-    ║              │                                                   ║
-    ║     ┌────────▼────────┐                                          ║
-    ║     │  6× Si APD      │     Single-photon detection              ║
-    ║     │  DETECTOR ARRAY │     (6-outcome measurement)              ║
-    ║     └─────────────────┘                                          ║
-    ║                                                                  ║
-    ╚══════════════════════════════════════════════════════════════════╝
-```
-
-### Bill of Materials
-
-| # | Component | Specification | Purpose | Est. Cost |
-|---|---|---|---|---|
-| 6 | Laser diodes | 630/640/650/660/670/680 nm, 5mW each, single-mode | 6-state wavelength basis | $50-200 ea |
-| 1 | WDM combiner | 6-to-1 wavelength multiplexer, fiber-coupled | Combine into single beam | $200-500 |
-| 2 | Diffraction gratings | 1200 lines/mm, blazed, holographic | DFT₆ and DFT₆† | $100-400 ea |
-| 6 | Electro-optic modulators | LiNbO₃, <1ns switching, fiber-pigtailed | Dynamic Z₆ phase control | $500-2000 ea |
-| 6 | Static phase plates | λ/6 precision, AR-coated | Fixed Z₆ gate (low-cost option) | $20-50 ea |
-| 1 | PPLN crystal | 10mm, multi-period, temperature-tuned | CZ₆ cross-channel entanglement | $500-2000 |
-| 4 | HR cavity mirrors | R > 99.9%, broadband 620-690nm | Ouroboros ring cavity | $100-300 ea |
-| 1 | Output coupler | 95/5 or 99/1, broadband | Measurement tap | $100-200 |
-| 6 | Si APD detectors | Single-photon, fiber-coupled, <1ns timing | 6-outcome measurement | $200-1000 ea |
-| 1 | Hexagonal fiber bundle | 6-core, polarization-maintaining | Spatial mode (channel B) | $300-800 |
-| 6 | Spiral phase plates | Topological charge ℓ = 0-5 | OAM modes (channel C) | $50-200 ea |
-| 1 | Optical breadboard | 4'×8', vibration-isolated | Stable mounting | $2000-5000 |
-
-**Total estimated cost**: $8,000 – $25,000 (proof-of-concept)
-
-This is achievable in a university optics lab. The most expensive component is the EOM array for dynamic phase control — the static phase plate version reduces cost to under $5,000.
-
-### Software-to-Hardware Gate Correspondence
-
-| Software (`bell_dual.c`) | Optical Hardware | Physical Operation |
-|---|---|---|
-| `init_gates()` → Z6, DFT6 | Grating + phase plates | Calibrate dispersion angles |
-| `triad_gate_a(t, DFT6_RE, DFT6_IM)` | Grating₁ | Pass beam through dispersive element |
-| `triad_gate_a(t, Z6_RE, Z6_IM)` | Phase plate array | Apply 6 phase shifts at focal plane |
-| `triad_renormalize(t)` | (automatic) | Conservation of energy in lossless cavity |
-| `processor_measure()` | APD detector array | Count photon arrivals in each spectral bin |
-| Ouroboros loop iterations | Cavity round trips | Light circulates, accumulating gate operations |
-| `s6_exotic_invariant()` | Hexagonal beam splitter network | Measure interference between S₆ group orbits |
-
-### Expected Physical Observables
-
-Based on the software results from `bell_dual.c`:
-
-| Observable | Software Result | Expected Optical Result |
-|---|---|---|
-| CHSH parameter S | +2.500 | +2.500 ± 0.01 (shot noise limited) |
-| Optimal angles | 0°, 60°, 120° | Phase plate settings at 0, π/3, 2π/3 rad |
-| Correlator E(0°, 0°) | +1.000 (perfect) | > 0.99 (limited by mode overlap) |
-| Reproducibility | 100% (deterministic) | Limited by laser stability (~99.9%) |
-| Fringe visibility (eraser) | 1.000 | > 0.95 (limited by cavity finesse) |
-
-The Bell violation at S = 2.500 translates directly to photon correlation statistics. The hardware would demonstrate that the D=6 topological structure produces non-classical correlations in physical light fields.
-
-### Path to D=6 Quantum Computer
-
-The optical architecture extends from proof-of-concept to scalable quantum processing:
-
-| Stage | Config | Capability |
-|---|---|---|
-| **Stage 1** | Single cavity, 6 wavelengths | 1 quhit — gate characterization |
-| **Stage 2** | 2 cavities, fiber-linked | 2 quhits — Bell test, CZ₆ verification |
-| **Stage 3** | 6 cavities, hexagonal layout | 6 quhits — Ouroboros loop, S₆ automorphism |
-| **Stage 4** | Cavity array + MPS fiber chain | N quhits — tensor network on optical bench |
-
-Each cavity is one quhit. The inter-cavity fiber links are the entanglement bonds. An MPS chain of N optical cavities connected by PPLN crystals implements the full HexState tensor network in hardware — with gate operations occurring at the speed of light.
+## Benchmark Results
+
+### Heap benchmark (21 sections, 118 tests)
+
+| Section | Module | Result |
+|---------|--------|--------|
+| §1–§4 | Core (init, gates, phase, X/Z) | ✓ |
+| §5 | Measurement (Born rule, 6K samples, χ²) | ✓ |
+| §6 | Entanglement (Bell pairs, disentangle) | ✓ |
+| §7 | BigInt (mul, gcd, pow_mod) | ✓ |
+| §8 | Substrate (20 opcodes, warm-start) | ✓ |
+| §9 | Self-calibration (5 identities) | ✓ |
+| §10 | Triality (126M gates/sec) | ✓ |
+| §11 | Lazy gate chains | ✓ |
+| §12 | S₆ exotic (15 synthemes) | ✓ |
+| §13 | Flat quhit (promote/demote) | ✓ |
+| §14 | Triadic 3-body entanglement | ✓ |
+| §15 | Register (1M-quhit GHZ) | ✓ |
+| §16 | Gauss sum amplitudes | ✓ |
+| §17 | Lazy throughput (10M/sec) | ✓ |
+| §18 | MPS overlay | ✓ |
+| §19 | PEPS 2D overlay | ✓ |
+| §20 | Dynamic chain growth | ✓ |
+| §21 | Full pipeline (16M ops/sec) | ✓ |
+
+### MIPT sweep (all 6 dimensions)
+
+| Dim | Sites | S̄(p=0) | S̄(p=1) | Time |
+|-----|-------|---------|---------|------|
+| 1D MPS | 16 | 2.071 | 0.000 | 34s |
+| 2D PEPS | 16 | 0.522 | 0.000 | 21s |
+| 3D TNS | 18 | 0.548 | 0.000 | 225s |
+| 4D TNS | 16 | 0.322 | 0.000 | 221s |
+| 5D TNS | 32 | 0.161 | 0.000 | 413s |
+| 6D TNS | 64 | 0.236 | 0.000 | 676s |
+
+All dimensions show the correct volume → area law entropy transition.
 
 ---
 
 ## License
 
-MIT
+See repository for license details.
