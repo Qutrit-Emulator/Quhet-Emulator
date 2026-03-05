@@ -260,7 +260,7 @@ static inline void tri_reg_gate_1site_masked(
             double ui = U_im[kp * D + k];
             double nr = ur * ar - ui * ai;
             double ni = ur * ai + ui * ar;
-            if (nr * nr + ni * ni < 1e-10) continue;
+            if (nr * nr + ni * ni < 1e-30) continue;
 
             unsigned __int128 new_basis = (unsigned __int128)kp * chi_power + bond;
 
@@ -284,7 +284,7 @@ static inline void tri_reg_gate_1site_masked(
     /* Write back to register */
     reg->num_nonzero = 0;
     for (int t = 0; t < nout; t++) {
-        if (tmp[t].re * tmp[t].re + tmp[t].im * tmp[t].im >= 1e-10 &&
+        if (tmp[t].re * tmp[t].re + tmp[t].im * tmp[t].im >= 1e-30 &&
             reg->num_nonzero < 4096) {
             reg->entries[reg->num_nonzero].basis_state = (basis_t)tmp[t].basis;
             reg->entries[reg->num_nonzero].amp_re = tmp[t].re;
