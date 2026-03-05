@@ -274,7 +274,8 @@ static inline void fq_idft(FlatQuhit *fq) {
  * Lucifer #3: Direct computation for all flat/subspace combos — no promotion. */
 static inline void fq_cz(FlatQuhit *a, FlatQuhit *b) {
     if (a->repr == FLAT_BASIS && b->repr == FLAT_BASIS) {
-        /* Basis × Basis: ω^(j·k) phase on each. O(1). */
+        /* Basis × Basis: ω^(j·k) phase on a only. O(1).
+         * The joint phase lives on one side — b is untouched. */
         int j = a->basis_index, k = b->basis_index;
         int idx = (j * k) % TRI_D;
         if (idx != 0) {
@@ -282,9 +283,6 @@ static inline void fq_cz(FlatQuhit *a, FlatQuhit *b) {
             double new_a_re = CMUL_RE(a->phase_re, a->phase_im, w_re, w_im);
             double new_a_im = CMUL_IM(a->phase_re, a->phase_im, w_re, w_im);
             a->phase_re = new_a_re; a->phase_im = new_a_im;
-            double new_b_re = CMUL_RE(b->phase_re, b->phase_im, w_re, w_im);
-            double new_b_im = CMUL_IM(b->phase_re, b->phase_im, w_re, w_im);
-            b->phase_re = new_b_re; b->phase_im = new_b_im;
         }
         a->flat_ops++; b->flat_ops++;
         return;
