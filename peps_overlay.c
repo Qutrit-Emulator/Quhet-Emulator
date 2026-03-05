@@ -175,8 +175,11 @@ void peps_gate_1site(PepsGrid *grid, int x, int y,
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 #include "tensor_svd.h"
+#include "svd_truncate.h"
 
 #define PEPS_SVDDIM (PEPS_D * PEPS_CHI * PEPS_CHI)
+
+static SvdTmpBuf peps_svd_buf;
 
 /* Helper: read tensor T[k,u,d,l,r] from register into dense array */
 static void peps_reg_read_dense(PepsGrid *grid, int site,
@@ -410,8 +413,8 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
     if (sig_norm > 1e-30)
         for (int s = 0; s < rank; s++) hb_shared->w[s] = sig[s] / sig_norm;
 
-    /* ── 6. Write back — preserving ALL bond values ── */
-    regA->num_nonzero = 0;
+    /* ── 6. Write back with magnitude-sorted truncation ── */
+    svd_buf_reset(&peps_svd_buf);
     for (int kA = 0; kA < D; kA++)
      for (int eA = 0; eA < num_EA; eA++) {
          int row = kA * num_EA + eA;
@@ -426,17 +429,12 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
          for (int g = 0; g < rank; g++) {
              double re = U_re[row * rank + g] * invw;
              double im = U_im[row * rank + g] * invw;
-             if (re*re + im*im > 1e-10 && regA->num_nonzero < 4096) {
-                 basis_t bs = PT_IDX(kA, uA, dA, lA, g);
-                 regA->entries[regA->num_nonzero].basis_state = bs;
-                 regA->entries[regA->num_nonzero].amp_re = re;
-                 regA->entries[regA->num_nonzero].amp_im = im;
-                 regA->num_nonzero++;
-             }
+             svd_buf_push(&peps_svd_buf, PT_IDX(kA, uA, dA, lA, g), re, im);
          }
      }
+    svd_buf_flush(&peps_svd_buf, regA);
 
-    regB->num_nonzero = 0;
+    svd_buf_reset(&peps_svd_buf);
     for (int kB = 0; kB < D; kB++)
      for (int eB = 0; eB < num_EB; eB++) {
          int col = kB * num_EB + eB;
@@ -451,15 +449,10 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
          for (int g = 0; g < rank; g++) {
              double re = Vc_re[g * svddim_B + col] * invw;
              double im = Vc_im[g * svddim_B + col] * invw;
-             if (re*re + im*im > 1e-10 && regB->num_nonzero < 4096) {
-                 basis_t bs = PT_IDX(kB, uB, dB, g, rB);
-                 regB->entries[regB->num_nonzero].basis_state = bs;
-                 regB->entries[regB->num_nonzero].amp_re = re;
-                 regB->entries[regB->num_nonzero].amp_im = im;
-                 regB->num_nonzero++;
-             }
+             svd_buf_push(&peps_svd_buf, PT_IDX(kB, uB, dB, g, rB), re, im);
          }
      }
+    svd_buf_flush(&peps_svd_buf, regB);
 
     free(U_re); free(U_im);
     free(sig);
@@ -684,8 +677,8 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
     if (sig_norm > 1e-30)
         for (int s = 0; s < rank; s++) vb_shared->w[s] = sig[s] / sig_norm;
 
-    /* ── 6. Write back — preserving ALL bond values ── */
-    regA->num_nonzero = 0;
+    /* ── 6. Write back with magnitude-sorted truncation ── */
+    svd_buf_reset(&peps_svd_buf);
     for (int kA = 0; kA < D; kA++)
      for (int eA = 0; eA < num_EA; eA++) {
          int row = kA * num_EA + eA;
@@ -700,17 +693,12 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
          for (int g = 0; g < rank; g++) {
              double re = U_re[row * rank + g] * invw;
              double im = U_im[row * rank + g] * invw;
-             if (re*re + im*im > 1e-10 && regA->num_nonzero < 4096) {
-                 basis_t bs = PT_IDX(kA, uA, g, lA, rA);
-                 regA->entries[regA->num_nonzero].basis_state = bs;
-                 regA->entries[regA->num_nonzero].amp_re = re;
-                 regA->entries[regA->num_nonzero].amp_im = im;
-                 regA->num_nonzero++;
-             }
+             svd_buf_push(&peps_svd_buf, PT_IDX(kA, uA, g, lA, rA), re, im);
          }
      }
+    svd_buf_flush(&peps_svd_buf, regA);
 
-    regB->num_nonzero = 0;
+    svd_buf_reset(&peps_svd_buf);
     for (int kB = 0; kB < D; kB++)
      for (int eB = 0; eB < num_EB; eB++) {
          int col = kB * num_EB + eB;
@@ -725,15 +713,10 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
          for (int g = 0; g < rank; g++) {
              double re = Vc_re[g * svddim_B + col] * invw;
              double im = Vc_im[g * svddim_B + col] * invw;
-             if (re*re + im*im > 1e-10 && regB->num_nonzero < 4096) {
-                 basis_t bs = PT_IDX(kB, g, dB, lB, rB);
-                 regB->entries[regB->num_nonzero].basis_state = bs;
-                 regB->entries[regB->num_nonzero].amp_re = re;
-                 regB->entries[regB->num_nonzero].amp_im = im;
-                 regB->num_nonzero++;
-             }
+             svd_buf_push(&peps_svd_buf, PT_IDX(kB, g, dB, lB, rB), re, im);
          }
      }
+    svd_buf_flush(&peps_svd_buf, regB);
 
     free(U_re); free(U_im);
     free(sig);
