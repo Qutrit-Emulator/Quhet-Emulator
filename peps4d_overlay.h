@@ -64,6 +64,7 @@
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 #include "quhit_engine.h"
+#include "triality_overlay.h"
 
 /* Lightweight tensor stub — register IS the tensor */
 typedef struct {
@@ -85,6 +86,7 @@ typedef struct {
     uint32_t *q_phys;
     QuhitEngine *eng;
     int *site_reg;
+    TriOverlaySite *tri_sites;
 } Tns4dGrid;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
