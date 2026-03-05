@@ -378,7 +378,7 @@ static void gb_build(GammaBuckets *gb, QuhitRegister *reg, int chi) {
     /* Count entries per gamma */
     for (uint32_t e = 0; e < reg->num_nonzero; e++) {
         double ar = reg->entries[e].amp_re, ai = reg->entries[e].amp_im;
-        if (ar*ar + ai*ai < 1e-10) continue;
+        if (ar*ar + ai*ai < 1e-30) continue;
         int gamma = (int)(reg->entries[e].basis_state % chi);
         if (gamma < chi) gb->counts[gamma]++;
     }
@@ -393,7 +393,7 @@ static void gb_build(GammaBuckets *gb, QuhitRegister *reg, int chi) {
     memcpy(pos, gb->offsets, chi * sizeof(uint16_t));
     for (uint32_t e = 0; e < reg->num_nonzero; e++) {
         double ar = reg->entries[e].amp_re, ai = reg->entries[e].amp_im;
-        if (ar*ar + ai*ai < 1e-10) continue;
+        if (ar*ar + ai*ai < 1e-30) continue;
         int gamma = (int)(reg->entries[e].basis_state % chi);
         if (gamma < chi)
             gb->indices[pos[gamma]++] = (uint16_t)e;
@@ -518,7 +518,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
         basis_t bsA = regA->entries[eA].basis_state;
         double arA = regA->entries[eA].amp_re;
         double aiA = regA->entries[eA].amp_im;
-        if (arA*arA + aiA*aiA < 1e-10) continue;
+        if (arA*arA + aiA*aiA < 1e-30) continue;
 
         int kA = (int)(bsA / chi2);
         int alpha = (int)((bsA / chi) % chi);
@@ -629,10 +629,10 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
          int row = kA * chi + a;
          for (int g = 0; g < rank; g++) {
              double sq = sqrt_sig[g];
-             if (sq < 1e-10) continue;
+             if (sq < 1e-30) continue;
              double re = sq * g2_U_re[row * rank + g];
              double im = sq * g2_U_im[row * rank + g];
-             if (re*re + im*im > 1e-10 && regA->num_nonzero < 4096) {
+             if (re*re + im*im > 1e-30 && regA->num_nonzero < 4096) {
                  basis_t bs = (basis_t)kA * chi2 + (basis_t)a * chi + g;
                  regA->entries[regA->num_nonzero].basis_state = bs;
                  regA->entries[regA->num_nonzero].amp_re = re;
@@ -647,12 +647,12 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     for (int kB = 0; kB < D; kB++)
      for (int g = 0; g < rank; g++) {
           double sq = sqrt_sig[g];
-          if (sq < 1e-10) continue;
+          if (sq < 1e-30) continue;
          for (int b = 0; b < chi; b++) {
              int col = kB * chi + b;
              double re = sq * g2_Vc_re[g * dchi + col];
              double im = sq * g2_Vc_im[g * dchi + col];
-             if (re*re + im*im > 1e-10 && regB->num_nonzero < 4096) {
+             if (re*re + im*im > 1e-30 && regB->num_nonzero < 4096) {
                  basis_t bs = (basis_t)kB * chi2 + (basis_t)g * chi + b;
                  regB->entries[regB->num_nonzero].basis_state = bs;
                  regB->entries[regB->num_nonzero].amp_re = re;
