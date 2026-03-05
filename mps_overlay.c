@@ -284,7 +284,8 @@ void mps_gate_bond(MpsChain *c, int site,
     double *Vc_re = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
     double *Vc_im = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
 
-    tsvd_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B, chi,
+    tsvd_vesica_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B,
+                   D, num_EA, num_EB, chi,
                    U_re, U_im, sig, Vc_re, Vc_im);
     free(Th2_re); free(Th2_im);
 
