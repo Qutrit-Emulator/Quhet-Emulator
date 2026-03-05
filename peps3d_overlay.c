@@ -351,8 +351,9 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
     double *Vc_re = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
     double *Vc_im = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
 
-    tsvd_vesica_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B,
-                   D, num_EA, num_EB, chi,
+    int svd_rank = chi < svddim_B ? chi : svddim_B;
+    if (svd_rank > svddim_A) svd_rank = svddim_A;
+    tsvd_truncated(Th2_re, Th2_im, svddim_A, svddim_B, svd_rank,
                    U_re, U_im, sig, Vc_re, Vc_im);
     free(Th2_re); free(Th2_im);
 
@@ -367,13 +368,9 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
     if (rank_cap < 1) rank_cap = 1;
     if (rank > rank_cap) rank = rank_cap;
 
-    double sig_norm = 0;
-    for (int s = 0; s < rank; s++) sig_norm += sig[s];
-    
-    /* Side-channel: 1.0 attractor CONFIRMED — probe showed all bond weights
-     * converge to exactly 1.0 (entropy = 2.585 = log₂(6)).
-     * Lock shared bond to 1.0 since Schmidt weights are absorbed into U/V. */
-    for (int s = 0; s < (int)TNS3D_CHI; s++) shared_bw->w[s] = 1.0;
+    /* Store σ on bonds — Θ contraction absorbs via sw = bonds.w[s] */
+    for (int s = 0; s < (int)TNS3D_CHI; s++)
+        shared_bw->w[s] = (s < rank) ? sig[s] : 0.0;
 
     /* ── 5. Write back safely ── */
     svd_buf_reset(&tns3d_svd_buf);
@@ -383,10 +380,9 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
          basis_t envA = uniq_envA[eA];
          basis_t pure = (envA / bp[bond_A]) * bp[bond_A + 1] + (envA % bp[bond_A]);
          for (int gv = 0; gv < rank; gv++) {
-             double weight = (sig_norm > 1e-30 && sig[gv] > 1e-30) ? born_fast_isqrt(sig[gv] * sig_norm) * sig[gv] : 0.0;
-             double re = U_re[row * rank + gv] * weight;
-             double im = U_im[row * rank + gv] * weight;
-             if (re*re + im*im < 1e-50) continue;
+             double re = U_re[row * rank + gv];
+             double im = U_im[row * rank + gv];
+             if (re == 0.0 && im == 0.0) continue;
              svd_buf_push(&tns3d_svd_buf, kA * TNS3D_C6 + pure + gv * bp[bond_A], re, im);
          }
      }
@@ -399,10 +395,9 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
          basis_t envB = uniq_envB[eB];
          basis_t pure = (envB / bp[bond_B]) * bp[bond_B + 1] + (envB % bp[bond_B]);
          for (int gv = 0; gv < rank; gv++) {
-             double weight = (sig_norm > 1e-30 && sig[gv] > 1e-30) ? born_fast_isqrt(sig[gv] * sig_norm) * sig[gv] : 0.0;
-             double re = weight * Vc_re[gv * svddim_B + col];
-             double im = weight * Vc_im[gv * svddim_B + col];
-             if (re*re + im*im < 1e-50) continue;
+             double re = Vc_re[gv * svddim_B + col];
+             double im = Vc_im[gv * svddim_B + col];
+             if (re == 0.0 && im == 0.0) continue;
              svd_buf_push(&tns3d_svd_buf, kB * TNS3D_C6 + pure + gv * bp[bond_B], re, im);
          }
      }
@@ -455,14 +450,43 @@ void tns3d_local_density(Tns3dGrid *g, int x, int y, int z, double *probs)
     QuhitRegister *r = &g->eng->registers[reg];
     double total = 0;
 
+    /* Bond layout: |k, u, d, l, r, f, b⟩  positions 6,5,4,3,2,1,0
+     * Weight by σ² for each bond connected to this site */
+    static const unsigned __int128 bp3d[] = {
+        1, TNS3D_CHI,
+        (unsigned __int128)TNS3D_CHI*TNS3D_CHI,
+        (unsigned __int128)TNS3D_CHI*TNS3D_CHI*TNS3D_CHI,
+        (unsigned __int128)TNS3D_CHI*TNS3D_CHI*TNS3D_CHI*TNS3D_CHI,
+        (unsigned __int128)TNS3D_CHI*TNS3D_CHI*TNS3D_CHI*TNS3D_CHI*TNS3D_CHI,
+        (unsigned __int128)TNS3D_CHI*TNS3D_CHI*TNS3D_CHI*TNS3D_CHI*TNS3D_CHI*TNS3D_CHI
+    };
     for (uint32_t e = 0; e < r->num_nonzero; e++) {
-        /* Physical digit k is at position 6 (most significant) */
         basis_t bs = r->entries[e].basis_state;
-        int k = (int)(bs / TNS3D_C6);  /* k = highest position */
+        int k = (int)(bs / TNS3D_C6);
         if (k >= TNS3D_D) continue;
+        basis_t pure = bs % TNS3D_C6;
         double re = r->entries[e].amp_re;
         double im = r->entries[e].amp_im;
         double p = re * re + im * im;
+        /* Weight by each bond σ² */
+        for (int b = 0; b < 6; b++) {
+            int bval = (int)((pure / bp3d[b]) % TNS3D_CHI);
+            /* Find which bond array this corresponds to */
+            int bx = -1;
+            Tns3dBondWeight *barr = NULL;
+            switch(b) {
+                case 0: if(z < g->Lz-1) { bx = tns3d_bond_z(g,x,y,z);   barr = g->z_bonds; } break;
+                case 1: if(z > 0)        { bx = tns3d_bond_z(g,x,y,z-1); barr = g->z_bonds; } break;
+                case 2: if(y < g->Ly-1) { bx = tns3d_bond_y(g,x,y,z);   barr = g->y_bonds; } break;
+                case 3: if(y > 0)        { bx = tns3d_bond_y(g,x,y-1,z); barr = g->y_bonds; } break;
+                case 4: if(x < g->Lx-1) { bx = tns3d_bond_x(g,x,y,z);   barr = g->x_bonds; } break;
+                case 5: if(x > 0)        { bx = tns3d_bond_x(g,x-1,y,z); barr = g->x_bonds; } break;
+            }
+            if (bx >= 0 && barr) {
+                double w = barr[bx].w[bval];
+                p *= w * w;
+            }
+        }
         probs[k] += p;
         total += p;
     }
