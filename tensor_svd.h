@@ -266,9 +266,11 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
              /* Phase to make H[p][q] real: e^{-iθ} */
              double er = apr / mag, ei = -api / mag;
 
-             /* Rotate H */
-             H_re[p*n+p] -= t * mag;
-             H_re[q*n+q] += t * mag;
+             /* Rotate H: diagonal update from G†HG expansion
+              * H'[p,p] = c²·hpp + 2cs·Re(e^{-iθ}·h_pq) + s²·hqq = hpp + t·mag
+              * H'[q,q] = s²·hpp - 2cs·Re(e^{-iθ}·h_pq) + c²·hqq = hqq - t·mag */
+             H_re[p*n+p] += t * mag;
+             H_re[q*n+q] -= t * mag;
              H_re[p*n+q] = 0; H_im[p*n+q] = 0;
              H_re[q*n+p] = 0; H_im[q*n+p] = 0;
 
@@ -292,18 +294,29 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
                  H_re[q*n+k] =  H_re[k*n+q]; H_im[q*n+k] = -H_im[k*n+q];
              }
 
-             /* Rotate W: W[:,p], W[:,q] */
+             /* Rotate W: W' = W · G
+              * G[p,p] = c,            G[p,q] = -s·e^{-iθ}
+              * G[q,p] = s·e^{+iθ},    G[q,q] = c
+              *
+              * W'[k,p] = c·W[k,p] + s·e^{+iθ}·W[k,q]
+              * W'[k,q] = -s·e^{-iθ}·W[k,p] + c·W[k,q]
+              */
              for (int k = 0; k < n; k++) {
                  double wpr = W_re[k*n+p], wpi = W_im[k*n+p];
                  double wqr = W_re[k*n+q], wqi = W_im[k*n+q];
 
-                 double wqr2 =  er * wqr + ei * wqi;
-                 double wqi2 = -ei * wqr + er * wqi;
+                 /* e^{+iθ} · W[k,q] */
+                 double pqr =  er * wqr - ei * wqi;
+                 double pqi =  ei * wqr + er * wqi;
 
-                 W_re[k*n+p] =  c * wpr + s * wqr2;
-                 W_im[k*n+p] =  c * wpi + s * wqi2;
-                 W_re[k*n+q] = -s * wpr + c * wqr2;
-                 W_im[k*n+q] = -s * wpi + c * wqi2;
+                 /* e^{-iθ} · W[k,p] */
+                 double ppr =  er * wpr + ei * wpi;
+                 double ppi = -ei * wpr + er * wpi;
+
+                 W_re[k*n+p] =  c * wpr + s * pqr;
+                 W_im[k*n+p] =  c * wpi + s * pqi;
+                 W_re[k*n+q] = -s * ppr + c * wqr;
+                 W_im[k*n+q] = -s * ppi + c * wqi;
              }
          }
     }
@@ -1351,7 +1364,8 @@ vesica_done:
      *
      * SVD on the full folded matrix (same dimensions but better conditioned
      * in the vesica basis), then unfold the results.
-     * Still avoids full SVD on the original basis.
+     * The fold is a Hadamard (self-inverse unitary), so fold→SVD→unfold
+     * is mathematically exact.
      * ═══════════════════════════════════════════════════════════════════════ */
     {
         int rank = chi < n ? chi : n;
@@ -1366,7 +1380,7 @@ vesica_done:
         tsvd_truncated_sparse(FF_re, FF_im, m, n, rank,
                               fU_re, fU_im, fS, fV_re, fV_im);
 
-        /* Unfold U rows: inverse Vesica fold */
+        /* Unfold U rows: inverse Vesica fold (Hadamard = self-inverse) */
         for (int s = 0; s < rank; s++) {
             sigma[s] = fS[s];
             for (int eA = 0; eA < num_envA; eA++) {
