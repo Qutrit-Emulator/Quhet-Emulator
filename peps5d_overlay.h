@@ -18,6 +18,7 @@
 #define PEPS5D_OVERLAY_H
 
 #include "quhit_engine.h"
+#include "triality_overlay.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -60,6 +61,7 @@ typedef struct {
     QuhitEngine    *eng;
     uint32_t       *q_phys;
     int            *site_reg;
+    TriOverlaySite *tri_sites;
 } Tns5dGrid;
 
 /* ═══════════════ API ═══════════════ */
