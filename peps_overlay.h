@@ -46,6 +46,7 @@
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 #include "quhit_engine.h"
+#include "triality_overlay.h"
 
 /* PepsTensor is a lightweight stub — the register IS the tensor.
  * Kept only for API compatibility with contraction code. */
@@ -66,6 +67,7 @@ typedef struct {
     uint32_t *q_phys;         /* [Ly * Lx] per-site physical quhit IDs */
     QuhitEngine *eng;          /* HexState Engine reference             */
     int *site_reg;             /* [Ly * Lx] per-site register indices   */
+    TriOverlaySite *tri_sites; /* [Ly * Lx] per-site triality state     */
 } PepsGrid;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
