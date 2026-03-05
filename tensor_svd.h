@@ -1035,6 +1035,96 @@ static void tsvd_mini_2x2_svd(const double *Br, const double *Bi,
     }
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * S₆ SYNTHEME TABLE — All 15 ways to partition {0,1,2,3,4,5} into 3 pairs
+ *
+ * Each syntheme defines the vesica/wave channel assignment.
+ * The sweep tries all 15 and picks the one with lowest wave energy.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+static const int tsvd_s6_synthemes[15][3][2] = {
+    {{0,1},{2,3},{4,5}}, {{0,1},{2,4},{3,5}}, {{0,1},{2,5},{3,4}},
+    {{0,2},{1,3},{4,5}}, {{0,2},{1,4},{3,5}}, {{0,2},{1,5},{3,4}},
+    {{0,3},{1,2},{4,5}}, {{0,3},{1,4},{2,5}}, {{0,3},{1,5},{2,4}},
+    {{0,4},{1,2},{3,5}}, {{0,4},{1,3},{2,5}}, {{0,4},{1,5},{2,3}},
+    {{0,5},{1,2},{3,4}}, {{0,5},{1,3},{2,4}}, {{0,5},{1,4},{2,3}}
+};
+
+/* ── Fold Θ with a given syntheme pairing ──
+ * For pair p: (a,b), vesica = (a+b)/√2 at slot p, wave = (a-b)/√2 at slot p+3.
+ * Row fold: pair physical kA indices, then col fold: pair physical kB indices. */
+static void tsvd_fold_syntheme(const double *M_re, const double *M_im,
+                                int m, int n, int nEA, int nEB,
+                                const int pairs[3][2],
+                                double *FF_re, double *FF_im)
+{
+    size_t msz = (size_t)m * n;
+    double *F_re = (double *)calloc(msz, sizeof(double));
+    double *F_im = (double *)calloc(msz, sizeof(double));
+
+    /* Row fold: for each pair (a,b), vesica row p*nEA+eA, wave row (p+3)*nEA+eA */
+    for (int eA = 0; eA < nEA; eA++) {
+        for (int p = 0; p < 3; p++) {
+            int a = pairs[p][0], b = pairs[p][1];
+            int row_v = p * nEA + eA;       /* vesica destination */
+            int row_w = (p + 3) * nEA + eA; /* wave destination   */
+            int row_a = a * nEA + eA;       /* physical source a  */
+            int row_b = b * nEA + eA;       /* physical source b  */
+            for (int c = 0; c < n; c++) {
+                double ar = M_re[row_a*n+c], ai = M_im[row_a*n+c];
+                double br = M_re[row_b*n+c], bi = M_im[row_b*n+c];
+                F_re[row_v*n+c] = TSVD_INV_SQRT2 * (ar + br);
+                F_im[row_v*n+c] = TSVD_INV_SQRT2 * (ai + bi);
+                F_re[row_w*n+c] = TSVD_INV_SQRT2 * (ar - br);
+                F_im[row_w*n+c] = TSVD_INV_SQRT2 * (ai - bi);
+            }
+        }
+    }
+
+    /* Col fold: same pairing on columns */
+    memset(FF_re, 0, msz * sizeof(double));
+    memset(FF_im, 0, msz * sizeof(double));
+    for (int eB = 0; eB < nEB; eB++) {
+        for (int p = 0; p < 3; p++) {
+            int a = pairs[p][0], b = pairs[p][1];
+            int col_v = p * nEB + eB;
+            int col_w = (p + 3) * nEB + eB;
+            int col_a = a * nEB + eB;
+            int col_b = b * nEB + eB;
+            for (int r = 0; r < m; r++) {
+                double ar = F_re[r*n+col_a], ai = F_im[r*n+col_a];
+                double br = F_re[r*n+col_b], bi = F_im[r*n+col_b];
+                FF_re[r*n+col_v] = TSVD_INV_SQRT2 * (ar + br);
+                FF_im[r*n+col_v] = TSVD_INV_SQRT2 * (ai + bi);
+                FF_re[r*n+col_w] = TSVD_INV_SQRT2 * (ar - br);
+                FF_im[r*n+col_w] = TSVD_INV_SQRT2 * (ai - bi);
+            }
+        }
+    }
+    free(F_re); free(F_im);
+}
+
+/* ── Measure wave energy fraction for a folded matrix ── */
+static double tsvd_wave_energy(const double *FF_re, const double *FF_im,
+                                int m, int n, int nEA, int nEB)
+{
+    double vesica_E = 0, wave_E = 0;
+    for (int r = 0; r < m; r++) {
+        int kA = r / nEA;
+        int is_wave_r = (kA >= 3);
+        for (int c = 0; c < n; c++) {
+            double mag2 = FF_re[r*n+c]*FF_re[r*n+c] + FF_im[r*n+c]*FF_im[r*n+c];
+            if (mag2 < TSVD_EPS2) continue;
+            int kB = c / nEB;
+            int is_wave_c = (kB >= 3);
+            if (is_wave_r || is_wave_c) wave_E += mag2;
+            else vesica_E += mag2;
+        }
+    }
+    double total = vesica_E + wave_E;
+    return (total > TSVD_EPS2) ? wave_E / total : 0;
+}
+
 static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
                                           int m, int n,
                                           int D, int num_envA, int num_envB,
@@ -1051,104 +1141,43 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
     }
 
     /* ═══════════════════════════════════════════════════════════════════════
-     * STEP 1: VESICA FOLD — Transform Θ into (vesica, wave) basis
+     * STEP 1: OMNIDIRECTIONAL SWEEP — Try all 15 S₆ synthemes
      *
-     * Row fold: pair (kA=j, kA=j+3) for each envA
-     *   vesica row j*nEA+eA = (row[j*nEA+eA] + row[(j+3)*nEA+eA]) / √2
-     *   wave   row (j+3)*nEA+eA = (row[j*nEA+eA] - row[(j+3)*nEA+eA]) / √2
-     *
-     * Col fold: same pairing on columns.
-     * Result: FF is the doubly-folded Θ. Rows/cols 0..3nE-1 = vesica,
-     *         rows/cols 3nE..6nE-1 = wave.
+     * For each syntheme, fold Θ into (vesica, wave) basis and measure
+     * the wave energy fraction. The syntheme with the LOWEST wave_frac
+     * has found the hidden geometric symmetry in the entanglement.
      * ═══════════════════════════════════════════════════════════════════════ */
 
     size_t msz = (size_t)m * n;
-    double *F_re = (double *)calloc(msz, sizeof(double));
-    double *F_im = (double *)calloc(msz, sizeof(double));
-
-    for (int eA = 0; eA < num_envA; eA++) {
-        for (int j = 0; j < TSVD_VESICA_D2; j++) {
-            int row_lo = j * num_envA + eA;
-            int row_hi = (j + 3) * num_envA + eA;
-            for (int c = 0; c < n; c++) {
-                double lo_r = M_re[row_lo*n+c], lo_i = M_im[row_lo*n+c];
-                double hi_r = M_re[row_hi*n+c], hi_i = M_im[row_hi*n+c];
-                F_re[row_lo*n+c] = TSVD_INV_SQRT2 * (lo_r + hi_r);
-                F_im[row_lo*n+c] = TSVD_INV_SQRT2 * (lo_i + hi_i);
-                F_re[row_hi*n+c] = TSVD_INV_SQRT2 * (lo_r - hi_r);
-                F_im[row_hi*n+c] = TSVD_INV_SQRT2 * (lo_i - hi_i);
-            }
-        }
-    }
-
     double *FF_re = (double *)calloc(msz, sizeof(double));
     double *FF_im = (double *)calloc(msz, sizeof(double));
 
-    for (int eB = 0; eB < num_envB; eB++) {
-        for (int j = 0; j < TSVD_VESICA_D2; j++) {
-            int col_lo = j * num_envB + eB;
-            int col_hi = (j + 3) * num_envB + eB;
-            for (int r = 0; r < m; r++) {
-                double lo_r = F_re[r*n+col_lo], lo_i = F_im[r*n+col_lo];
-                double hi_r = F_re[r*n+col_hi], hi_i = F_im[r*n+col_hi];
-                FF_re[r*n+col_lo] = TSVD_INV_SQRT2 * (lo_r + hi_r);
-                FF_im[r*n+col_lo] = TSVD_INV_SQRT2 * (lo_i + hi_i);
-                FF_re[r*n+col_hi] = TSVD_INV_SQRT2 * (lo_r - hi_r);
-                FF_im[r*n+col_hi] = TSVD_INV_SQRT2 * (lo_i - hi_i);
-            }
-        }
-    }
-    free(F_re); free(F_im);
+    int    best_synth = 7;   /* default: antipodal (0,3)(1,4)(2,5) */
+    double best_wave  = 1.0;
 
-    /* ═══════════════════════════════════════════════════════════════════════
-     * STEP 2: MEASURE WAVE ENERGY — Decide which path to take
-     * ═══════════════════════════════════════════════════════════════════════ */
-
-    double vesica_energy = 0, wave_energy = 0;
-    for (int r = 0; r < m; r++) {
-        int kA = r / num_envA;
-        int is_wave_r = (kA >= 3);
-        for (int c = 0; c < n; c++) {
-            double mag2 = FF_re[r*n+c]*FF_re[r*n+c] + FF_im[r*n+c]*FF_im[r*n+c];
-            if (mag2 < TSVD_EPS2) continue;
-            int kB = c / num_envB;
-            int is_wave_c = (kB >= 3);
-            if (is_wave_r || is_wave_c) wave_energy += mag2;
-            else vesica_energy += mag2;
+    for (int si = 0; si < 15; si++) {
+        tsvd_fold_syntheme(M_re, M_im, m, n, num_envA, num_envB,
+                           tsvd_s6_synthemes[si], FF_re, FF_im);
+        double wf = tsvd_wave_energy(FF_re, FF_im, m, n, num_envA, num_envB);
+        if (wf < best_wave) {
+            best_wave  = wf;
+            best_synth = si;
         }
     }
 
-    double total_energy = vesica_energy + wave_energy;
-    double wave_frac = (total_energy > TSVD_EPS2)
-        ? wave_energy / total_energy : 0;
-        
-    /* DBG */ fprintf(stderr, "  wave_frac=%.6f vesica_E=%.6f wave_E=%.6f\n", wave_frac, vesica_energy, wave_energy);
+    /* Re-fold with the winning syntheme */
+    const int (*pairs)[2] = tsvd_s6_synthemes[best_synth];
+    tsvd_fold_syntheme(M_re, M_im, m, n, num_envA, num_envB,
+                       pairs, FF_re, FF_im);
+
+    double wave_frac = best_wave;
+    /* DBG */ fprintf(stderr, "  omni_sweep: synth=%d wave_frac=%.6f\n", best_synth, wave_frac);
 
     /* ═══════════════════════════════════════════════════════════════════════
      * PATH 1: VESICA DIRECT — Geometric factorization, NO SVD
      *
      * When wave < 1%, the doubly-folded Θ lives entirely in the
-     * vesica subspace: a 3nEA × 3nEB matrix.
-     *
-     * The 3 vesica pairs define 3×3 = 9 blocks of size nEA × nEB.
-     * Each block B[jA][jB] = FF[jA*nEA:(jA+1)*nEA, jB*nEB:(jB+1)*nEB]
-     * captures how vesica pair jA at site A correlates with pair jB at B.
-     *
-     * Factorization: decompose each block independently.
-     *   Block (jA, jB) of size nEA × nEB contributes
-     *   min(nEA, nEB) singular components.
-     *   Each component gets a unique bond value s.
-     *
-     * For nEA=nEB=1 (product state):  rank = up to 9 (9 scalar entries)
-     * For nEA=nEB=2 (after 1 gate):   rank = up to 18 (9 blocks × 2)
-     *
-     * The geometric insight: the fold basis IS the eigenbasis of the
-     * CZ gate. Pattern B (12.5% of calls) becomes rank-3 diagonal.
-     * Even general symmetric states decompose as at most 3 active pairs.
-     *
-     * After factorization, UNFOLD back to physical k-space:
-     *   k = j:   U_phys = U_fold / √2
-     *   k = j+3: U_phys = U_fold / √2   (symmetric distribution)
+     * vesica subspace (3nEA × 3nEB).
      * ═══════════════════════════════════════════════════════════════════════ */
 
     if (wave_frac < 0.01) {
@@ -1156,7 +1185,7 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
         int cn = TSVD_VESICA_D2 * num_envB;
         int phys_rank = chi < n ? chi : n;
         if (phys_rank > m) phys_rank = m;
-        
+
         int v_rank = chi < cn ? chi : cn;
         if (v_rank > cm) v_rank = cm;
 
@@ -1181,32 +1210,34 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
         for (int s = 0; s < v_rank; s++) {
             if (fS[s] < TSVD_EPS * (fS[0] > 0 ? fS[0] : 1.0)) break;
             sigma[s_idx] = fS[s];
-            
-            /* Unfold U: vesica component r -> physical k=jA and k=jA+3 */
+
+            /* Unfold U: vesica slot p → physical k=a and k=b */
             for (int eA = 0; eA < num_envA; eA++) {
-                for (int j = 0; j < TSVD_VESICA_D2; j++) {
-                    int r_v = j * num_envA + eA; 
-                    int row_lo = j * num_envA + eA; 
-                    int row_hi = (j + 3) * num_envA + eA; 
+                for (int p = 0; p < TSVD_VESICA_D2; p++) {
+                    int a = pairs[p][0], b = pairs[p][1];
+                    int r_v = p * num_envA + eA;
+                    int row_a = a * num_envA + eA;
+                    int row_b = b * num_envA + eA;
                     double ur = fU_re[r_v*v_rank + s], ui = fU_im[r_v*v_rank + s];
-                    U_re[row_lo * phys_rank + s_idx] = TSVD_INV_SQRT2 * ur;
-                    U_im[row_lo * phys_rank + s_idx] = TSVD_INV_SQRT2 * ui;
-                    U_re[row_hi * phys_rank + s_idx] = TSVD_INV_SQRT2 * ur;
-                    U_im[row_hi * phys_rank + s_idx] = TSVD_INV_SQRT2 * ui;
+                    U_re[row_a * phys_rank + s_idx] = TSVD_INV_SQRT2 * ur;
+                    U_im[row_a * phys_rank + s_idx] = TSVD_INV_SQRT2 * ui;
+                    U_re[row_b * phys_rank + s_idx] = TSVD_INV_SQRT2 * ur;
+                    U_im[row_b * phys_rank + s_idx] = TSVD_INV_SQRT2 * ui;
                 }
             }
 
-            /* Unfold V: vesica component c -> physical k=jB and k=jB+3 */
+            /* Unfold V: vesica slot p → physical k=a and k=b */
             for (int eB = 0; eB < num_envB; eB++) {
-                for (int j = 0; j < TSVD_VESICA_D2; j++) {
-                    int c_v = j * num_envB + eB; 
-                    int col_lo = j * num_envB + eB; 
-                    int col_hi = (j + 3) * num_envB + eB; 
+                for (int p = 0; p < TSVD_VESICA_D2; p++) {
+                    int a = pairs[p][0], b = pairs[p][1];
+                    int c_v = p * num_envB + eB;
+                    int col_a = a * num_envB + eB;
+                    int col_b = b * num_envB + eB;
                     double vr = fV_re[s*cn + c_v], vi = fV_im[s*cn + c_v];
-                    Vc_re[s_idx * n + col_lo] = TSVD_INV_SQRT2 * vr;
-                    Vc_im[s_idx * n + col_lo] = TSVD_INV_SQRT2 * vi;
-                    Vc_re[s_idx * n + col_hi] = TSVD_INV_SQRT2 * vr;
-                    Vc_im[s_idx * n + col_hi] = TSVD_INV_SQRT2 * vi;
+                    Vc_re[s_idx * n + col_a] = TSVD_INV_SQRT2 * vr;
+                    Vc_im[s_idx * n + col_a] = TSVD_INV_SQRT2 * vi;
+                    Vc_re[s_idx * n + col_b] = TSVD_INV_SQRT2 * vr;
+                    Vc_im[s_idx * n + col_b] = TSVD_INV_SQRT2 * vi;
                 }
             }
             s_idx++;
@@ -1218,7 +1249,7 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
         free(vM_re); free(vM_im);
         free(fU_re); free(fU_im); free(fS);
         free(fV_re); free(fV_im);
-        
+
         free(FF_re); free(FF_im);
         return;
     }
@@ -1226,10 +1257,7 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
     /* ═══════════════════════════════════════════════════════════════════════
      * PATH 2: VESICA + miniSVD — Wave present but partially symmetric
      *
-     * SVD on the full folded matrix (same dimensions but better conditioned
-     * in the vesica basis), then unfold the results.
-     * The fold is a Hadamard (self-inverse unitary), so fold→SVD→unfold
-     * is mathematically exact.
+     * SVD on the full folded matrix, then unfold with the winning syntheme.
      * ═══════════════════════════════════════════════════════════════════════ */
     {
         int rank = chi < n ? chi : n;
@@ -1244,35 +1272,41 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
         tsvd_truncated_sparse(FF_re, FF_im, m, n, rank,
                               fU_re, fU_im, fS, fV_re, fV_im);
 
-        /* Unfold U rows: inverse Vesica fold (Hadamard = self-inverse) */
+        /* Unfold U rows: inverse fold with winning syntheme */
         for (int s = 0; s < rank; s++) {
             sigma[s] = fS[s];
             for (int eA = 0; eA < num_envA; eA++) {
-                for (int j = 0; j < TSVD_VESICA_D2; j++) {
-                    int r_v = j * num_envA + eA;
-                    int r_w = (j + 3) * num_envA + eA;
+                for (int p = 0; p < TSVD_VESICA_D2; p++) {
+                    int a = pairs[p][0], b = pairs[p][1];
+                    int r_v = p * num_envA + eA;
+                    int r_w = (p + 3) * num_envA + eA;
                     double v_r = fU_re[r_v*rank+s], v_i = fU_im[r_v*rank+s];
                     double w_r = fU_re[r_w*rank+s], w_i = fU_im[r_w*rank+s];
-                    U_re[r_v*rank+s] = TSVD_INV_SQRT2 * (v_r + w_r);
-                    U_im[r_v*rank+s] = TSVD_INV_SQRT2 * (v_i + w_i);
-                    U_re[r_w*rank+s] = TSVD_INV_SQRT2 * (v_r - w_r);
-                    U_im[r_w*rank+s] = TSVD_INV_SQRT2 * (v_i - w_i);
+                    int row_a = a * num_envA + eA;
+                    int row_b = b * num_envA + eA;
+                    U_re[row_a*rank+s] = TSVD_INV_SQRT2 * (v_r + w_r);
+                    U_im[row_a*rank+s] = TSVD_INV_SQRT2 * (v_i + w_i);
+                    U_re[row_b*rank+s] = TSVD_INV_SQRT2 * (v_r - w_r);
+                    U_im[row_b*rank+s] = TSVD_INV_SQRT2 * (v_i - w_i);
                 }
             }
         }
 
-        /* Unfold V† cols: inverse Vesica fold */
+        /* Unfold V† cols: inverse fold with winning syntheme */
         for (int s = 0; s < rank; s++) {
             for (int eB = 0; eB < num_envB; eB++) {
-                for (int j = 0; j < TSVD_VESICA_D2; j++) {
-                    int c_v = j * num_envB + eB;
-                    int c_w = (j + 3) * num_envB + eB;
+                for (int p = 0; p < TSVD_VESICA_D2; p++) {
+                    int a = pairs[p][0], b = pairs[p][1];
+                    int c_v = p * num_envB + eB;
+                    int c_w = (p + 3) * num_envB + eB;
                     double v_r = fV_re[s*n+c_v], v_i = fV_im[s*n+c_v];
                     double w_r = fV_re[s*n+c_w], w_i = fV_im[s*n+c_w];
-                    Vc_re[s*n+c_v] = TSVD_INV_SQRT2 * (v_r + w_r);
-                    Vc_im[s*n+c_v] = TSVD_INV_SQRT2 * (v_i + w_i);
-                    Vc_re[s*n+c_w] = TSVD_INV_SQRT2 * (v_r - w_r);
-                    Vc_im[s*n+c_w] = TSVD_INV_SQRT2 * (v_i - w_i);
+                    int col_a = a * num_envB + eB;
+                    int col_b = b * num_envB + eB;
+                    Vc_re[s*n+col_a] = TSVD_INV_SQRT2 * (v_r + w_r);
+                    Vc_im[s*n+col_a] = TSVD_INV_SQRT2 * (v_i + w_i);
+                    Vc_re[s*n+col_b] = TSVD_INV_SQRT2 * (v_r - w_r);
+                    Vc_im[s*n+col_b] = TSVD_INV_SQRT2 * (v_i - w_i);
                 }
             }
         }
