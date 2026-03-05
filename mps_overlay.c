@@ -472,7 +472,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                 double phase_re = out_re / mag, phase_im = out_im / mag;
 
                 /* Put magnitude on A, phase on A, unit on B */
-                if (regA->num_nonzero < 4096) {
+                {
                     int found = -1;
                     for (uint32_t e = 0; e < regA->num_nonzero; e++) {
                         if (regA->entries[e].basis_state == newA) { found = e; break; }
@@ -480,21 +480,21 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                     if (found >= 0) {
                         regA->entries[found].amp_re += mag * phase_re;
                         regA->entries[found].amp_im += mag * phase_im;
-                    } else {
+                    } else if (regA->num_nonzero < 4096) {
                         int e = regA->num_nonzero++;
                         regA->entries[e].basis_state = newA;
                         regA->entries[e].amp_re = mag * phase_re;
                         regA->entries[e].amp_im = mag * phase_im;
                     }
                 }
-                if (regB->num_nonzero < 4096) {
+                {
                     int found = -1;
                     for (uint32_t e = 0; e < regB->num_nonzero; e++) {
                         if (regB->entries[e].basis_state == newB) { found = e; break; }
                     }
                     if (found >= 0) {
                         /* already there */
-                    } else {
+                    } else if (regB->num_nonzero < 4096) {
                         int e = regB->num_nonzero++;
                         regB->entries[e].basis_state = newB;
                         regB->entries[e].amp_re = 1.0;
