@@ -4,11 +4,11 @@ HEAP COMPILE. Otherwise you will get segfault!
 
 # HexState 3.6
 
-**A D=6 hexagonal quantum simulator.**
+**A D=6 hexagonal quantum simulator built on the Triality Quhit.**
 
-HexState operates in a native 6-state ("quhit") basis instead of the conventional 2-state qubit. Every quhit carries 6 complex amplitudes (96 bytes). Entangled pairs carry 36 (576 bytes). Memory scales as O(N + P) — polynomial in the number of quhits and pairs — never exponential.
+HexState operates in a native 6-state basis instead of the conventional 2-state qubit. Its primary quantum primitive is the **Triality Quhit** — a geometric object that simultaneously exists in five mutually-defining views (Edge, Vertex, Diagonal, Folded, Exotic). Gates automatically execute in whichever view is cheapest. States breathe between flat O(1) representations and full quantum form as needed.
 
-Built entirely in standalone C99. No external dependencies beyond the standard library and `libm`. OpenMP parallelism where available, SSE2 intrinsics where beneficial.
+Memory scales as O(N + P) — polynomial in the number of quhits and pairs — never exponential. Built entirely in standalone C99. No external dependencies beyond `libm`. OpenMP parallelism where available, SSE2 intrinsics where beneficial.
 
 ---
 
@@ -23,49 +23,27 @@ Built entirely in standalone C99. No external dependencies beyond the standard l
 │   MPS (1D) · PEPS (2D) · TNS (3D · 4D · 5D · 6D)     │
 ├────────────────────────────────────────────────────────┤
 │              Vesica Fold Factorization                 │
-│   Geometric SVD replacement for antipodal-symmetric    │
-│   states — lossless, O(1) for product states           │
+│   Geometric SVD replacement for symmetric states       │
+│   Lossless · O(1) for product states · No Jacobi       │
 ├────────────────────────────────────────────────────────┤
-│              Triality Engine                           │
+│     ★ Triality Quhit — Primary Quantum Primitive ★     │
 │   5-view lazy conversion · Flat auto-promote/demote    │
 │   Lazy gate chains · SVD spectrum oracle               │
+│   S₆ outer automorphism · 15-syntheme omnidirectional  │
 ├────────────────────────────────────────────────────────┤
-│              Core Quhit Engine                         │
+│              Foundation Layer (internal)                │
 │   DFT₆ · CZ · Born-rule · Registers · Substrate       │
-│   Self-calibration · S₆ exotic · BigInt · Gauss sums   │
+│   Self-calibration · BigInt · Gauss sums               │
 └────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Core Engine
+## The Triality Quhit
 
-| File | Role |
-|------|------|
-| `quhit_engine.h` | Master header. Architecture constants. Data structures. |
-| `quhit_core.c` | Engine lifecycle, PRNG (LCG, deterministic, reproducible). |
-| `quhit_gates.c` | DFT₆ (precomputed twiddle table — no trig at runtime), CZ, X (cyclic shift), Z (diagonal phase), arbitrary 6×6 unitaries. Entangled-pair gates operate on the 36-element joint state directly. |
-| `quhit_measure.c` | Born-rule sampling with collapse. Entangled measurement computes marginal probabilities, partially collapses the joint state, and auto-determines the partner's state. Non-destructive inspection (probabilities, entropy, purity). |
-| `quhit_entangle.c` | Bell-pair creation (braid), disentanglement (unbraid), product-state preparation. |
-| `quhit_register.c` | 100-trillion-scale registers. GHZ entanglement across arbitrary N quhits via a chained Bell-pair sliding window — at most 768 bytes live at any time regardless of N. Bulk rules, DFT, measurement, sparse amplitude readout. |
+The Triality Quhit (`quhit_triality.h` / `quhit_triality.c`) is the primary quantum primitive in HexState. It is based on the CMY geometric principle: three mutually-defining views where each view's structure *is* the other views' structure in a different role.
 
-### Side-Channel Primitives (header-only)
-
-| File | Contents |
-|------|----------|
-| `arithmetic.h` | IEEE-754 constants reverse-engineered from substrate probing. Mantissa widths, exponent biases, magic numbers for fast inverse sqrt and log₂. |
-| `born_rule.h` | Born-rule sampling utilities, fast inverse square root. |
-| `statevector.h` | Cache-aligned state vector storage layouts. |
-| `superposition.h` | Precomputed DFT₆ twiddle tables, superposition utilities. |
-| `entanglement.h` | Joint-state operations, Bell states, partial trace. |
-| `quhit_management.h` | Per-quhit state management, entanglement lifecycle. |
-| `quhit_gauss.h` | Analytic Gauss sum amplitude resolver. Evaluates exact amplitudes for DFT₆+CZ circuits in O(N) time with zero storage. |
-
----
-
-## Triality Engine
-
-The Triality Quhit (`quhit_triality.h` / `quhit_triality.c`) is a quantum primitive based on three mutually-defining geometric views:
+Every quhit stores its state simultaneously in five views with lazy conversion:
 
 | View | Basis | Cheap operations |
 |------|-------|-----------------|
@@ -104,13 +82,13 @@ The SVD is the most expensive operation in tensor network contraction. The oracl
 
 This is exact, not an approximation. O(1) instead of O(n³).
 
----
+### S₆ Outer Automorphism (`s6_exotic.h` / `s6_exotic.c`)
 
-## S₆ Outer Automorphism (`s6_exotic.h` / `s6_exotic.c`)
+S₆ is the *only* symmetric group possessing a non-trivial outer automorphism. HexState implements the full automorphism φ over all 720 permutations, the 15 synthemes (partitions of {0,…,5} into 3 unordered pairs), and the 6 synthematic totals. The omnidirectional fold enables lossless basis changes parameterized by any of the 15 synthemes, not just the default antipodal pairing {(0,3),(1,4),(2,5)}.
 
-S₆ is the *only* symmetric group possessing a non-trivial outer automorphism. HexState implements the full automorphism φ over all 720 permutations, the 15 synthemes (partitions of {0,…,5} into 3 unordered pairs), and the 6 synthematic totals.
+### Triadic 3-Body Entanglement (`quhit_triadic.h` / `quhit_triadic.c`)
 
-The omnidirectional fold enables lossless basis changes parameterized by any of the 15 synthemes, not just the default antipodal pairing {(0,3),(1,4),(2,5)}.
+Native 3-body entanglement primitives: CMY Bell states, GHZ triples, and product triples, with marginal computation for each party.
 
 ---
 
@@ -206,12 +184,37 @@ Five cross-validation identities are checked at boot. Cost: ~1μs.
 
 ---
 
-## Additional Modules
+## Foundation Layer (internal)
+
+The Triality Quhit is built on top of a lower-level quhit engine. Users interact with Triality; these modules provide the underlying infrastructure.
+
+| File | Role |
+|------|------|
+| `quhit_engine.h` | Master header. Architecture constants. Each raw quhit = 6 complex amplitudes (96 bytes). Entangled pairs = 36 amplitudes (576 bytes). |
+| `quhit_core.c` | Engine lifecycle, PRNG (LCG, deterministic, reproducible). |
+| `quhit_gates.c` | DFT₆ (precomputed twiddle table — no trig at runtime), CZ, X, Z, arbitrary 6×6 unitaries. |
+| `quhit_measure.c` | Born-rule sampling with collapse. Entangled measurement computes marginals, partially collapses joint state, auto-determines partner. |
+| `quhit_entangle.c` | Bell-pair creation (braid), disentanglement (unbraid), product-state preparation. |
+| `quhit_register.c` | 100-trillion-scale registers. GHZ entanglement across arbitrary N via sliding window — 768 bytes live regardless of N. |
+
+### Primitives (header-only)
+
+| File | Contents |
+|------|----------|
+| `arithmetic.h` | IEEE-754 constants reverse-engineered from substrate probing. |
+| `born_rule.h` | Born-rule sampling utilities, fast inverse square root. |
+| `statevector.h` | Cache-aligned state vector storage. |
+| `superposition.h` | Precomputed DFT₆ twiddle tables. |
+| `entanglement.h` | Joint-state operations, Bell states, partial trace. |
+| `quhit_management.h` | Per-quhit state management, entanglement lifecycle. |
+| `quhit_gauss.h` | O(N) analytic Gauss sum amplitude resolver for DFT₆+CZ circuits. |
+
+### Additional Modules
 
 | File | Purpose |
 |------|---------|
-| `bigint.c/.h` | Arbitrary-precision integer arithmetic (mul, gcd, pow_mod, add). Used by the entangled factoring engine. |
-| `svd_truncate.h` | Register-level SVD entry truncation buffer. Caps to 4096 entries by magnitude. |
+| `bigint.c/.h` | Arbitrary-precision integer arithmetic (mul, gcd, pow_mod, add). |
+| `svd_truncate.h` | SVD entry truncation buffer. Caps to 4096 entries by magnitude. |
 | `tensor_network.h` | Shared tensor network constants and utilities. |
 | `tensor_product.h` | Tensor product and contraction primitives. |
 | `quhit_factored.h` | Factored state representations. |
