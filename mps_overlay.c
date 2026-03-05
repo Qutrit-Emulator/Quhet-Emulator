@@ -276,8 +276,7 @@ void mps_gate_bond(MpsChain *c, int site,
     double *Vc_re = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
     double *Vc_im = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
 
-    tsvd_vesica_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B,
-                   D, num_EA, num_EB, chi,
+    tsvd_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B, chi,
                    U_re, U_im, sig, Vc_re, Vc_im);
     free(Th2_re); free(Th2_im);
 
@@ -290,11 +289,9 @@ void mps_gate_bond(MpsChain *c, int site,
     if (rank_cap < 1) rank_cap = 1;
     if (rank > rank_cap) rank = rank_cap;
 
-    double sig_norm = 0;
-    for (int s = 0; s < rank; s++) sig_norm += sig[s];
-
-    /* Update shared bond weights */
-    for (int s = 0; s < (int)MPS_CHI; s++) shared_bw->w[s] = 1.0;
+    /* Store σ on bonds — the Θ contraction absorbs them via sw = bonds.w[] */
+    for (int s = 0; s < (int)MPS_CHI; s++)
+        shared_bw->w[s] = (s < rank) ? sig[s] : 0.0;
 
     /* ── 5. Write back safely ── */
     svd_buf_reset(&mps_svd_buf);
@@ -304,9 +301,8 @@ void mps_gate_bond(MpsChain *c, int site,
          basis_t envA = uniq_envA[eA];
          basis_t pure = (envA / bp[bond_A]) * bp[bond_A + 1] + (envA % bp[bond_A]);
          for (int gv = 0; gv < rank; gv++) {
-             double weight = (sig_norm > 1e-30 && sig[gv] > 1e-30) ? born_fast_isqrt(sig[gv] * sig_norm) * sig[gv] : 0.0;
-             double re = U_re[row_idx * rank + gv] * weight;
-             double im = U_im[row_idx * rank + gv] * weight;
+             double re = U_re[row_idx * rank + gv];
+             double im = U_im[row_idx * rank + gv];
              if (re*re + im*im < 1e-50) continue;
              svd_buf_push(&mps_svd_buf, kA * MPS_C2 + pure + gv * bp[bond_A], re, im);
          }
@@ -320,9 +316,8 @@ void mps_gate_bond(MpsChain *c, int site,
          basis_t envB = uniq_envB[eB];
          basis_t pure = (envB / bp[bond_B]) * bp[bond_B + 1] + (envB % bp[bond_B]);
          for (int gv = 0; gv < rank; gv++) {
-             double weight = (sig_norm > 1e-30 && sig[gv] > 1e-30) ? born_fast_isqrt(sig[gv] * sig_norm) * sig[gv] : 0.0;
-             double re = weight * Vc_re[gv * svddim_B + col_idx];
-             double im = weight * Vc_im[gv * svddim_B + col_idx];
+             double re = Vc_re[gv * svddim_B + col_idx];
+             double im = Vc_im[gv * svddim_B + col_idx];
              if (re*re + im*im < 1e-50) continue;
              svd_buf_push(&mps_svd_buf, kB * MPS_C2 + pure + gv * bp[bond_B], re, im);
          }
