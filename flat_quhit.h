@@ -271,7 +271,7 @@ static inline void fq_idft(FlatQuhit *fq) {
 
 /* CZ: controlled-Z between two FlatQuhits
  * CZ|j⟩|k⟩ = ω^(j·k)|j⟩|k⟩ where ω = e^(2πi/6)
- * Lucifer #3: Direct computation for all flat/subspace combos — no promotion. */
+ * Direct computation for all flat/subspace combos — no promotion. */
 static inline void fq_cz(FlatQuhit *a, FlatQuhit *b) {
     if (a->repr == FLAT_BASIS && b->repr == FLAT_BASIS) {
         /* Basis × Basis: ω^(j·k) phase on a only. O(1).
