@@ -272,6 +272,7 @@ void mps_gate_bond(MpsChain *c, int site,
         }
     }
 
+
     /* ── 3. Apply Gate ── */
     double *Th2_re = (double *)calloc(svd2, sizeof(double));
     double *Th2_im = (double *)calloc(svd2, sizeof(double));
@@ -320,9 +321,6 @@ void mps_gate_bond(MpsChain *c, int site,
     if (svd_cols > chi) svd_cols = chi;
     int rank = svd_cols;
 
-    /* DBG */ fprintf(stderr, "BOND site=%d: svddim=%dx%d nEA=%d nEB=%d rank=%d sig=[%.6f,%.6f,%.6f,%.6f,%.6f,%.6f] nregA=%u nregB=%u\n",
-    /* DBG */   site, svddim_A, svddim_B, num_EA, num_EB, rank, sig[0], rank>1?sig[1]:0, rank>2?sig[2]:0, rank>3?sig[3]:0, rank>4?sig[4]:0, rank>5?sig[5]:0, regA->num_nonzero, regB->num_nonzero);
-    /* DBG */ fprintf(stderr, "  bond_w=[%.6f,%.6f,%.6f,%.6f]\n", shared_bw->w[0], shared_bw->w[1], chi>2?shared_bw->w[2]:0, chi>3?shared_bw->w[3]:0);
 
     /* Trim trailing zero singular values */
     while (rank > 0 && sig[rank - 1] < 1e-14) rank--;
