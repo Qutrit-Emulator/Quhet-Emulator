@@ -289,7 +289,9 @@ void mps_gate_bond(MpsChain *c, int site,
     if (rank_cap < 1) rank_cap = 1;
     if (rank > rank_cap) rank = rank_cap;
 
-    /* Store σ on bonds — the Θ contraction absorbs them via sw = bonds.w[] */
+    /* Store σ on bonds — Θ contraction absorbs via sw = bonds.w[s].
+     * U and V are written unscaled. 1-site gates between bond gates
+     * are compatible because they don't touch the bond index. */
     for (int s = 0; s < (int)MPS_CHI; s++)
         shared_bw->w[s] = (s < rank) ? sig[s] : 0.0;
 
@@ -303,7 +305,7 @@ void mps_gate_bond(MpsChain *c, int site,
          for (int gv = 0; gv < rank; gv++) {
              double re = U_re[row_idx * rank + gv];
              double im = U_im[row_idx * rank + gv];
-             if (re*re + im*im < 1e-50) continue;
+             if (re == 0.0 && im == 0.0) continue;
              svd_buf_push(&mps_svd_buf, kA * MPS_C2 + pure + gv * bp[bond_A], re, im);
          }
      }
@@ -318,7 +320,7 @@ void mps_gate_bond(MpsChain *c, int site,
          for (int gv = 0; gv < rank; gv++) {
              double re = Vc_re[gv * svddim_B + col_idx];
              double im = Vc_im[gv * svddim_B + col_idx];
-             if (re*re + im*im < 1e-50) continue;
+             if (re == 0.0 && im == 0.0) continue;
              svd_buf_push(&mps_svd_buf, kB * MPS_C2 + pure + gv * bp[bond_B], re, im);
          }
      }
