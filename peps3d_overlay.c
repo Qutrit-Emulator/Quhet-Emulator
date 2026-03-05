@@ -471,19 +471,17 @@ void tns3d_local_density(Tns3dGrid *g, int x, int y, int z, double *probs)
         /* Weight by each bond σ² */
         for (int b = 0; b < 6; b++) {
             int bval = (int)((pure / bp3d[b]) % TNS3D_CHI);
-            /* Find which bond array this corresponds to */
-            int bx = -1;
-            Tns3dBondWeight *barr = NULL;
+            Tns3dBondWeight *bw = NULL;
             switch(b) {
-                case 0: if(z < g->Lz-1) { bx = tns3d_bond_z(g,x,y,z);   barr = g->z_bonds; } break;
-                case 1: if(z > 0)        { bx = tns3d_bond_z(g,x,y,z-1); barr = g->z_bonds; } break;
-                case 2: if(y < g->Ly-1) { bx = tns3d_bond_y(g,x,y,z);   barr = g->y_bonds; } break;
-                case 3: if(y > 0)        { bx = tns3d_bond_y(g,x,y-1,z); barr = g->y_bonds; } break;
-                case 4: if(x < g->Lx-1) { bx = tns3d_bond_x(g,x,y,z);   barr = g->x_bonds; } break;
-                case 5: if(x > 0)        { bx = tns3d_bond_x(g,x-1,y,z); barr = g->x_bonds; } break;
+                case 0: if(z < g->Lz-1) bw = tns3d_zbond(g,x,y,z);   break;
+                case 1: if(z > 0)        bw = tns3d_zbond(g,x,y,z-1); break;
+                case 2: if(y < g->Ly-1) bw = tns3d_ybond(g,x,y,z);   break;
+                case 3: if(y > 0)        bw = tns3d_ybond(g,x,y-1,z); break;
+                case 4: if(x < g->Lx-1) bw = tns3d_xbond(g,x,y,z);   break;
+                case 5: if(x > 0)        bw = tns3d_xbond(g,x-1,y,z); break;
             }
-            if (bx >= 0 && barr) {
-                double w = barr[bx].w[bval];
+            if (bw) {
+                double w = bw->w[bval];
                 p *= w * w;
             }
         }
