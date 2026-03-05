@@ -1,7 +1,6 @@
 /*
  * flat_quhit.h — The Flat Representation
  *
- *
  * When a quantum state reaches a structurally simple condition —
  * a single basis state, a phase-locked eigenstate, a confined subspace —
  * it can be "demoted" to the Flat, where gates are O(1) instead of O(D).
