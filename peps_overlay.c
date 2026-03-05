@@ -401,18 +401,18 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
     double *Vc_re = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
     double *Vc_im = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
 
-    tsvd_vesica_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B,
-                   D, num_EA, num_EB, chi,
+    int svd_rank = chi < svddim_B ? chi : svddim_B;
+    if (svd_rank > svddim_A) svd_rank = svddim_A;
+    tsvd_truncated(Th2_re, Th2_im, svddim_A, svddim_B, svd_rank,
                    U_re, U_im, sig, Vc_re, Vc_im);
     free(Th2_re); free(Th2_im);
 
     /* ── 5. Update bond weight ── */
     int rank = chi < svddim_B ? chi : svddim_B;
     if (rank > svddim_A) rank = svddim_A;
-    double sig_norm = 0;
-    for (int s = 0; s < rank; s++) sig_norm += sig[s];
-    if (sig_norm > 1e-30)
-        for (int s = 0; s < rank; s++) hb_shared->w[s] = sig[s] / sig_norm;
+    /* Store σ on bonds — Θ contraction absorbs via sw = bonds.w[s] */
+    for (int s = 0; s < chi; s++)
+        hb_shared->w[s] = (s < rank) ? sig[s] : 0.0;
 
     /* ── 6. Write back with magnitude-sorted truncation ── */
     svd_buf_reset(&peps_svd_buf);
@@ -666,18 +666,18 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
     double *Vc_re = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
     double *Vc_im = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
 
-    tsvd_vesica_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B,
-                   D, num_EA, num_EB, chi,
+    int svd_rank = chi < svddim_B ? chi : svddim_B;
+    if (svd_rank > svddim_A) svd_rank = svddim_A;
+    tsvd_truncated(Th2_re, Th2_im, svddim_A, svddim_B, svd_rank,
                    U_re, U_im, sig, Vc_re, Vc_im);
     free(Th2_re); free(Th2_im);
 
     /* ── 5. Update bond weight ── */
     int rank = chi < svddim_B ? chi : svddim_B;
     if (rank > svddim_A) rank = svddim_A;
-    double sig_norm = 0;
-    for (int s = 0; s < rank; s++) sig_norm += sig[s];
-    if (sig_norm > 1e-30)
-        for (int s = 0; s < rank; s++) vb_shared->w[s] = sig[s] / sig_norm;
+    /* Store σ on bonds — Θ contraction absorbs via sw = bonds.w[s] */
+    for (int s = 0; s < chi; s++)
+        vb_shared->w[s] = (s < rank) ? sig[s] : 0.0;
 
     /* ── 6. Write back with magnitude-sorted truncation ── */
     svd_buf_reset(&peps_svd_buf);
