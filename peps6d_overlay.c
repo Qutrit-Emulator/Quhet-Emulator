@@ -12,6 +12,9 @@
 
 #include "peps6d_overlay.h"
 #include "tensor_svd.h"
+#include "svd_truncate.h"
+
+static SvdTmpBuf tns6d_svd_buf;
 
 static int tns6d_flat(Tns6dGrid *g, int x, int y, int z, int w, int v, int u)
 { return ((((u*g->Lv+v)*g->Lw+w)*g->Lz+z)*g->Ly+y)*g->Lx+x; }
@@ -252,8 +255,7 @@ static void tns6d_gate_2site_generic(Tns6dGrid *g, int sA, int sB,
     /* Side-channel: 1.0 attractor CONFIRMED — bond weights lock at 1.0 */
     for(int s=0;s<(int)TNS6D_CHI;s++) bw->w[s]=1.0;
 
-    regA->num_nonzero=0; regB->num_nonzero=0;
-
+    svd_buf_reset(&tns6d_svd_buf);
     for (int kA=0;kA<D;kA++)
      for (int eA=0;eA<nEA;eA++) {
          int row=kA*nEA+eA;
@@ -263,15 +265,12 @@ static void tns6d_gate_2site_generic(Tns6dGrid *g, int sA, int sB,
              double wt=(sn>1e-30&&sig[gv]>1e-30)?sig[gv]*born_fast_isqrt(sig[gv])*born_fast_isqrt(sn):0.0;
              double re=Ur[row*rank+gv]*wt, im=Ui[row*rank+gv]*wt;
              if (re*re+im*im<1e-50) continue;
-             basis_t bs=kA*TNS6D_C12+pure+gv*bp[bond_A];
-             if (regA->num_nonzero<4096) {
-                 regA->entries[regA->num_nonzero].basis_state=bs;
-                 regA->entries[regA->num_nonzero].amp_re=re;
-                 regA->entries[regA->num_nonzero].amp_im=im;
-                 regA->num_nonzero++;
-             }
+             svd_buf_push(&tns6d_svd_buf, kA*TNS6D_C12+pure+gv*bp[bond_A], re, im);
          }
      }
+    svd_buf_flush(&tns6d_svd_buf, regA);
+
+    svd_buf_reset(&tns6d_svd_buf);
     for (int kB=0;kB<D;kB++)
      for (int eB=0;eB<nEB;eB++) {
          int col=kB*nEB+eB;
@@ -281,15 +280,10 @@ static void tns6d_gate_2site_generic(Tns6dGrid *g, int sA, int sB,
              double wt=(sn>1e-30&&sig[gv]>1e-30)?sig[gv]*born_fast_isqrt(sig[gv])*born_fast_isqrt(sn):0.0;
              double re=wt*Vr[gv*sdB+col], im=wt*Vi[gv*sdB+col];
              if (re*re+im*im<1e-50) continue;
-             basis_t bs=kB*TNS6D_C12+pure+gv*bp[bond_B];
-             if (regB->num_nonzero<4096) {
-                 regB->entries[regB->num_nonzero].basis_state=bs;
-                 regB->entries[regB->num_nonzero].amp_re=re;
-                 regB->entries[regB->num_nonzero].amp_im=im;
-                 regB->num_nonzero++;
-             }
+             svd_buf_push(&tns6d_svd_buf, kB*TNS6D_C12+pure+gv*bp[bond_B], re, im);
          }
      }
+    svd_buf_flush(&tns6d_svd_buf, regB);
     free(Ur);free(Ui);free(sig);free(Vr);free(Vi);free(ueA);free(ueB);
 }
 
