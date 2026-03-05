@@ -40,7 +40,7 @@ MpsChain *mps_init(int L)
     c->bonds = (MpsBondWeight *)calloc(L - 1, sizeof(MpsBondWeight));
     for (int i = 0; i < L - 1; i++) {
         c->bonds[i].w = (double *)calloc((size_t)MPS_CHI, sizeof(double));
-        for (int s = 0; s < (int)MPS_CHI; s++) c->bonds[i].w[s] = 1.0;
+        c->bonds[i].w[0] = 1.0;  /* Product state: only shared bond 0 active */
     }
 
     c->eng = (QuhitEngine *)calloc(1, sizeof(QuhitEngine));
@@ -195,7 +195,15 @@ void mps_gate_bond(MpsChain *c, int site,
         return;
     }
 
-    /* ── 2. Build Θ ── */
+    /* Adjacent bond weights for Γ-Λ simple-update:
+     * left  = bonds[site-1] for site A's α (environment)
+     * right = bonds[site+1] for site B's β (environment) */
+    MpsBondWeight *bw_left  = (sA > 0) ? &c->bonds[sA - 1] : NULL;
+    MpsBondWeight *bw_right = (sB < c->L - 1) ? &c->bonds[sB] : NULL;
+
+    /* ── 2. Build Θ (Γ-Λ form) ──
+     * Θ = √Λ_left · ΓA · Λ_shared · ΓB · √Λ_right
+     * Absorb all bond weights to create properly normalized Θ. */
     int svddim_A = D * num_EA;
     int svddim_B = D * num_EB;
     size_t svd2 = (size_t)svddim_A * svddim_B;
@@ -219,6 +227,15 @@ void mps_gate_bond(MpsChain *c, int site,
         if (idx_EA < 0) continue;
         int row = kA * num_EA + idx_EA;
 
+        /* Absorb √Λ_left: weight A amplitude by √σ_left[α_A] */
+        double wA = 1.0;
+        if (bw_left) {
+            int alpha_A = (int)((pureA / bp[1]) % chi);
+            wA = bw_left->w[alpha_A];
+            if (wA > 0) wA = sqrt(wA); else wA = 0;
+        }
+        double warA = arA * wA, waiA = aiA * wA;
+
         for (uint32_t eB = 0; eB < regB->num_nonzero; eB++) {
             basis_t bsB = regB->entries[eB].basis_state;
             double arB = regB->entries[eB].amp_re;
@@ -238,11 +255,20 @@ void mps_gate_bond(MpsChain *c, int site,
             if (idx_EB < 0) continue;
             int col = kB * num_EB + idx_EB;
 
-            double sw = shared_bw->w[shared_valA];
-            double br = arB * sw, bi = aiB * sw;
+            /* Absorb √Λ_right: weight B amplitude by √σ_right[β_B] */
+            double wB = 1.0;
+            if (bw_right) {
+                int beta_B = (int)(pureB % chi);
+                wB = bw_right->w[beta_B];
+                if (wB > 0) wB = sqrt(wB); else wB = 0;
+            }
 
-            Th_re[row * svddim_B + col] += arA*br - aiA*bi;
-            Th_im[row * svddim_B + col] += arA*bi + aiA*br;
+            /* Absorb Λ_shared: multiply by σ_shared[s] */
+            double sw = shared_bw->w[shared_valA];
+            double br = arB * sw * wB, bi = aiB * sw * wB;
+
+            Th_re[row * svddim_B + col] += warA*br - waiA*bi;
+            Th_im[row * svddim_B + col] += warA*bi + waiA*br;
         }
     }
 
@@ -289,8 +315,18 @@ void mps_gate_bond(MpsChain *c, int site,
                    U_re, U_im, sig, Vc_re, Vc_im);
     free(Th2_re); free(Th2_im);
 
-    int rank = chi < svddim_B ? chi : svddim_B;
-    if (rank > svddim_A) rank = svddim_A;
+    /* Determine actual SVD rank: min(rows, cols, chi), trimmed at zero sigmas */
+    int svd_cols = svddim_A < svddim_B ? svddim_A : svddim_B;
+    if (svd_cols > chi) svd_cols = chi;
+    int rank = svd_cols;
+
+    /* DBG */ fprintf(stderr, "BOND site=%d: svddim=%dx%d nEA=%d nEB=%d rank=%d sig=[%.6f,%.6f,%.6f,%.6f,%.6f,%.6f] nregA=%u nregB=%u\n",
+    /* DBG */   site, svddim_A, svddim_B, num_EA, num_EB, rank, sig[0], rank>1?sig[1]:0, rank>2?sig[2]:0, rank>3?sig[3]:0, rank>4?sig[4]:0, rank>5?sig[5]:0, regA->num_nonzero, regB->num_nonzero);
+    /* DBG */ fprintf(stderr, "  bond_w=[%.6f,%.6f,%.6f,%.6f]\n", shared_bw->w[0], shared_bw->w[1], chi>2?shared_bw->w[2]:0, chi>3?shared_bw->w[3]:0);
+
+    /* Trim trailing zero singular values */
+    while (rank > 0 && sig[rank - 1] < 1e-14) rank--;
+    if (rank == 0) rank = 1;
 
     /* Cap rank for 4096-entry register limit */
     int max_env = num_EA > num_EB ? num_EA : num_EB;
@@ -298,24 +334,32 @@ void mps_gate_bond(MpsChain *c, int site,
     if (rank_cap < 1) rank_cap = 1;
     if (rank > rank_cap) rank = rank_cap;
 
-    double sig_norm = 0;
-    for (int s = 0; s < rank; s++) sig_norm += sig[s];
+    /* Store σ as bond weights for the shared bond */
+    for (int s = 0; s < (int)MPS_CHI; s++)
+        shared_bw->w[s] = (s < rank) ? sig[s] : 0.0;
 
-    /* Bond weights locked to 1.0 (same attractor as peps3d) */
-    for (int s = 0; s < (int)MPS_CHI; s++) shared_bw->w[s] = 1.0;
-
-    /* ── 5. Write back ── */
+    /* ── 5. Write back (Γ form) ──
+     * Divide out √Λ_left from U to get ΓA, and √Λ_right from V† to get ΓB.
+     * ΓA[kA, envA, gv] = U[row, gv] / √σ_left[α_A]
+     * ΓB[kB, gv, envB] = V†[gv, col] / √σ_right[β_B] */
     svd_buf_reset(&mps_svd_buf);
     for (int kA = 0; kA < D; kA++)
      for (int eA = 0; eA < num_EA; eA++) {
          int row_idx = kA * num_EA + eA;
          basis_t envA = uniq_envA[eA];
          basis_t pure = (envA / bp[bond_A]) * bp[bond_A + 1] + (envA % bp[bond_A]);
+
+         /* Compute √Λ_left inverse for this environment index */
+         double inv_wL = 1.0;
+         if (bw_left) {
+             int alpha_A = (int)(envA % chi);  /* envA is the α value */
+             double wL = bw_left->w[alpha_A];
+             inv_wL = (wL > 1e-15) ? 1.0 / sqrt(wL) : 0.0;
+         }
+
          for (int gv = 0; gv < rank; gv++) {
-             double weight = (sig_norm > 1e-30 && sig[gv] > 1e-30)
-                           ? born_fast_isqrt(sig[gv] * sig_norm) * sig[gv] : 0.0;
-             double re = U_re[row_idx * rank + gv] * weight;
-             double im = U_im[row_idx * rank + gv] * weight;
+             double re = U_re[row_idx * svd_cols + gv] * inv_wL;
+             double im = U_im[row_idx * svd_cols + gv] * inv_wL;
              if (re*re + im*im < 1e-50) continue;
              svd_buf_push(&mps_svd_buf,
                           kA * MPS_C2 + pure + gv * bp[bond_A], re, im);
@@ -329,11 +373,18 @@ void mps_gate_bond(MpsChain *c, int site,
          int col_idx = kB * num_EB + eB;
          basis_t envB = uniq_envB[eB];
          basis_t pure = (envB / bp[bond_B]) * bp[bond_B + 1] + (envB % bp[bond_B]);
+
+         /* Compute √Λ_right inverse for this environment index */
+         double inv_wR = 1.0;
+         if (bw_right) {
+             int beta_B = (int)(envB % chi);  /* envB is the β value */
+             double wR = bw_right->w[beta_B];
+             inv_wR = (wR > 1e-15) ? 1.0 / sqrt(wR) : 0.0;
+         }
+
          for (int gv = 0; gv < rank; gv++) {
-             double weight = (sig_norm > 1e-30 && sig[gv] > 1e-30)
-                           ? born_fast_isqrt(sig[gv] * sig_norm) * sig[gv] : 0.0;
-             double re = weight * Vc_re[gv * svddim_B + col_idx];
-             double im = weight * Vc_im[gv * svddim_B + col_idx];
+             double re = Vc_re[gv * svddim_B + col_idx] * inv_wR;
+             double im = Vc_im[gv * svddim_B + col_idx] * inv_wR;
              if (re*re + im*im < 1e-50) continue;
              svd_buf_push(&mps_svd_buf,
                           kB * MPS_C2 + pure + gv * bp[bond_B], re, im);
@@ -362,15 +413,37 @@ void mps_local_density(MpsChain *c, int site, double *probs)
     if (reg < 0 || !c->eng) { probs[0] = 1.0; return; }
 
     QuhitRegister *r = &c->eng->registers[reg];
+    int chi = (int)MPS_CHI;
     double total = 0;
+
+    /* Bond weight pointers: left bond (α, position 1) and right bond (β, position 0) */
+    MpsBondWeight *bw_left  = (site > 0) ? &c->bonds[site - 1] : NULL;
+    MpsBondWeight *bw_right = (site < c->L - 1) ? &c->bonds[site] : NULL;
 
     for (uint32_t e = 0; e < r->num_nonzero; e++) {
         basis_t bs = r->entries[e].basis_state;
         int k = (int)(bs / MPS_C2);
         if (k >= MPS_D) continue;
+        basis_t pure = bs % MPS_C2;
+        int beta  = (int)(pure % chi);         /* position 0: right bond index */
+        int alpha = (int)((pure / chi) % chi); /* position 1: left bond index */
+
         double re = r->entries[e].amp_re;
         double im = r->entries[e].amp_im;
         double p = re * re + im * im;
+
+        /* Weight by σ² for each adjacent bond (σ_left[α]² × σ_right[β]²)
+         * The density ρ_k = Σ_{α,β} |U[k,α,β]|² × σ_L[α]² × σ_R[β]²
+         * where σ² are the squared singular values (= eigenvalues of reduced ρ) */
+        if (bw_left && alpha < chi) {
+            double wL = bw_left->w[alpha];
+            p *= wL * wL;
+        }
+        if (bw_right && beta < chi) {
+            double wR = bw_right->w[beta];
+            p *= wR * wR;
+        }
+
         probs[k] += p;
         total += p;
     }
@@ -387,10 +460,12 @@ void mps_gate_bond_all(MpsChain *c, const double *G_re, const double *G_im)
 {
     if (c->L < 2) return;
 
-    for (int parity = 0; parity < 2; parity++) {
-        for (int i = parity; i < c->L - 1; i += 2)
-            mps_gate_bond(c, i, G_re, G_im);
-    }
+    /* Sequential left-to-right sweep.
+     * MPS simple-update requires sequential ordering: each bond gate
+     * modifies both adjacent tensors, and the next bond must see the
+     * updated tensor from the previous step. */
+    for (int i = 0; i < c->L - 1; i++)
+        mps_gate_bond(c, i, G_re, G_im);
 }
 
 void mps_gate_1site_all(MpsChain *c, const double *U_re, const double *U_im)
