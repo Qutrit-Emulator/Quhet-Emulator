@@ -116,6 +116,11 @@ Tns3dGrid *tns3d_init(int Lx, int Ly, int Lz)
         g->tensors[i].reg_idx = g->site_reg[i];
     }
 
+    /* ── Per-site Triality state ── */
+    g->tri_sites = (TriOverlaySite *)calloc(N, sizeof(TriOverlaySite));
+    for (int i = 0; i < N; i++)
+        tri_site_init(&g->tri_sites[i]);
+
     return g;
 }
 
@@ -138,6 +143,7 @@ void tns3d_free(Tns3dGrid *g)
     }
     free(g->q_phys);
     free(g->site_reg);
+    free(g->tri_sites);
     free(g);
 }
 
@@ -177,76 +183,14 @@ void tns3d_gate_1site(Tns3dGrid *g, int x, int y, int z,
     int reg_idx = g->site_reg[site];
     if (reg_idx < 0 || !g->eng) return;
 
-    /* Manual rotation of physical index k.
-     * Register dim=χ=12, but physical index k∈[0,D=6).
-     * Can't use quhit_reg_apply_unitary_pos which assumes dim=D. */
-    int D = TNS3D_D;
     QuhitRegister *r = &g->eng->registers[reg_idx];
-    uint32_t old_n = r->num_nonzero;
+    uint8_t mask = g->tri_sites ? g->tri_sites[site].active_mask : 0x3F;
+    unsigned __int128 chi_power = (unsigned __int128)TNS3D_C6;
+    tri_reg_gate_1site_masked(r, U_re, U_im, mask, chi_power);
 
-    /* Read existing entries */
-    basis_t *old_bs = (basis_t *)calloc(old_n, sizeof(basis_t));
-    double *old_re = (double *)calloc(old_n, sizeof(double));
-    double *old_im = (double *)calloc(old_n, sizeof(double));
-    for (uint32_t e = 0; e < old_n; e++) {
-        old_bs[e] = r->entries[e].basis_state;
-        old_re[e] = r->entries[e].amp_re;
-        old_im[e] = r->entries[e].amp_im;
-    }
-
-    r->num_nonzero = 0;
-
-    uint32_t max_out = old_n * D + 1;
-    if (max_out < 4096) max_out = 4096;
-    struct tmp_entry *tmp = calloc(max_out, sizeof(*tmp));
-    uint32_t nout = 0;
-
-    for (int kp = 0; kp < D; kp++) {
-        for (uint32_t e = 0; e < old_n; e++) {
-            basis_t bs = old_bs[e];
-            int k = (int)(bs / TNS3D_C6);
-            if (k >= D) continue;
-            basis_t bond_part = bs % TNS3D_C6;
-
-            double gre = U_re[kp * D + k];
-            double gim = U_im[kp * D + k];
-            if (gre*gre + gim*gim < 1e-10) continue;
-
-            double are = old_re[e], aim = old_im[e];
-            double new_re = gre*are - gim*aim;
-            double new_im = gre*aim + gim*are;
-
-            if (nout < max_out) {
-                tmp[nout].basis = (basis_t)kp * TNS3D_C6 + bond_part;
-                tmp[nout].re = new_re;
-                tmp[nout].im = new_im;
-                nout++;
-            }
-        }
-    }
-
-    qsort(tmp, nout, sizeof(struct tmp_entry), cmp_basis);
-
-    r->num_nonzero = 0;
-    for (uint32_t t = 0; t < nout; t++) {
-        double acc_re = tmp[t].re;
-        double acc_im = tmp[t].im;
-        while (t + 1 < nout && tmp[t+1].basis == tmp[t].basis) {
-            t++;
-            acc_re += tmp[t].re;
-            acc_im += tmp[t].im;
-        }
-        if (acc_re*acc_re + acc_im*acc_im >= 1e-10 &&
-            r->num_nonzero < 4096) {
-            r->entries[r->num_nonzero].basis_state = tmp[t].basis;
-            r->entries[r->num_nonzero].amp_re = acc_re;
-            r->entries[r->num_nonzero].amp_im = acc_im;
-            r->num_nonzero++;
-        }
-    }
-
-    free(tmp);
-    free(old_bs); free(old_re); free(old_im);
+    /* Mirror to triality site */
+    if (g->tri_sites)
+        tri_site_apply_gate(&g->tri_sites[site], U_re, U_im);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
