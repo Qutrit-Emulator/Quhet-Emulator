@@ -14,6 +14,9 @@
 
 #include "peps4d_overlay.h"
 #include "tensor_svd.h"
+#include "svd_truncate.h"
+
+static SvdTmpBuf tns4d_svd_buf;
 
 #define TNS4D_PHYS_POS 8  /* Physical index k is at position 8 (most significant) */
 
@@ -379,10 +382,8 @@ static void tns4d_gate_2site_generic(Tns4dGrid *g,
      * (entropy = log₂(χ) = maximal). Schmidt weights absorbed into U/V. */
     for (int s = 0; s < (int)TNS4D_CHI; s++) shared_bw->w[s] = 1.0;
 
-    /* ── 5. Write back (sparse) ── */
-    regA->num_nonzero = 0;
-    regB->num_nonzero = 0;
-
+    /* ── 5. Write back with magnitude-sorted truncation ── */
+    svd_buf_reset(&tns4d_svd_buf);
     for (int kA = 0; kA < D; kA++)
      for (int eA = 0; eA < num_EA; eA++) {
          int row = kA * num_EA + eA;
@@ -393,17 +394,12 @@ static void tns4d_gate_2site_generic(Tns4dGrid *g,
              double re = U_re[row * rank + gv] * weight;
              double im = U_im[row * rank + gv] * weight;
              if (re*re + im*im < 1e-50) continue;
-
-             basis_t bs = kA * TNS4D_C8 + pure + gv * bp[bond_A];
-             if (regA->num_nonzero < 4096) {
-                 regA->entries[regA->num_nonzero].basis_state = bs;
-                 regA->entries[regA->num_nonzero].amp_re = re;
-                 regA->entries[regA->num_nonzero].amp_im = im;
-                 regA->num_nonzero++;
-             }
+             svd_buf_push(&tns4d_svd_buf, kA * TNS4D_C8 + pure + gv * bp[bond_A], re, im);
          }
      }
+    svd_buf_flush(&tns4d_svd_buf, regA);
 
+    svd_buf_reset(&tns4d_svd_buf);
     for (int kB = 0; kB < D; kB++)
      for (int eB = 0; eB < num_EB; eB++) {
          int col = kB * num_EB + eB;
@@ -414,16 +410,10 @@ static void tns4d_gate_2site_generic(Tns4dGrid *g,
              double re = weight * Vc_re[gv * svddim_B + col];
              double im = weight * Vc_im[gv * svddim_B + col];
              if (re*re + im*im < 1e-50) continue;
-
-             basis_t bs = kB * TNS4D_C8 + pure + gv * bp[bond_B];
-             if (regB->num_nonzero < 4096) {
-                 regB->entries[regB->num_nonzero].basis_state = bs;
-                 regB->entries[regB->num_nonzero].amp_re = re;
-                 regB->entries[regB->num_nonzero].amp_im = im;
-                 regB->num_nonzero++;
-             }
+             svd_buf_push(&tns4d_svd_buf, kB * TNS4D_C8 + pure + gv * bp[bond_B], re, im);
          }
      }
+    svd_buf_flush(&tns4d_svd_buf, regB);
 
     free(U_re); free(U_im);
     free(sig);
