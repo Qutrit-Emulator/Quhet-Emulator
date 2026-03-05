@@ -20,6 +20,7 @@
 #define PEPS6D_OVERLAY_H
 
 #include "quhit_engine.h"
+#include "triality_overlay.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -54,6 +55,7 @@ typedef struct {
     QuhitEngine     *eng;
     uint32_t        *q_phys;
     int             *site_reg;
+    TriOverlaySite  *tri_sites;
 } Tns6dGrid;
 
 Tns6dGrid *tns6d_init(int Lx, int Ly, int Lz, int Lw, int Lv, int Lu);
