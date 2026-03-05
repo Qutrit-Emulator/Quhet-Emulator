@@ -276,7 +276,10 @@ void mps_gate_bond(MpsChain *c, int site,
     double *Vc_re = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
     double *Vc_im = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
 
-    tsvd_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B, chi,
+    int svd_rank = chi < svddim_B ? chi : svddim_B;
+    if (svd_rank > svddim_A) svd_rank = svddim_A;
+
+    tsvd_truncated(Th2_re, Th2_im, svddim_A, svddim_B, svd_rank,
                    U_re, U_im, sig, Vc_re, Vc_im);
     free(Th2_re); free(Th2_im);
 
@@ -345,14 +348,35 @@ void mps_local_density(MpsChain *c, int site, double *probs)
     QuhitRegister *r = &c->eng->registers[reg];
     double total = 0;
 
+    /* Bond weight convention: register amplitudes are raw SVD vectors.
+     * True prob = |a|² × Π σ[bond_val]² for all bond indices.
+     * 
+     * For site i:  basis = k * χ² + α * χ + β
+     *   Left bond (α, position 1):  σ from bonds[site-1] if site > 0
+     *   Right bond (β, position 0): σ from bonds[site]   if site < L-1
+     */
     for (uint32_t e = 0; e < r->num_nonzero; e++) {
-        /* Physical digit k is at position 2 (most significant) */
         basis_t bs = r->entries[e].basis_state;
-        int k = (int)(bs / MPS_C2);  /* k = highest position */
+        int k = (int)(bs / MPS_C2);
         if (k >= MPS_D) continue;
+        
+        int alpha = (int)((bs % MPS_C2) / MPS_CHI);  /* left bond */
+        int beta  = (int)(bs % MPS_CHI);              /* right bond */
+        
         double re = r->entries[e].amp_re;
         double im = r->entries[e].amp_im;
         double p = re * re + im * im;
+        
+        /* Weight by bond σ² for each bond */
+        if (site > 0) {
+            double wL = c->bonds[site - 1].w[alpha];
+            p *= wL * wL;
+        }
+        if (site < c->L - 1) {
+            double wR = c->bonds[site].w[beta];
+            p *= wR * wR;
+        }
+        
         probs[k] += p;
         total += p;
     }
