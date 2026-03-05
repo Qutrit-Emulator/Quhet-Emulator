@@ -267,12 +267,20 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
               double tau = (hqq - hpp) / (2.0 * mag);
               double t, c, s;
               if (fabs(tau) < 1e-15) {
-                  /* hpp ≈ hqq: use t = -1 so that H'[p,p] = hpp + mag
-                   * (larger eigenvalue at position p) with eigenvector
-                   * (c, s) = (1/√2, -1/√2) correctly paired. */
-                  t = -1.0;
+                  /* hpp ≈ hqq: use t = 1.0 so that H'[q,q] = hqq + mag
+                   * (larger eigenvalue at position q) and H'[p,p] = hpp - mag.
+                   * Wait, standard Jacobi gives the largest eigenvalue to hqq if we use t=1.
+                   * Let's exactly solve for the eigenvectors!
+                   * With H = [hpp apr; apr hpp], eigenvalues are hpp+apr and hpp-apr.
+                   * Vector for (hpp+apr) is [1, 1] / sqrt(2).
+                   * Vector for (hpp-apr) is [1, -1] / sqrt(2).
+                   * To put hpp+apr at H'[p,p], we need the column p of G to be [1, 1] / sqrt(2).
+                   * Column p of G is (c, s)^T. So we need c = 1/sqrt(2), s = 1/sqrt(2).
+                   * If c = 1/sqrt(2), s = 1/sqrt(2), then t = s/c = 1.0.
+                   * Let's explicitly set c = 1/sqrt(2) and s = 1/sqrt(2) which is t = 1.0! */
+                  t = 1.0;
                   c = TSVD_INV_SQRT2;
-                  s = -TSVD_INV_SQRT2;
+                  s = TSVD_INV_SQRT2;
               } else {
                   t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau) + fabs(tau) * born_fast_isqrt(1.0 + 1.0/(tau*tau)));
                   c = born_fast_isqrt(1.0 + t*t);
@@ -283,11 +291,10 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
              double er = apr / mag, ei = -api / mag;
 
              /* Rotate H: standard Jacobi diagonal update
-              * H'[p,p] = hpp - t·mag, H'[q,q] = hqq + t·mag
-              * For t = -1 (tau=0): H'[p,p] = hpp + mag (larger)
-              * For t > 0 (tau > 0): H'[p,p] = hpp - t·mag (smaller) */
-             H_re[p*n+p] -= t * mag;
-             H_re[q*n+q] += t * mag;
+              * For the rotation matrix G = [c, -s; s, c], mathematically
+              * H'[p,p] = hpp + t·mag, H'[q,q] = hqq - t·mag */
+             H_re[p*n+p] += t * mag;
+             H_re[q*n+q] -= t * mag;
              H_re[p*n+q] = 0; H_im[p*n+q] = 0;
              H_re[q*n+p] = 0; H_im[q*n+p] = 0;
 
@@ -1151,6 +1158,8 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
     double total_energy = vesica_energy + wave_energy;
     double wave_frac = (total_energy > TSVD_EPS2)
         ? wave_energy / total_energy : 0;
+        
+    /* DBG */ fprintf(stderr, "  wave_frac=%.6f vesica_E=%.6f wave_E=%.6f\n", wave_frac, vesica_energy, wave_energy);
 
     /* ═══════════════════════════════════════════════════════════════════════
      * PATH 1: VESICA DIRECT — Geometric factorization, NO SVD
@@ -1182,200 +1191,71 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
     if (wave_frac < 0.01) {
         int cm = TSVD_VESICA_D2 * num_envA;
         int cn = TSVD_VESICA_D2 * num_envB;
-        int rank_out = chi < n ? chi : n;
-        if (rank_out > m) rank_out = m;
+        int phys_rank = chi < n ? chi : n;
+        if (phys_rank > m) phys_rank = m;
+        
+        int v_rank = chi < cn ? chi : cn;
+        if (v_rank > cm) v_rank = cm;
 
-        int s_idx = 0;  /* running bond index */
+        double *vM_re = (double *)calloc((size_t)cm * cn, sizeof(double));
+        double *vM_im = (double *)calloc((size_t)cm * cn, sizeof(double));
+        for (int r = 0; r < cm; r++)
+            for (int c = 0; c < cn; c++) {
+                vM_re[r*cn + c] = FF_re[r*n + c];
+                vM_im[r*cn + c] = FF_im[r*n + c];
+            }
 
-        /* Iterate over all 9 blocks (3 row-pairs × 3 col-pairs) */
-        for (int jA = 0; jA < TSVD_VESICA_D2; jA++) {
-            for (int jB = 0; jB < TSVD_VESICA_D2; jB++) {
+        double *fU_re = (double *)calloc((size_t)cm * v_rank, sizeof(double));
+        double *fU_im = (double *)calloc((size_t)cm * v_rank, sizeof(double));
+        double *fS    = (double *)calloc(v_rank, sizeof(double));
+        double *fV_re = (double *)calloc((size_t)v_rank * cn, sizeof(double));
+        double *fV_im = (double *)calloc((size_t)v_rank * cn, sizeof(double));
 
-                /* Extract nEA × nEB block B[jA][jB] from the folded Θ */
-                int bm = num_envA, bn = num_envB;
-                int brank = bm < bn ? bm : bn;
-                if (s_idx + brank > rank_out) brank = rank_out - s_idx;
-                if (brank <= 0) goto vesica_done;
+        tsvd_truncated(vM_re, vM_im, cm, cn, v_rank,
+                       fU_re, fU_im, fS, fV_re, fV_im);
 
-                /* Check if this block has significant energy */
-                double blk_energy = 0;
-                for (int i = 0; i < bm; i++)
-                    for (int k = 0; k < bn; k++) {
-                        int r = jA * num_envA + i;
-                        int c = jB * num_envB + k;
-                        blk_energy += FF_re[r*n+c]*FF_re[r*n+c]
-                                    + FF_im[r*n+c]*FF_im[r*n+c];
-                    }
-                if (blk_energy < TSVD_EPS2) continue;  /* Skip zero blocks */
-
-                /* ═══ Per-block factorization ═══ */
-
-                if (bm == 1 && bn == 1) {
-                    /* ── Scalar block: rank-1, trivial ──
-                     * B = σ × u × v†  with u=v=1, σ = |B| */
-                    int r = jA * num_envA;
-                    int c = jB * num_envB;
-                    double br = FF_re[r*n+c], bi = FF_im[r*n+c];
-                    double mag = sqrt(br*br + bi*bi);
-                    if (mag < TSVD_SAFE_MIN) continue;
-
-                    sigma[s_idx] = mag;
-                    double inv = 1.0 / mag;
-
-                    /* Folded U row */
-                    int frow = jA * num_envA;
-                    /* Unfold → physical k=jA and k=jA+3 */
-                    U_re[frow * rank_out + s_idx] = TSVD_INV_SQRT2 * br * inv;
-                    U_im[frow * rank_out + s_idx] = TSVD_INV_SQRT2 * bi * inv;
-                    U_re[(frow + 3*num_envA) * rank_out + s_idx] = TSVD_INV_SQRT2 * br * inv;
-                    U_im[(frow + 3*num_envA) * rank_out + s_idx] = TSVD_INV_SQRT2 * bi * inv;
-
-                    /* Folded V† col */
-                    int fcol = jB * num_envB;
-                    Vc_re[s_idx * n + fcol] = TSVD_INV_SQRT2;
-                    Vc_im[s_idx * n + fcol] = 0;
-                    Vc_re[s_idx * n + fcol + 3*num_envB] = TSVD_INV_SQRT2;
-                    Vc_im[s_idx * n + fcol + 3*num_envB] = 0;
-
-                    s_idx++;
-
-                } else if (bm <= 2 && bn <= 2) {
-                    /* ── Small block: analytic 2×2 SVD ── */
-                    double Br[4] = {0}, Bi[4] = {0};
-                    for (int i = 0; i < bm; i++)
-                        for (int k = 0; k < bn; k++) {
-                            int r = jA * num_envA + i;
-                            int c = jB * num_envB + k;
-                            Br[i*bn+k] = FF_re[r*n+c];
-                            Bi[i*bn+k] = FF_im[r*n+c];
-                        }
-
-                    /* Pad to 2×2 if needed (zero-pad) */
-                    double B2r[4]={0}, B2i[4]={0};
-                    for (int i=0;i<bm;i++) for(int k=0;k<bn;k++) {
-                        B2r[i*2+k]=Br[i*bn+k]; B2i[i*2+k]=Bi[i*bn+k];
-                    }
-
-                    double mU_re[4]={0}, mU_im[4]={0};
-                    double mSv[2]={0};
-                    double mV_re[4]={0}, mV_im[4]={0};
-                    tsvd_mini_2x2_svd(B2r, B2i, mU_re, mU_im, mSv, mV_re, mV_im);
-
-                    for (int sv = 0; sv < brank; sv++) {
-                        if (mSv[sv] < TSVD_EPS * (mSv[0] > 0 ? mSv[0] : 1.0)) break;
-                        if (s_idx >= rank_out) goto vesica_done;
-
-                        sigma[s_idx] = mSv[sv];
-
-                        /* Unfold U: vesica pair jA → k=jA and k=jA+3 */
-                        for (int i = 0; i < bm; i++) {
-                            double ur = mU_re[i*2+sv], ui = mU_im[i*2+sv];
-                            int row_lo = jA * num_envA + i;
-                            int row_hi = (jA + 3) * num_envA + i;
-                            U_re[row_lo * rank_out + s_idx] = TSVD_INV_SQRT2 * ur;
-                            U_im[row_lo * rank_out + s_idx] = TSVD_INV_SQRT2 * ui;
-                            U_re[row_hi * rank_out + s_idx] = TSVD_INV_SQRT2 * ur;
-                            U_im[row_hi * rank_out + s_idx] = TSVD_INV_SQRT2 * ui;
-                        }
-
-                        /* Unfold V†: vesica pair jB → k=jB and k=jB+3 */
-                        for (int k = 0; k < bn; k++) {
-                            /* V† row sv: conj(V col sv) */
-                            double vr = mV_re[k*2+sv], vi = -mV_im[k*2+sv];
-                            int col_lo = jB * num_envB + k;
-                            int col_hi = (jB + 3) * num_envB + k;
-                            Vc_re[s_idx * n + col_lo] = TSVD_INV_SQRT2 * vr;
-                            Vc_im[s_idx * n + col_lo] = TSVD_INV_SQRT2 * vi;
-                            Vc_re[s_idx * n + col_hi] = TSVD_INV_SQRT2 * vr;
-                            Vc_im[s_idx * n + col_hi] = TSVD_INV_SQRT2 * vi;
-                        }
-                        s_idx++;
-                    }
-
-                } else {
-                    /* ── General block: mini Jacobi SVD on nEA × nEB ──
-                     * These are TINY matrices (typ. 3×3 to 8×8).
-                     * Total cost: O(nEA² × nEB) — negligible. */
-                    double *Bk_re = (double *)calloc((size_t)bm * bn, sizeof(double));
-                    double *Bk_im = (double *)calloc((size_t)bm * bn, sizeof(double));
-                    for (int i = 0; i < bm; i++)
-                        for (int k = 0; k < bn; k++) {
-                            int r = jA * num_envA + i;
-                            int c = jB * num_envB + k;
-                            Bk_re[i*bn+k] = FF_re[r*n+c];
-                            Bk_im[i*bn+k] = FF_im[r*n+c];
-                        }
-
-                    double *bU_re = (double *)calloc((size_t)bm * brank, sizeof(double));
-                    double *bU_im = (double *)calloc((size_t)bm * brank, sizeof(double));
-                    double *bS    = (double *)calloc(brank, sizeof(double));
-                    double *bV_re = (double *)calloc((size_t)brank * bn, sizeof(double));
-                    double *bV_im = (double *)calloc((size_t)brank * bn, sizeof(double));
-
-                    tsvd_truncated(Bk_re, Bk_im, bm, bn, brank,
-                                   bU_re, bU_im, bS, bV_re, bV_im);
-
-                    for (int sv = 0; sv < brank; sv++) {
-                        if (bS[sv] < TSVD_EPS * (bS[0] > 0 ? bS[0] : 1.0)) break;
-                        if (s_idx >= rank_out) {
-                            free(Bk_re); free(Bk_im);
-                            free(bU_re); free(bU_im); free(bS);
-                            free(bV_re); free(bV_im);
-                            goto vesica_done;
-                        }
-
-                        sigma[s_idx] = bS[sv];
-
-                        for (int i = 0; i < bm; i++) {
-                            double ur = bU_re[i*brank+sv], ui = bU_im[i*brank+sv];
-                            int row_lo = jA * num_envA + i;
-                            int row_hi = (jA + 3) * num_envA + i;
-                            U_re[row_lo * rank_out + s_idx] = TSVD_INV_SQRT2 * ur;
-                            U_im[row_lo * rank_out + s_idx] = TSVD_INV_SQRT2 * ui;
-                            U_re[row_hi * rank_out + s_idx] = TSVD_INV_SQRT2 * ur;
-                            U_im[row_hi * rank_out + s_idx] = TSVD_INV_SQRT2 * ui;
-                        }
-
-                        for (int k = 0; k < bn; k++) {
-                            double vr = bV_re[sv*bn+k], vi = bV_im[sv*bn+k];
-                            int col_lo = jB * num_envB + k;
-                            int col_hi = (jB + 3) * num_envB + k;
-                            Vc_re[s_idx * n + col_lo] = TSVD_INV_SQRT2 * vr;
-                            Vc_im[s_idx * n + col_lo] = TSVD_INV_SQRT2 * vi;
-                            Vc_re[s_idx * n + col_hi] = TSVD_INV_SQRT2 * vr;
-                            Vc_im[s_idx * n + col_hi] = TSVD_INV_SQRT2 * vi;
-                        }
-                        s_idx++;
-                    }
-
-                    free(Bk_re); free(Bk_im);
-                    free(bU_re); free(bU_im); free(bS);
-                    free(bV_re); free(bV_im);
+        int s_idx = 0;
+        for (int s = 0; s < v_rank; s++) {
+            if (fS[s] < TSVD_EPS * (fS[0] > 0 ? fS[0] : 1.0)) break;
+            sigma[s_idx] = fS[s];
+            
+            /* Unfold U: vesica component r -> physical k=jA and k=jA+3 */
+            for (int eA = 0; eA < num_envA; eA++) {
+                for (int j = 0; j < TSVD_VESICA_D2; j++) {
+                    int r_v = j * num_envA + eA; 
+                    int row_lo = j * num_envA + eA; 
+                    int row_hi = (j + 3) * num_envA + eA; 
+                    double ur = fU_re[r_v*v_rank + s], ui = fU_im[r_v*v_rank + s];
+                    U_re[row_lo * phys_rank + s_idx] = TSVD_INV_SQRT2 * ur;
+                    U_im[row_lo * phys_rank + s_idx] = TSVD_INV_SQRT2 * ui;
+                    U_re[row_hi * phys_rank + s_idx] = TSVD_INV_SQRT2 * ur;
+                    U_im[row_hi * phys_rank + s_idx] = TSVD_INV_SQRT2 * ui;
                 }
             }
-        }
 
-vesica_done:
-        /* Sort by descending sigma (insertion sort — rank is small) */
-        for (int i = 0; i < s_idx - 1; i++) {
-            int mx = i;
-            for (int j2 = i + 1; j2 < s_idx; j2++)
-                if (sigma[j2] > sigma[mx]) mx = j2;
-            if (mx != i) {
-                double tmp = sigma[i]; sigma[i] = sigma[mx]; sigma[mx] = tmp;
-                /* Swap U columns */
-                for (int r = 0; r < m; r++) {
-                    double tr = U_re[r*rank_out+i]; U_re[r*rank_out+i] = U_re[r*rank_out+mx]; U_re[r*rank_out+mx] = tr;
-                    double ti = U_im[r*rank_out+i]; U_im[r*rank_out+i] = U_im[r*rank_out+mx]; U_im[r*rank_out+mx] = ti;
-                }
-                /* Swap V† rows */
-                for (int c = 0; c < n; c++) {
-                    double tr = Vc_re[i*n+c]; Vc_re[i*n+c] = Vc_re[mx*n+c]; Vc_re[mx*n+c] = tr;
-                    double ti = Vc_im[i*n+c]; Vc_im[i*n+c] = Vc_im[mx*n+c]; Vc_im[mx*n+c] = ti;
+            /* Unfold V: vesica component c -> physical k=jB and k=jB+3 */
+            for (int eB = 0; eB < num_envB; eB++) {
+                for (int j = 0; j < TSVD_VESICA_D2; j++) {
+                    int c_v = j * num_envB + eB; 
+                    int col_lo = j * num_envB + eB; 
+                    int col_hi = (j + 3) * num_envB + eB; 
+                    double vr = fV_re[s*cn + c_v], vi = fV_im[s*cn + c_v];
+                    Vc_re[s_idx * n + col_lo] = TSVD_INV_SQRT2 * vr;
+                    Vc_im[s_idx * n + col_lo] = TSVD_INV_SQRT2 * vi;
+                    Vc_re[s_idx * n + col_hi] = TSVD_INV_SQRT2 * vr;
+                    Vc_im[s_idx * n + col_hi] = TSVD_INV_SQRT2 * vi;
                 }
             }
+            s_idx++;
         }
 
+        /* Pad remaining sigma with 0 */
+        for (int i = s_idx; i < phys_rank; i++) sigma[i] = 0;
+
+        free(vM_re); free(vM_im);
+        free(fU_re); free(fU_im); free(fS);
+        free(fV_re); free(fV_im);
+        
         free(FF_re); free(FF_im);
         return;
     }
