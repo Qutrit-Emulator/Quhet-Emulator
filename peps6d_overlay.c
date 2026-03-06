@@ -338,6 +338,50 @@ void tns6d_local_density(Tns6dGrid *g, int x, int y, int z, int w, int v, int u,
     else probs[0]=1.0;
 }
 
+/* ═══════════════ PROJECTIVE MEASUREMENT — Vesica Complement ═══════════════ */
+int tns6d_measure_site(Tns6dGrid *g, int x, int y, int z, int w, int v, int u)
+{
+    double probs[TNS6D_D];
+    tns6d_local_density(g, x, y, z, w, v, u, probs);
+
+    double r = (double)(rand()) / (double)(RAND_MAX);
+    double cum = 0;
+    int outcome = TNS6D_D - 1;
+    for (int k = 0; k < TNS6D_D; k++) { cum += probs[k]; if (r < cum) { outcome = k; break; } }
+
+    /* Register collapse → product state |outcome, 0...0⟩ */
+    int site = tns6d_flat(g, x, y, z, w, v, u);
+    int reg = g->site_reg[site];
+    if (reg >= 0 && g->eng) {
+        g->eng->registers[reg].num_nonzero = 0;
+        basis_t ps = (basis_t)outcome * TNS6D_C12;
+        quhit_reg_sv_set(g->eng, reg, ps, 1.0, 0.0);
+    }
+
+    /* Bond collapse: all 12 adjacent bonds → rank-1 */
+    int chi = (int)TNS6D_CHI;
+    #define TRUNC6(bw) do { (bw)->w[0]=1.0; for(int s=1;s<chi;s++) (bw)->w[s]=0.0; } while(0)
+    if (x < g->Lx-1) TRUNC6(tns6d_xbond(g,x,y,z,w,v,u));
+    if (x > 0)        TRUNC6(tns6d_xbond(g,x-1,y,z,w,v,u));
+    if (y < g->Ly-1) TRUNC6(tns6d_ybond(g,x,y,z,w,v,u));
+    if (y > 0)        TRUNC6(tns6d_ybond(g,x,y-1,z,w,v,u));
+    if (z < g->Lz-1) TRUNC6(tns6d_zbond(g,x,y,z,w,v,u));
+    if (z > 0)        TRUNC6(tns6d_zbond(g,x,y,z-1,w,v,u));
+    if (w < g->Lw-1) TRUNC6(tns6d_wbond(g,x,y,z,w,v,u));
+    if (w > 0)        TRUNC6(tns6d_wbond(g,x,y,z,w-1,v,u));
+    if (v < g->Lv-1) TRUNC6(tns6d_vbond(g,x,y,z,w,v,u));
+    if (v > 0)        TRUNC6(tns6d_vbond(g,x,y,z,w,v-1,u));
+    if (u < g->Lu-1) TRUNC6(tns6d_ubond(g,x,y,z,w,v,u));
+    if (u > 0)        TRUNC6(tns6d_ubond(g,x,y,z,w,v,u-1));
+    #undef TRUNC6
+
+    if (g->tri_sites) {
+        double proj_re[36]={0}, proj_im[36]={0};
+        proj_re[outcome*6+outcome]=1.0;
+        tri_site_apply_gate(&g->tri_sites[site], proj_re, proj_im);
+    }
+    return outcome;
+}
 /* ═══════════════ BATCH OPS ═══════════════ */
 
 #define BATCH6_AXIS(name, L_check, loop_body) \
