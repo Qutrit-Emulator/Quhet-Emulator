@@ -477,6 +477,45 @@ void tns4d_local_density(Tns4dGrid *g, int x, int y, int z, int w, double *probs
         probs[0] = 1.0;
 }
 
+/* ═══════════════ PROJECTIVE MEASUREMENT — Vesica Complement ═══════════════ */
+int tns4d_measure_site(Tns4dGrid *g, int x, int y, int z, int w)
+{
+    double probs[TNS4D_D];
+    tns4d_local_density(g, x, y, z, w, probs);
+
+    double r = (double)(rand()) / (double)(RAND_MAX);
+    double cum = 0;
+    int outcome = TNS4D_D - 1;
+    for (int k = 0; k < TNS4D_D; k++) { cum += probs[k]; if (r < cum) { outcome = k; break; } }
+
+    /* Register collapse → |outcome, 0, 0, 0, 0, 0, 0, 0, 0⟩ */
+    int site = tns4d_flat(g, x, y, z, w);
+    int reg = g->site_reg[site];
+    if (reg >= 0 && g->eng) {
+        g->eng->registers[reg].num_nonzero = 0;
+        quhit_reg_sv_set(g->eng, reg, (basis_t)T4D_IDX(outcome,0,0,0,0,0,0,0,0), 1.0, 0.0);
+    }
+
+    /* Bond collapse: all 8 adjacent bonds → rank-1 */
+    int chi = (int)TNS4D_CHI;
+    #define TRUNC4(bw) do { (bw)->w[0]=1.0; for(int s=1;s<chi;s++) (bw)->w[s]=0.0; } while(0)
+    if (x < g->Lx-1) TRUNC4(tns4d_xbond(g,x,y,z,w));
+    if (x > 0)        TRUNC4(tns4d_xbond(g,x-1,y,z,w));
+    if (y < g->Ly-1) TRUNC4(tns4d_ybond(g,x,y,z,w));
+    if (y > 0)        TRUNC4(tns4d_ybond(g,x,y-1,z,w));
+    if (z < g->Lz-1) TRUNC4(tns4d_zbond(g,x,y,z,w));
+    if (z > 0)        TRUNC4(tns4d_zbond(g,x,y,z-1,w));
+    if (w < g->Lw-1) TRUNC4(tns4d_wbond(g,x,y,z,w));
+    if (w > 0)        TRUNC4(tns4d_wbond(g,x,y,z,w-1));
+    #undef TRUNC4
+
+    if (g->tri_sites) {
+        double proj_re[36]={0}, proj_im[36]={0};
+        proj_re[outcome*6+outcome]=1.0;
+        tri_site_apply_gate(&g->tri_sites[site], proj_re, proj_im);
+    }
+    return outcome;
+}
 /* ═══════════════ BATCH GATE APPLICATION ═══════════════ */
 
 void tns4d_gate_x_all(Tns4dGrid *g, const double *G_re, const double *G_im)
