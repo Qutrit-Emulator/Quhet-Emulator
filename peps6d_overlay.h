@@ -82,5 +82,6 @@ void tns6d_trotter_step(Tns6dGrid *g, const double *G_re, const double *G_im);
 void tns6d_normalize_site(Tns6dGrid *g, int x, int y, int z, int w, int v, int u);
 void tns6d_local_density(Tns6dGrid *g, int x, int y, int z, int w, int v, int u,
                          double *probs);
+int  tns6d_measure_site(Tns6dGrid *g, int x, int y, int z, int w, int v, int u);
 
 #endif
