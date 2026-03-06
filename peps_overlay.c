@@ -165,6 +165,83 @@ void peps_gate_1site(PepsGrid *grid, int x, int y,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
+ * PROJECTIVE MEASUREMENT — Vesica Complement
+ *
+ * The vesica fold is a unitary (symmetry-preserving) operation. Measurement
+ * is fundamentally NON-unitary — it cannot be expressed within the fold basis.
+ * This function is the measurement complement: it performs full wavefunction
+ * collapse in the PEPS register, resetting the site to a product state.
+ *
+ * 1. Born-rule sample: compute probabilities, draw outcome
+ * 2. Register collapse: reset to single entry |outcome, 0, 0, 0, 0⟩
+ * 3. Bond collapse: all adjacent bond weights → rank-1 (σ₀=1, rest=0)
+ *
+ * Returns the measurement outcome (0..D-1).
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+int peps_measure_site(PepsGrid *grid, int x, int y)
+{
+    /* 1. Born-rule sample */
+    double probs[PEPS_D];
+    peps_local_density(grid, x, y, probs);
+
+    /* Draw from cumulative distribution (caller seeds PRNG externally) */
+    double r = (double)(rand()) / (double)(RAND_MAX);
+    double cum = 0;
+    int outcome = PEPS_D - 1;
+    for (int k = 0; k < PEPS_D; k++) {
+        cum += probs[k];
+        if (r < cum) { outcome = k; break; }
+    }
+
+    /* 2. Register collapse: reset to |outcome, 0, 0, 0, 0⟩ */
+    int site = y * grid->Lx + x;
+    int reg_idx = grid->site_reg[site];
+    if (reg_idx >= 0 && grid->eng) {
+        QuhitRegister *reg = &grid->eng->registers[reg_idx];
+        reg->num_nonzero = 0;
+        basis_t product_state = PT_IDX(outcome, 0, 0, 0, 0);
+        quhit_reg_sv_set(grid->eng, reg_idx, product_state, 1.0, 0.0);
+    }
+
+    /* 3. Bond collapse: all adjacent bonds → rank-1 */
+    int chi = (int)PEPS_CHI;
+
+    /* Horizontal: right bond */
+    if (x < grid->Lx - 1) {
+        PepsBondWeight *hb = peps_hbond(grid, x, y);
+        hb->w[0] = 1.0;
+        for (int s = 1; s < chi; s++) hb->w[s] = 0.0;
+    }
+    /* Horizontal: left bond */
+    if (x > 0) {
+        PepsBondWeight *hb = peps_hbond(grid, x - 1, y);
+        hb->w[0] = 1.0;
+        for (int s = 1; s < chi; s++) hb->w[s] = 0.0;
+    }
+    /* Vertical: down bond */
+    if (y < grid->Ly - 1) {
+        PepsBondWeight *vb = peps_vbond(grid, x, y);
+        vb->w[0] = 1.0;
+        for (int s = 1; s < chi; s++) vb->w[s] = 0.0;
+    }
+    /* Vertical: up bond */
+    if (y > 0) {
+        PepsBondWeight *vb = peps_vbond(grid, x, y - 1);
+        vb->w[0] = 1.0;
+        for (int s = 1; s < chi; s++) vb->w[s] = 0.0;
+    }
+
+    /* Mirror to triality site */
+    if (grid->tri_sites) {
+        double proj_re[36] = {0}, proj_im[36] = {0};
+        proj_re[outcome * 6 + outcome] = 1.0;
+        tri_site_apply_gate(&grid->tri_sites[site], proj_re, proj_im);
+    }
+
+    return outcome;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
  * 2-SITE GATE: HORIZONTAL BOND  (x,y)—(x+1,y)
  *
  * Side-channel optimized:
