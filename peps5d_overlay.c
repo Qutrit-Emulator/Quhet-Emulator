@@ -458,6 +458,48 @@ void tns5d_local_density(Tns5dGrid *g, int x, int y, int z, int w, int v, double
         probs[0] = 1.0;
 }
 
+/* ═══════════════ PROJECTIVE MEASUREMENT — Vesica Complement ═══════════════ */
+int tns5d_measure_site(Tns5dGrid *g, int x, int y, int z, int w, int v)
+{
+    double probs[TNS5D_D];
+    tns5d_local_density(g, x, y, z, w, v, probs);
+
+    double r = (double)(rand()) / (double)(RAND_MAX);
+    double cum = 0;
+    int outcome = TNS5D_D - 1;
+    for (int k = 0; k < TNS5D_D; k++) { cum += probs[k]; if (r < cum) { outcome = k; break; } }
+
+    /* Register collapse → product state |outcome, 0...0⟩ */
+    int site = tns5d_flat(g, x, y, z, w, v);
+    int reg = g->site_reg[site];
+    if (reg >= 0 && g->eng) {
+        g->eng->registers[reg].num_nonzero = 0;
+        basis_t ps = (basis_t)outcome * TNS5D_C10;
+        quhit_reg_sv_set(g->eng, reg, ps, 1.0, 0.0);
+    }
+
+    /* Bond collapse: all 10 adjacent bonds → rank-1 */
+    int chi = (int)TNS5D_CHI;
+    #define TRUNC5(bw) do { (bw)->w[0]=1.0; for(int s=1;s<chi;s++) (bw)->w[s]=0.0; } while(0)
+    if (x < g->Lx-1) TRUNC5(tns5d_xbond(g,x,y,z,w,v));
+    if (x > 0)        TRUNC5(tns5d_xbond(g,x-1,y,z,w,v));
+    if (y < g->Ly-1) TRUNC5(tns5d_ybond(g,x,y,z,w,v));
+    if (y > 0)        TRUNC5(tns5d_ybond(g,x,y-1,z,w,v));
+    if (z < g->Lz-1) TRUNC5(tns5d_zbond(g,x,y,z,w,v));
+    if (z > 0)        TRUNC5(tns5d_zbond(g,x,y,z-1,w,v));
+    if (w < g->Lw-1) TRUNC5(tns5d_wbond(g,x,y,z,w,v));
+    if (w > 0)        TRUNC5(tns5d_wbond(g,x,y,z,w-1,v));
+    if (v < g->Lv-1) TRUNC5(tns5d_vbond(g,x,y,z,w,v));
+    if (v > 0)        TRUNC5(tns5d_vbond(g,x,y,z,w,v-1));
+    #undef TRUNC5
+
+    if (g->tri_sites) {
+        double proj_re[36]={0}, proj_im[36]={0};
+        proj_re[outcome*6+outcome]=1.0;
+        tri_site_apply_gate(&g->tri_sites[site], proj_re, proj_im);
+    }
+    return outcome;
+}
 /* ═══════════════ BATCH GATE APPLICATION ═══════════════ */
 
 #define BATCH5D(axis_gate, L_axis, coord_inc, bond_check) \
