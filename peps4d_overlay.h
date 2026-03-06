@@ -112,6 +112,7 @@ void tns4d_gate_w(Tns4dGrid *grid, int x, int y, int z, int w,
                   const double *G_re, const double *G_im);
 
 void tns4d_local_density(Tns4dGrid *grid, int x, int y, int z, int w, double *probs);
+int  tns4d_measure_site(Tns4dGrid *grid, int x, int y, int z, int w);
 
 /* Batch gates */
 void tns4d_gate_x_all(Tns4dGrid *grid, const double *G_re, const double *G_im);
