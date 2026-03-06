@@ -78,6 +78,7 @@ void mps_gate_1site(MpsChain *chain, int site,
                     const double *U_re, const double *U_im);
 
 void mps_local_density(MpsChain *chain, int site, double *probs);
+int  mps_measure_site(MpsChain *chain, int site);
 
 /* Batch gates */
 void mps_gate_bond_all(MpsChain *chain, const double *G_re, const double *G_im);
