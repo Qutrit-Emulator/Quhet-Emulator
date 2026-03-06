@@ -90,6 +90,7 @@ void tns3d_gate_1site(Tns3dGrid *grid, int x, int y, int z,
                       const double *U_re, const double *U_im);
 
 void tns3d_local_density(Tns3dGrid *grid, int x, int y, int z, double *probs);
+int  tns3d_measure_site(Tns3dGrid *grid, int x, int y, int z);
 
 /* Batch gates */
 void tns3d_gate_x_all(Tns3dGrid *grid, const double *G_re, const double *G_im);
