@@ -6,6 +6,10 @@ HEAP COMPILE. Otherwise you will get segfault!
 If there is no test folder, don't clone this!
 </p>
 
+<p align="center">
+Note: Presently it is fine to clone this, I feel satisfied and will not update it for a bit unless I find serious errors. The previous version lacked a way to measure in tensor, so sorry about that!!
+</p>
+
 
 # HexState Engine v3.6
 
