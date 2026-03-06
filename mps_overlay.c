@@ -385,6 +385,45 @@ void mps_local_density(MpsChain *c, int site, double *probs)
         probs[0] = 1.0;
 }
 
+/* ═══════════════ PROJECTIVE MEASUREMENT — Vesica Complement ═══════════════ */
+int mps_measure_site(MpsChain *c, int site)
+{
+    double probs[MPS_D];
+    mps_local_density(c, site, probs);
+
+    double r = (double)(rand()) / (double)(RAND_MAX);
+    double cum = 0;
+    int outcome = MPS_D - 1;
+    for (int k = 0; k < MPS_D; k++) { cum += probs[k]; if (r < cum) { outcome = k; break; } }
+
+    /* Register collapse → |outcome, 0, 0⟩ */
+    int reg = c->site_reg[site];
+    if (reg >= 0 && c->eng) {
+        c->eng->registers[reg].num_nonzero = 0;
+        quhit_reg_sv_set(c->eng, reg, (basis_t)MPS_IDX(outcome, 0, 0), 1.0, 0.0);
+    }
+
+    /* Bond collapse: left + right bonds → rank-1 */
+    int chi = (int)MPS_CHI;
+    if (site > 0) {
+        c->bonds[site - 1].w[0] = 1.0;
+        for (int s = 1; s < chi; s++) c->bonds[site - 1].w[s] = 0.0;
+    }
+    if (site < c->L - 1) {
+        c->bonds[site].w[0] = 1.0;
+        for (int s = 1; s < chi; s++) c->bonds[site].w[s] = 0.0;
+    }
+
+    /* Mirror to triality site */
+    if (c->tri_sites) {
+        double proj_re[36] = {0}, proj_im[36] = {0};
+        proj_re[outcome * 6 + outcome] = 1.0;
+        tri_site_apply_gate(&c->tri_sites[site], proj_re, proj_im);
+    }
+
+    return outcome;
+}
+
 /* ═══════════════ BATCH GATE APPLICATION ═══════════════ */
 
 void mps_gate_bond_all(MpsChain *c, const double *G_re, const double *G_im)
