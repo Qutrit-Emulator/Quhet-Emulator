@@ -332,11 +332,130 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * TRUNCATED SVD
+ * PSD POWER ITERATION EIGENDECOMPOSITION
  *
- * M (m×n complex) → U (m×chi) × σ (chi) × V† (chi×n)
- * Uses Jacobi eigendecomposition of M†M to find V, σ.
- * U = M V σ⁻¹.
+ * Replaces tsvd_jacobi_hermitian for PSD matrices (M†M is always PSD).
+ * Jacobi has a proven bug: produces negative eigenvalues for PSD matrices,
+ * which corrupts singular value extraction.
+ *
+ * Power iteration + Hotelling deflation:
+ *   - Guaranteed non-negative eigenvalues for PSD input
+ *   - Fixed iteration count per eigenvalue (numerically stable)
+ *   - O(n² × k × iters) where k = number of eigenvalues needed
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+static void tsvd_psd_power_eigen(const double *H_re, const double *H_im, int n,
+                                  int k, /* number of eigenvalues to extract */
+                                  double *eig, double *V_re, double *V_im)
+{
+    /* Work with a copy so we can deflate */
+    size_t hsz = (size_t)n * n;
+    double *Wr = (double *)calloc(hsz, sizeof(double));
+    double *Wi = (double *)calloc(hsz, sizeof(double));
+    memcpy(Wr, H_re, hsz * sizeof(double));
+    memcpy(Wi, H_im, hsz * sizeof(double));
+
+    double *vr = (double *)calloc(n, sizeof(double));
+    double *vi = (double *)calloc(n, sizeof(double));
+    double *yr = (double *)calloc(n, sizeof(double));
+    double *yi = (double *)calloc(n, sizeof(double));
+
+    /* Initialize V to identity */
+    memset(V_re, 0, hsz * sizeof(double));
+    memset(V_im, 0, hsz * sizeof(double));
+    for (int i = 0; i < n; i++) V_re[i*n+i] = 1.0;
+
+    for (int ev = 0; ev < k; ev++) {
+        /* Seed with pseudorandom vector */
+        uint64_t rng = 777 + (uint64_t)ev * 1337;
+        for (int i = 0; i < n; i++) {
+            rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+            vr[i] = ((double)(rng >> 32)) / 4294967296.0 - 0.5;
+            rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+            vi[i] = ((double)(rng >> 32)) / 4294967296.0 - 0.5;
+        }
+        /* Normalize */
+        double norm2 = 0;
+        for (int i = 0; i < n; i++) norm2 += vr[i]*vr[i] + vi[i]*vi[i];
+        double inv = 1.0 / sqrt(norm2 > 0 ? norm2 : 1.0);
+        for (int i = 0; i < n; i++) { vr[i] *= inv; vi[i] *= inv; }
+
+        /* Power iteration: v ← W·v / ||W·v|| */
+        double lambda = 0;
+        for (int iter = 0; iter < 300; iter++) {
+            /* y = W · v */
+            for (int i = 0; i < n; i++) {
+                double sr = 0, si = 0;
+                for (int j = 0; j < n; j++) {
+                    sr += Wr[i*n+j]*vr[j] - Wi[i*n+j]*vi[j];
+                    si += Wr[i*n+j]*vi[j] + Wi[i*n+j]*vr[j];
+                }
+                yr[i] = sr; yi[i] = si;
+            }
+            /* Rayleigh quotient: λ = v†·y */
+            double new_lambda = 0;
+            for (int i = 0; i < n; i++)
+                new_lambda += vr[i]*yr[i] + vi[i]*yi[i];
+
+            /* Normalize y */
+            norm2 = 0;
+            for (int i = 0; i < n; i++) norm2 += yr[i]*yr[i] + yi[i]*yi[i];
+            inv = 1.0 / sqrt(norm2 > 1e-60 ? norm2 : 1e-60);
+            for (int i = 0; i < n; i++) { yr[i] *= inv; yi[i] *= inv; }
+
+            memcpy(vr, yr, n * sizeof(double));
+            memcpy(vi, yi, n * sizeof(double));
+
+            if (fabs(new_lambda - lambda) < TSVD_EPS * (fabs(new_lambda) + TSVD_SAFE_MIN))
+                break;
+            lambda = new_lambda;
+        }
+
+        /* Final Rayleigh quotient */
+        for (int i = 0; i < n; i++) {
+            double sr = 0, si = 0;
+            for (int j = 0; j < n; j++) {
+                sr += Wr[i*n+j]*vr[j] - Wi[i*n+j]*vi[j];
+                si += Wr[i*n+j]*vi[j] + Wi[i*n+j]*vr[j];
+            }
+            yr[i] = sr; yi[i] = si;
+        }
+        lambda = 0;
+        for (int i = 0; i < n; i++) lambda += vr[i]*yr[i] + vi[i]*yi[i];
+
+        eig[ev] = lambda > 0 ? lambda : 0; /* PSD guarantee */
+
+        /* Store eigenvector in V[:,ev] */
+        for (int i = 0; i < n; i++) {
+            V_re[i*n+ev] = vr[i];
+            V_im[i*n+ev] = vi[i];
+        }
+
+        /* Hotelling deflation: W ← W - λ v v† */
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++) {
+                double vvr = vr[i]*vr[j] + vi[i]*vi[j];
+                double vvi = vi[i]*vr[j] - vr[i]*vi[j];
+                Wr[i*n+j] -= lambda * vvr;
+                Wi[i*n+j] -= lambda * vvi;
+            }
+    }
+
+    free(Wr); free(Wi);
+    free(vr); free(vi);
+    free(yr); free(yi);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * TRUNCATED DECOMPOSITION via Gram + Power Iteration (SVD-FREE)
+ *
+ * Forms the Gram matrix H = M†M (n×n Hermitian PSD), then finds its
+ * eigendecomposition H = V D V† via power iteration + deflation.
+ * Singular values are σ = √D.
+ * Left singular vectors recovered as U = M V σ⁻¹.
+ *
+ * Replaces the previous Jacobi-based SVD which had a bug producing
+ * negative eigenvalues for PSD matrices.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 static void tsvd_truncated(const double *M_re, const double *M_im,
@@ -368,21 +487,19 @@ static void tsvd_truncated(const double *M_re, const double *M_im,
             H_re[j*n+i] = sr; H_im[j*n+i] = -si; /* Hermitian */
         }
 
-    /* Jacobi eigendecomposition: H = V D V† */
+    /* Power iteration eigendecomposition: H = V D V† (PSD-safe) */
+    int k = chi < n ? chi : n;
+    if (k > m) k = m;
     double *eig = (double *)calloc(n, sizeof(double));
     double *V_re = (double *)calloc(hsz, sizeof(double));
     double *V_im = (double *)calloc(hsz, sizeof(double));
 
-    tsvd_jacobi_hermitian(H_re, H_im, n, eig, V_re, V_im);
+    tsvd_psd_power_eigen(H_re, H_im, n, k, eig, V_re, V_im);
 
-    /* σ = sqrt(eigenvalues), clamped at chi.
-     * LAYER 9: SSE rsqrtss+2N (46 bits, 4.3cy) — same speed as
-     * Quake hack but with near-full precision.
-     * σ = eig × isqrt(eig) = eig/√eig = √eig */
-    int rank = chi < n ? chi : n;
-    if (rank > m) rank = m;
+    /* σ = sqrt(eigenvalues) — power iteration guarantees eig ≥ 0 */
+    int rank = k;
     for (int i = 0; i < rank; i++)
-        sigma[i] = eig[i] > 0 ? eig[i] * born_precise_isqrt(eig[i]) : 0;
+        sigma[i] = eig[i] > 0 ? sqrt(eig[i]) : 0;
 
     /* U = M V σ⁻¹  (m × rank) */
     memset(U_re, 0, (size_t)m * rank * sizeof(double));
