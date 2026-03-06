@@ -1250,6 +1250,27 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
         free(fU_re); free(fU_im); free(fS);
         free(fV_re); free(fV_im);
 
+        /* Post-unfold rank revalidation: the Hadamard spread can inflate
+         * apparent rank. Check actual contribution of each sigma in the
+         * physical (unfolded) basis and zero negligible ones. */
+        if (s_idx > 0) {
+            double ref = 0;
+            for (int r = 0; r < m; r++)
+                ref += U_re[r*phys_rank]*U_re[r*phys_rank]
+                     + U_im[r*phys_rank]*U_im[r*phys_rank];
+            ref = sigma[0] * sqrt(ref > 0 ? ref : 1.0);
+
+            for (int s = 1; s < s_idx; s++) {
+                double col_norm2 = 0;
+                for (int r = 0; r < m; r++)
+                    col_norm2 += U_re[r*phys_rank+s]*U_re[r*phys_rank+s]
+                               + U_im[r*phys_rank+s]*U_im[r*phys_rank+s];
+                double contrib = sigma[s] * sqrt(col_norm2 > 0 ? col_norm2 : 0);
+                if (contrib < TSVD_EPS * ref)
+                    sigma[s] = 0;
+            }
+        }
+
         free(FF_re); free(FF_im);
         return;
     }
@@ -1313,6 +1334,24 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
 
         free(fU_re); free(fU_im); free(fS);
         free(fV_re); free(fV_im);
+
+        /* Post-unfold rank revalidation (Path 2) */
+        if (rank > 1) {
+            double ref = 0;
+            for (int r = 0; r < m; r++)
+                ref += U_re[r*rank]*U_re[r*rank] + U_im[r*rank]*U_im[r*rank];
+            ref = sigma[0] * sqrt(ref > 0 ? ref : 1.0);
+
+            for (int s = 1; s < rank; s++) {
+                double col_norm2 = 0;
+                for (int r = 0; r < m; r++)
+                    col_norm2 += U_re[r*rank+s]*U_re[r*rank+s]
+                               + U_im[r*rank+s]*U_im[r*rank+s];
+                double contrib = sigma[s] * sqrt(col_norm2 > 0 ? col_norm2 : 0);
+                if (contrib < TSVD_EPS * ref)
+                    sigma[s] = 0;
+            }
+        }
     }
 
     free(FF_re); free(FF_im);
@@ -1321,21 +1360,12 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
 /* ═══════════════════════════════════════════════════════════════════════════════
  * MEASUREMENT-INDUCED BOND TRUNCATION
  *
- * The vesica fold SVD with omnidirectional S₆ sweep is measurement-invariant:
- * the Hadamard fold/unfold basis absorbs projective measurements as rotations,
- * preserving bond weights (ghost entanglement). This is a mathematical
- * consequence of the syntheme structure — NOT a bug.
+ * After a projective measurement collapses a site to |k⟩, that site is a
+ * product state with zero entanglement to its neighbors. All adjacent bond
+ * weights must be reset to rank-1 to reflect this.
  *
- * To observe physically correct measurement-induced phase transitions (MIPT),
- * bond weights must be explicitly truncated after projective measurement,
- * bypassing the vesica fold entirely:
- *
- *   A measured site in state |k⟩ is a PRODUCT STATE.
- *   It has ZERO entanglement with any neighbor.
- *   All adjacent bonds must become rank-1: σ₀ = 1, σ₁...σ_{χ-1} = 0.
- *
- * Usage: Call tsvd_measurement_truncate() on every bond adjacent to a site
- *        AFTER applying the projector gate |k⟩⟨k| via gate_1site().
+ * Call tsvd_measurement_truncate() on every bond adjacent to a measured site
+ * AFTER applying the projector |k⟩⟨k| via gate_1site().
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 /* Truncate a single bond to rank-1 after projective measurement.
