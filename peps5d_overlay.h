@@ -97,5 +97,6 @@ void tns5d_trotter_step(Tns5dGrid *g, const double *G_re, const double *G_im);
 void tns5d_normalize_site(Tns5dGrid *g, int x, int y, int z, int w, int v);
 void tns5d_local_density(Tns5dGrid *g, int x, int y, int z, int w, int v,
                          double *probs);
+int  tns5d_measure_site(Tns5dGrid *g, int x, int y, int z, int w, int v);
 
 #endif /* PEPS5D_OVERLAY_H */
