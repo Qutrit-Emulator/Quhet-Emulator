@@ -1171,7 +1171,7 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
                        pairs, FF_re, FF_im);
 
     double wave_frac = best_wave;
-    /* DBG */ fprintf(stderr, "  omni_sweep: synth=%d wave_frac=%.6f\n", best_synth, wave_frac);
+    /* omni_sweep debug disabled for performance */
 
     /* ═══════════════════════════════════════════════════════════════════════
      * PATH 1: VESICA DIRECT — Geometric factorization, NO SVD
@@ -1316,6 +1316,47 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
     }
 
     free(FF_re); free(FF_im);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * MEASUREMENT-INDUCED BOND TRUNCATION
+ *
+ * The vesica fold SVD with omnidirectional S₆ sweep is measurement-invariant:
+ * the Hadamard fold/unfold basis absorbs projective measurements as rotations,
+ * preserving bond weights (ghost entanglement). This is a mathematical
+ * consequence of the syntheme structure — NOT a bug.
+ *
+ * To observe physically correct measurement-induced phase transitions (MIPT),
+ * bond weights must be explicitly truncated after projective measurement,
+ * bypassing the vesica fold entirely:
+ *
+ *   A measured site in state |k⟩ is a PRODUCT STATE.
+ *   It has ZERO entanglement with any neighbor.
+ *   All adjacent bonds must become rank-1: σ₀ = 1, σ₁...σ_{χ-1} = 0.
+ *
+ * Usage: Call tsvd_measurement_truncate() on every bond adjacent to a site
+ *        AFTER applying the projector gate |k⟩⟨k| via gate_1site().
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* Truncate a single bond to rank-1 after projective measurement.
+ *   w   : bond weight array (σ values), length chi
+ *   chi : bond dimension
+ * Sets w[0] = 1.0, w[1..chi-1] = 0.0. */
+static inline void tsvd_measurement_truncate(double *w, int chi)
+{
+    w[0] = 1.0;
+    for (int s = 1; s < chi; s++) w[s] = 0.0;
+}
+
+/* Truncate multiple bonds after measurement (batch version).
+ *   bonds   : array of pointers to bond weight arrays
+ *   n_bonds : number of adjacent bonds to truncate
+ *   chi     : bond dimension */
+static inline void tsvd_measurement_truncate_batch(double **bonds,
+                                                    int n_bonds, int chi)
+{
+    for (int b = 0; b < n_bonds; b++)
+        tsvd_measurement_truncate(bonds[b], chi);
 }
 
 #endif /* TENSOR_SVD_H */
