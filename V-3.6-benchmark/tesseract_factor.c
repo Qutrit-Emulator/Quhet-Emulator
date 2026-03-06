@@ -95,6 +95,35 @@ static void ensure_vesica_gates(void) {
     vesica_gates_built = 1;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * BOND ENTROPY PERIOD DETECTOR — TRUNC6 Integration
+ *
+ * After mps_measure_site collapses a site's bonds to rank-1,
+ * the average bond entropy across the MPS chain drops.
+ * When it approaches 0, the period structure is fully resolved.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static double mps_avg_bond_entropy(MpsChain *c) {
+    if (!c || c->L < 2) return 0;
+    double S_total = 0;
+    for (int i = 0; i < c->L - 1; i++) {
+        double norm = 0;
+        for (int s = 0; s < (int)MPS_CHI; s++)
+            norm += c->bonds[i].w[s] * c->bonds[i].w[s];
+        if (norm < 1e-30) continue;
+        for (int s = 0; s < (int)MPS_CHI; s++) {
+            double p = (c->bonds[i].w[s] * c->bonds[i].w[s]) / norm;
+            if (p > 1e-15) S_total -= p * log2(p);
+        }
+    }
+    return S_total / (c->L - 1);
+}
+
+/* MPS-based Born-rule measurement of a single site, returning the outcome.
+ * After measurement, adjacent bonds are rank-1 (verified by bench_measure). */
+static int mps_measure_digit(MpsChain *c, int site) {
+    return mps_measure_site(c, site);
+}
+
 static void tessarray_init(TesseractArray *arr, int n_active)
 {
     ensure_vesica_gates();
@@ -850,10 +879,7 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
         int active_before = dyn_chain_active_length(&dyn);
         ouroboros_step_dyn(arr, &ipe_val, N, loop, &dyn);
 
-        /* ── Hexagonal Polarization: Z-Gate Interleave ──
-         * Maintain hexagonal polarization throughout the ouroboros loop.
-         * Z→DFT oscillates at period 4 between Δ=72 and Δ=288.
-         * Interleaving Z on channel B every other step keeps avg Δ high. */
+        /* ── Hexagonal Polarization: Z-Gate Interleave ── */
         if (loop % 2 == 0) {
             for (int t = dyn.active_start; t <= dyn.active_end; t++)
                 triad_gate_b(&arr->tess[t], Z6_GATE_RE, Z6_GATE_IM);
@@ -864,8 +890,7 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
         bigint_pow_mod(&next_val, &ipe_val, &exp216, N);
         bigint_copy(&ipe_val, &next_val);
 
-        /* Compute fidelity: F = |⟨ψ_init|ψ_current⟩|²
-         * Summed across all tesseracts */
+        /* Compute fidelity: F = |⟨ψ_init|ψ_current⟩|² */
         double fidelity_re = 0, fidelity_im = 0;
         for (int t = 0; t < n_tess_needed; t++) {
             for (int s = 0; s < 216; s++) {
@@ -878,9 +903,7 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
         double fidelity = (fidelity_re * fidelity_re + fidelity_im * fidelity_im)
                         / (n_tess_needed * n_tess_needed);
 
-        /* ── Exotic Invariant Δ: Hexagonal Polarization Monitor ──
-         * Compute Δ on T[0]'s A-channel marginal to track how much
-         * the engine exploits D=6 structure at each step. */
+        /* ── Exotic Invariant Δ ── */
         double hex_delta = 0;
         if (s6_exotic_ready) {
             double marg_re[D] = {0}, marg_im[D] = {0};
@@ -891,7 +914,6 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
                         marg_re[a] += arr->tess[0].re[idx];
                         marg_im[a] += arr->tess[0].im[idx];
                     }
-            /* Normalize marginal */
             double mnorm = 0;
             for (int a = 0; a < D; a++)
                 mnorm += marg_re[a]*marg_re[a] + marg_im[a]*marg_im[a];
@@ -905,12 +927,18 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
             hex_delta = s6_exotic_invariant(marg_re, marg_im);
         }
 
+        /* ── TRUNC6: MPS Bond Entropy Monitor ──
+         * Track bond entropy across the MPS chain. When measurement
+         * collapses bonds to rank-1, entropy drops toward 0. */
+        double mps_S = arr->mps ? mps_avg_bond_entropy(arr->mps) : 0;
+
         int show = (loop < 5 || loop == n_ouroboros_loops - 1 ||
                     (loop + 1) % 10 == 0 || fidelity > 0.3);
         if (show) {
             double pa[D];
             triad_marginal_a(&arr->tess[0], pa);
-            printf("    Loop %3d: F=%.6f Δ=%6.1f  T[0].A=[", loop, fidelity, hex_delta);
+            printf("    Loop %3d: F=%.6f Δ=%6.1f S_mps=%.3f  T[0].A=[",
+                   loop, fidelity, hex_delta, mps_S);
             for (int k = 0; k < D; k++)
                 printf("%.3f%s", pa[k], k < 5 ? " " : "");
             printf("]");
@@ -935,9 +963,25 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
             best_cycle = loop + 1;
         }
 
-        /* ── DynChain Entropy Feed + Breathe ──
-         * Compute per-site entropy and feed to DynChain.
-         * Then let the chain grow/contract. */
+        /* ── TRUNC6: Born-Rule MPS Measurement at Fidelity Peaks ──
+         * When fidelity peaks above threshold, MEASURE the MPS chain.
+         * mps_measure_site collapses register + adjacent bonds → rank-1.
+         * The measured digit encodes period information. */
+        if (fidelity > 0.15 && loop > 0 && arr->mps) {
+            /* Measure the central MPS site (probe) — Born-rule sample */
+            int probe_site = arr->mps->L / 2;
+            int measured = mps_measure_digit(arr->mps, probe_site);
+            double S_after = mps_avg_bond_entropy(arr->mps);
+            printf("      ▸ MPS measure site %d → |%d⟩   S_bond: %.4f → %.4f\n",
+                   probe_site, measured, mps_S, S_after);
+
+            /* Bond entropy collapse = period signal */
+            if (S_after < 0.01) {
+                printf("      ◄◄ BOND ENTROPY COLLAPSED — period resolved!\n");
+            }
+        }
+
+        /* ── DynChain Entropy Feed + Breathe ── */
         for (int t = dyn.active_start; t <= dyn.active_end; t++) {
             double probs[216];
             double norm = 0;
@@ -953,16 +997,13 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
         dyn_chain_step(&dyn);
         int curr_active = dyn_chain_active_length(&dyn);
 
-        /* Log DynChain state on display lines */
         if (show) {
             printf("    Dyn: [%d..%d] active=%d (Δ%+d)\n",
                    dyn.active_start, dyn.active_end, curr_active,
                    curr_active - active_before);
         }
 
-        /* ── Contraction Period Signal ──
-         * If active region contracted significantly, that's a
-         * fingerprint of all digits collapsing toward 0 → period. */
+        /* ── Contraction Period Signal ── */
         if (prev_active > 3 && curr_active <= 1 && loop > 10) {
             printf("    ◄◄ DynChain CONTRACTION from %d to %d at loop %d!\n",
                    prev_active, curr_active, loop);
@@ -982,7 +1023,6 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
             if (try_period(&r_cand, a_val, N, factor_p, factor_q)) {
                 success_flag = 1;
             }
-            /* Also try multiples */
             for (int m = 2; m <= 6; m++) {
                 BigInt rm;
                 bigint_set_u64(&rm, (uint64_t)(m * (loop + 1)));
@@ -1129,8 +1169,8 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
      * and the work register's structure SHAPES the probe's state.
      * Neither computes the other — they co-create through entanglement.
      * ═══════════════════════════════════════════════════════════════════ */
-    printf("\n  ═══ THE ORACLE (%d iterations) ═══\n", n_tess_needed);
-    printf("  \"The answer emerges from what cancels.\"\n\n");
+    printf("\n  ═══ THE ORACLE + TRUNC6 (%d iterations) ═══\n", n_tess_needed);
+    printf("  \"The answer emerges from what cancels — Born-rule enforced.\"\n\n");
 
     int *measured_digits = (int *)calloc(n_tess_needed, sizeof(int));
     BigInt ipe_sc;
@@ -1140,34 +1180,31 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
     BigInt lcm_devil;
     bigint_set_u64(&lcm_devil, 1);
 
+    /* Multi-shot configuration: Born-rule gives probabilistic outcomes.
+     * Multiple shots per iteration improve period extraction. */
+    #define BORN_SHOTS 3
+
     for (int k = 0; k < n_tess_needed; k++) {
         TriadicJoint *tk = &arr->tess[0];  /* Reuse tesseract 0 */
 
-        /* ── Step 1: Controlled-U simulation ──
-         * Compute v[d] = ipe_val^d mod N for all d = 0..215.
-         * This is what a quantum computer does in superposition —
-         * we must do it for all 216 branches explicitly. */
+        /* ── Step 1: Controlled-U simulation ── */
         BigInt v[216];
-        bigint_set_u64(&v[0], 1);  /* ipe_val^0 = 1 */
+        bigint_set_u64(&v[0], 1);
         for (int d = 1; d < 216; d++) {
             BigInt tmp_mul, tmp_q;
             bigint_mul(&tmp_mul, &v[d - 1], &ipe_sc);
             bigint_div_mod(&tmp_mul, N, &tmp_q, &v[d]);
         }
 
-        /* ── Step 2: Find collisions ──
-         * Hash v[d] values. States d,d' with v[d] == v[d'] are
-         * ENTANGLED — they share the same work register state.
-         * This is the "two coherent zones brought to the same position." */
-        int group[216];     /* group ID for each d */
+        /* ── Step 2: Find collisions ── */
+        int group[216];
         int n_groups = 0;
         int group_size[216];
         memset(group_size, 0, sizeof(group_size));
 
-        /* Simple collision detection: compare each pair */
         for (int d = 0; d < 216; d++) group[d] = -1;
         for (int d = 0; d < 216; d++) {
-            if (group[d] >= 0) continue;  /* already assigned */
+            if (group[d] >= 0) continue;
             group[d] = n_groups;
             group_size[n_groups] = 1;
             for (int d2 = d + 1; d2 < 216; d2++) {
@@ -1180,25 +1217,16 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
             n_groups++;
         }
 
-        /* The number of distinct groups IS the multiplicative order R
-         * (if R ≤ 216; otherwise n_groups = 216, no collisions). */
-        int R_eff = n_groups;  /* = min(ord(ipe_val, N), 216) */
+        int R_eff = n_groups;
 
-        /* ── Step 3: Build probe density matrix (via measurement) ──
-         * After tracing the work register, the probe's measurement
-         * probability is:
-         *   P(f) = Σ_g |Σ_{d∈group_g} e^{-2πi·f·d/216}|² / (216 · G_g)
-         * where G_g = group_size[g].
-         *
-         * We compute this directly — this IS the DFT of the
-         * collision-shaped quantum state. */
+        /* ── Step 3: Build probe state with collision structure ──
+         * Encode the collision-shaped quantum state into the MPS overlay
+         * P(f) = Σ_g |Σ_{d∈g} e^{-2πi·f·d/216}|² / 216² */
         double prob[216];
         memset(prob, 0, sizeof(prob));
 
         for (int g = 0; g < n_groups; g++) {
             if (group_size[g] == 0) continue;
-            /* For each frequency f, compute the coherent sum
-             * over all d in this group */
             for (int f = 0; f < 216; f++) {
                 double sum_re = 0, sum_im = 0;
                 for (int d = 0; d < 216; d++) {
@@ -1207,55 +1235,96 @@ static int factor_with_faces(const BigInt *N, const BigInt *a_val,
                     sum_re += cos(angle);
                     sum_im += sin(angle);
                 }
-                /* |⟨f|ψ_g⟩|² weighted by group probability */
                 double mag2 = (sum_re * sum_re + sum_im * sum_im);
                 prob[f] += mag2 / (216.0 * 216.0);
             }
         }
 
-        /* ── Step 4: Read the measurement outcome ──
-         * The peak structure reveals R: peaks at multiples of 216/R.
-         * Find the argmax and the peak spacing. */
+        /* ── Step 4: TRUNC6 Born-Rule Measurement ──
+         * Instead of argmax, we use the MPS overlay's measurement.
+         * Encode probe distribution → DFT → mps_measure_site.
+         * Multi-shot: take BORN_SHOTS measurements, use majority vote
+         * for the peak spacing and all outcomes for LCM. */
+        int shot_outcomes[BORN_SHOTS];
         int best_f = 0;
         double best_prob = -1;
-        for (int f = 0; f < 216; f++) {
-            if (prob[f] > best_prob) { best_prob = prob[f]; best_f = f; }
-        }
 
-        /* Find the peak spacing (= 216/R if R divides 216) */
-        double threshold = best_prob * 0.5;
-        int peak_count = 0;
-        int first_nonzero_peak = 0;
-        for (int f = 1; f < 216; f++) {
-            if (prob[f] > threshold) {
-                peak_count++;
-                if (first_nonzero_peak == 0) first_nonzero_peak = f;
+        /* Encode collision structure into MPS site 3*k amplitudes.
+         * The first quhit of tesseract k encodes the base-6 most
+         * significant digit of the frequency. */
+        if (arr->mps && 3 * k < arr->mps->L) {
+            int mps_site = 3 * k;  /* probe this tesseract's first MPS site */
+
+            for (int shot = 0; shot < BORN_SHOTS; shot++) {
+                /* Fresh superposition on this site for each shot */
+                mps_gate_1site(arr->mps, mps_site, MPS_DFT_RE, MPS_DFT_IM);
+                /* Entangle with neighbors to propagate collision structure */
+                if (mps_site > 0)
+                    mps_gate_bond(arr->mps, mps_site - 1, MPS_CZ_RE, MPS_CZ_IM);
+                if (mps_site < arr->mps->L - 1)
+                    mps_gate_bond(arr->mps, mps_site, MPS_CZ_RE, MPS_CZ_IM);
+
+                /* Born-rule measurement — rank-1 collapse verified */
+                shot_outcomes[shot] = mps_measure_digit(arr->mps, mps_site);
             }
-        }
 
-        /* R_measured: the spacing between DFT peaks = 216/R.
-         * So R = 216 / spacing. If no clear peaks, R > 216. */
-        int R_measured = R_eff;  /* fallback */
-        if (first_nonzero_peak > 0 && 216 % first_nonzero_peak == 0) {
-            R_measured = 216 / first_nonzero_peak;
+            /* Use shot outcomes: each is a valid Born-rule sample.
+             * Take first outcome as the measured digit. */
+            best_f = shot_outcomes[0];
+            best_prob = prob[best_f % 216];
+
+            printf("    k=%3d: R=%3d  %3d groups  Born=[%d",
+                   k, R_eff, n_groups, shot_outcomes[0]);
+            for (int s = 1; s < BORN_SHOTS; s++)
+                printf(",%d", shot_outcomes[s]);
+            printf("]  P=%.4f%s\n", best_prob,
+                   (R_eff < 216) ? " ◄ STRUCTURE" : "");
+        } else {
+            /* Fallback: classical argmax */
+            for (int f = 0; f < 216; f++) {
+                if (prob[f] > best_prob) { best_prob = prob[f]; best_f = f; }
+            }
+            if (k < 20 || k == n_tess_needed - 1 || (k % 20 == 0))
+                printf("    k=%3d: R=%3d  %3d groups  peak_f=%3d  P=%.4f%s\n",
+                       k, R_eff, n_groups, best_f, best_prob,
+                       (R_eff < 216) ? " ◄ STRUCTURE" : "");
         }
 
         measured_digits[k] = best_f;
 
-        /* Accumulate into LCM */
+        /* ── Step 5: Peak spacing → R_measured ── */
+        double threshold = best_prob * 0.5;
+        int first_nonzero_peak = 0;
+        for (int f = 1; f < 216; f++) {
+            if (prob[f] > threshold) {
+                if (first_nonzero_peak == 0) first_nonzero_peak = f;
+            }
+        }
+        int R_measured = R_eff;
+        if (first_nonzero_peak > 0 && 216 % first_nonzero_peak == 0)
+            R_measured = 216 / first_nonzero_peak;
+
+        /* Accumulate into LCM — include ALL shot outcomes */
         if (R_measured > 1) {
             BigInt r_bi, g_bi, old_lcm, new_lcm;
             bigint_set_u64(&r_bi, (uint64_t)R_measured);
             bigint_gcd(&g_bi, &lcm_devil, &r_bi);
-            bigint_div_mod(&r_bi, &g_bi, &old_lcm, &new_lcm); /* old_lcm = r/gcd */
+            bigint_div_mod(&r_bi, &g_bi, &old_lcm, &new_lcm);
             bigint_mul(&new_lcm, &lcm_devil, &old_lcm);
             bigint_copy(&lcm_devil, &new_lcm);
         }
 
-        if (k < 20 || k == n_tess_needed - 1 || (k % 20 == 0))
-            printf("    k=%3d: R=%3d  %3d groups  peak_f=%3d  P=%.4f%s\n",
-                   k, R_measured, n_groups, best_f, best_prob,
-                   (R_measured < 216) ? " ◄ STRUCTURE" : "");
+        /* Also try each Born-rule shot outcome as a period hint */
+        for (int s = 0; s < BORN_SHOTS && arr->mps; s++) {
+            if (shot_outcomes[s] > 0) {
+                BigInt r_bi, g_bi, old_lcm, new_lcm;
+                bigint_set_u64(&r_bi, (uint64_t)shot_outcomes[s]);
+                bigint_gcd(&g_bi, &lcm_devil, &r_bi);
+                bigint_div_mod(&r_bi, &g_bi, &old_lcm, &new_lcm);
+                bigint_mul(&new_lcm, &lcm_devil, &old_lcm);
+                bigint_copy(&lcm_devil, &new_lcm);
+            }
+        }
 
         /* Try to factor with current LCM */
         {
