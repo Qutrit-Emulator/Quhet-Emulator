@@ -93,6 +93,9 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
 /* Observables */
 void peps_local_density(PepsGrid *grid, int x, int y, double *probs);
 
+/* Measurement — vesica complement: fully collapses register + bonds */
+int peps_measure_site(PepsGrid *grid, int x, int y);
+
 /* ═══════════════════════════════════════════════════════════════════════════════
  * BATCH GATE APPLICATION (Red-Black Checkerboard Parallelism)
  * ═══════════════════════════════════════════════════════════════════════════════ */
