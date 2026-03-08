@@ -40,7 +40,10 @@ MpsChain *mps_init(int L)
     c->bonds = (MpsBondWeight *)calloc(L - 1, sizeof(MpsBondWeight));
     for (int i = 0; i < L - 1; i++) {
         c->bonds[i].w = (double *)calloc((size_t)MPS_CHI, sizeof(double));
-        for (int s = 0; s < (int)MPS_CHI; s++) c->bonds[i].w[s] = 1.0;
+        /* Rank-1 product state: only w[0] = 1, rest = 0 (via calloc).
+         * Previous all-ones initialization created 256 phantom bond weights
+         * that corrupted the density calculation for untouched bonds. */
+        c->bonds[i].w[0] = 1.0;
     }
 
     c->eng = (QuhitEngine *)calloc(1, sizeof(QuhitEngine));
@@ -200,12 +203,11 @@ void mps_gate_bond(MpsChain *c, int site,
         basis_t bsA = regA->entries[eA].basis_state;
         double arA = regA->entries[eA].amp_re;
         double aiA = regA->entries[eA].amp_im;
-        if (arA*arA + aiA*aiA < 1e-10) continue;
 
         int kA = (int)(bsA / MPS_C2);
         basis_t pureA = bsA % MPS_C2;
-        int shared_valA = (int)((pureA / bp[bond_A]) % chi);  /* β_A */
-        basis_t envA = (pureA / bp[bond_A + 1]) * bp[bond_A] + (pureA % bp[bond_A]);
+        int shared_valA = (int)(pureA % chi);  /* β is shared right bond for A */
+        basis_t envA = pureA / chi;            /* α is env left bond for A */
 
         int idx_EA = -1;
         for (int i = 0; i < num_EA; i++) if (uniq_envA[i] == envA) { idx_EA = i; break; }
@@ -216,14 +218,13 @@ void mps_gate_bond(MpsChain *c, int site,
             basis_t bsB = regB->entries[eB].basis_state;
             double arB = regB->entries[eB].amp_re;
             double aiB = regB->entries[eB].amp_im;
-            if (arB*arB + aiB*aiB < 1e-10) continue;
 
             basis_t pureB = bsB % MPS_C2;
-            int shared_valB = (int)((pureB / bp[bond_B]) % chi);  /* α_B */
+            int shared_valB = (int)(pureB / chi);  /* α is shared left bond for B */
             if (shared_valA != shared_valB) continue;
 
             int kB = (int)(bsB / MPS_C2);
-            basis_t envB = (pureB / bp[bond_B + 1]) * bp[bond_B] + (pureB % bp[bond_B]);
+            basis_t envB = pureB % chi;            /* β is env right bond for B */
 
             int idx_EB = -1;
             for (int i = 0; i < num_EB; i++) if (uniq_envB[i] == envB) { idx_EB = i; break; }
@@ -279,6 +280,7 @@ void mps_gate_bond(MpsChain *c, int site,
     tsvd_vesica_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B,
                    D, num_EA, num_EB, chi,
                    U_re, U_im, sig, Vc_re, Vc_im);
+
     free(Th2_re); free(Th2_im);
 
     int rank = chi < svddim_B ? chi : svddim_B;
@@ -292,9 +294,20 @@ void mps_gate_bond(MpsChain *c, int site,
 
     /* Store σ on bonds — Θ contraction absorbs via sw = bonds.w[s].
      * U and V are written unscaled. 1-site gates between bond gates
-     * are compatible because they don't touch the bond index. */
-    for (int s = 0; s < (int)MPS_CHI; s++)
-        shared_bw->w[s] = (s < rank) ? sig[s] : 0.0;
+     * are compatible because they don't touch the bond index.
+     *
+     * LAYER 10: Bond σ renormalization.
+     * Without normalization, σ absorbs the full Frobenius norm of Θ,
+     * which grows multiplicatively through layers (diagnostic showed
+     * σ reaching 7.1e+06 by layer 2, Σσ² = 5e+13). This causes
+     * catastrophic precision loss. Renormalize so Σσ² = 1. */
+    {
+        double norm2 = 0;
+        for (int s = 0; s < rank; s++) norm2 += sig[s] * sig[s];
+        double inv = (norm2 > 1e-30) ? 1.0 / sqrt(norm2) : 1.0;
+        for (int s = 0; s < (int)MPS_CHI; s++)
+            shared_bw->w[s] = (s < rank) ? sig[s] * inv : 0.0;
+    }
 
     /* ── 5. Write back safely ── */
     svd_buf_reset(&mps_svd_buf);
@@ -302,12 +315,12 @@ void mps_gate_bond(MpsChain *c, int site,
      for (int eA = 0; eA < num_EA; eA++) {
          int row_idx = kA * num_EA + eA;
          basis_t envA = uniq_envA[eA];
-         basis_t pure = (envA / bp[bond_A]) * bp[bond_A + 1] + (envA % bp[bond_A]);
          for (int gv = 0; gv < rank; gv++) {
              double re = U_re[row_idx * rank + gv];
              double im = U_im[row_idx * rank + gv];
              if (re == 0.0 && im == 0.0) continue;
-             svd_buf_push(&mps_svd_buf, kA * MPS_C2 + pure + gv * bp[bond_A], re, im);
+             basis_t base_pure = envA * chi + gv; /* alpha * chi + beta */
+             svd_buf_push(&mps_svd_buf, kA * MPS_C2 + base_pure, re, im);
          }
      }
     svd_buf_flush(&mps_svd_buf, regA);
@@ -317,12 +330,12 @@ void mps_gate_bond(MpsChain *c, int site,
      for (int eB = 0; eB < num_EB; eB++) {
          int col_idx = kB * num_EB + eB;
          basis_t envB = uniq_envB[eB];
-         basis_t pure = (envB / bp[bond_B]) * bp[bond_B + 1] + (envB % bp[bond_B]);
          for (int gv = 0; gv < rank; gv++) {
              double re = Vc_re[gv * svddim_B + col_idx];
              double im = Vc_im[gv * svddim_B + col_idx];
              if (re == 0.0 && im == 0.0) continue;
-             svd_buf_push(&mps_svd_buf, kB * MPS_C2 + pure + gv * bp[bond_B], re, im);
+             basis_t base_pure = gv * chi + envB; /* alpha * chi + beta */
+             svd_buf_push(&mps_svd_buf, kB * MPS_C2 + base_pure, re, im);
          }
      }
     svd_buf_flush(&mps_svd_buf, regB);
