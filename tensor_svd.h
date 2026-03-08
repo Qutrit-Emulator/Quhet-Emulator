@@ -220,11 +220,7 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
                * negligible relative to diagonal gap. This is the single
                * biggest speedup — eliminates ~60% of rotation work. */
               if (mag2 < sc_thresh) continue;
-              /* LAYER 9: born_fast_isqrt (9 bits) is sufficient here because
-               * Jacobi is self-correcting — rotation angle errors are absorbed
-               * by subsequent sweeps. True sqrt() is 10× slower in the hot loop
-               * and provides no convergence benefit. */
-              double mag = mag2 * born_fast_isqrt(mag2);
+              double mag = sqrt(mag2);
 
               double hpp = H_re[p*n+p], hqq = H_re[q*n+q];
               double tau = (hqq - hpp) / (2.0 * mag);
@@ -245,8 +241,8 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
                   c = TSVD_INV_SQRT2;
                   s = TSVD_INV_SQRT2;
               } else {
-                  t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau) + fabs(tau) * born_fast_isqrt(1.0 + 1.0/(tau*tau)));
-                  c = born_fast_isqrt(1.0 + t*t);
+                  t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau) + sqrt(tau*tau + 1.0));
+                  c = 1.0 / sqrt(1.0 + t*t);
                   s = t * c;
               }
 
@@ -464,79 +460,133 @@ static void tsvd_truncated(const double *M_re, const double *M_im,
                            double *sigma,
                            double *Vc_re, double *Vc_im)
 {
-    /* Form H = M† M  (n×n Hermitian) */
-    size_t hsz = (size_t)n * n;
-    double *H_re = (double *)calloc(hsz, sizeof(double));
-    double *H_im = (double *)calloc(hsz, sizeof(double));
+    /* LAYER 12: Gram-matrix Jacobi SVD with exact arithmetic.
+     * When m < n, form H = M·M† (m×m) to avoid ill-conditioned n×n Jacobi.
+     * When m >= n, form H = M†·M (n×n) as usual.
+     * Uses exact sqrt() throughout for machine-precision results. */
+    
+    int rank = chi < n ? chi : n;
+    if (rank > m) rank = m;
+    
+    if (m < n) {
+        /* ═══ m < n path: H = M·M† is m×m ═══ */
+        size_t hsz = (size_t)m * m;
+        double *H_re = (double *)calloc(hsz, sizeof(double));
+        double *H_im = (double *)calloc(hsz, sizeof(double));
 
-    for (int i = 0; i < n; i++)
-        for (int j = i; j < n; j++) {
-            /* LAYER 4 UPGRADE: FMA-aware complex dot product.
-             * Probe 3 confirmed fma() intrinsic works on this substrate.
-             * fma(a,b,c) = a*b+c with single rounding — prevents the
-             * catastrophic cancellation that Probe 8 mapped at 3.3 bits/digit.
-             * Each fma() call preserves ~52 extra mantissa bits vs MUL+ADD. */
-            double sr = 0, si = 0;
-            for (int k = 0; k < m; k++) {
-                double ar = M_re[k*n+i], ai = -M_im[k*n+i]; /* conj */
-                double br = M_re[k*n+j], bi =  M_im[k*n+j];
-                sr = fma(ar, br, sr); sr = fma(-ai, bi, sr);
-                si = fma(ar, bi, si); si = fma( ai, br, si);
+        for (int i = 0; i < m; i++)
+            for (int j = i; j < m; j++) {
+                double sr = 0, si = 0;
+                for (int k = 0; k < n; k++) {
+                    double ar = M_re[i*n+k], ai = M_im[i*n+k];
+                    double br = M_re[j*n+k], bi = -M_im[j*n+k]; /* conj(B_row_j) */
+                    sr += ar*br - ai*bi;
+                    si += ar*bi + ai*br;
+                }
+                H_re[i*m+j] = sr; H_im[i*m+j] = si;
+                H_re[j*m+i] = sr; H_im[j*m+i] = -si;
             }
-            H_re[i*n+j] = sr; H_im[i*n+j] = si;
-            H_re[j*n+i] = sr; H_im[j*n+i] = -si; /* Hermitian */
+
+        double *eig = (double *)calloc(m, sizeof(double));
+        double *W_re = (double *)calloc(hsz, sizeof(double));
+        double *W_im = (double *)calloc(hsz, sizeof(double));
+
+        tsvd_jacobi_hermitian(H_re, H_im, m, eig, W_re, W_im);
+
+        /* σ = sqrt(eigenvalues), U = W (eigenvectors of M·M†) */
+        for (int j = 0; j < rank; j++) {
+            sigma[j] = eig[j] > 0 ? sqrt(eig[j]) : 0;
         }
 
-    /* Power iteration eigendecomposition: H = V D V† (PSD-safe) */
-    int k = chi < n ? chi : n;
-    if (k > m) k = m;
-    double *eig = (double *)calloc(n, sizeof(double));
-    double *V_re = (double *)calloc(hsz, sizeof(double));
-    double *V_im = (double *)calloc(hsz, sizeof(double));
-
-    tsvd_psd_power_eigen(H_re, H_im, n, k, eig, V_re, V_im);
-
-    /* σ = sqrt(eigenvalues) — power iteration guarantees eig ≥ 0 */
-    int rank = k;
-    for (int i = 0; i < rank; i++)
-        sigma[i] = eig[i] > 0 ? sqrt(eig[i]) : 0;
-
-    /* U = M V σ⁻¹  (m × rank) */
-    memset(U_re, 0, (size_t)m * rank * sizeof(double));
-    memset(U_im, 0, (size_t)m * rank * sizeof(double));
-
-    for (int j = 0; j < rank; j++) {
-        /* LAYER 6: Information-theoretic rank truncation.
-         * Sigma is sorted descending. Truncate when sigma[j] drops below
-         * ε × sigma[0] — below this ratio, the singular vector carries
-         * less than 1 bit of signal above the noise floor. */
-        if (sigma[j] < TSVD_EPS * sigma[0] || sigma[j] < TSVD_SAFE_MIN) break;
-        /* LAYER 9: SSE rcpss+2N (46 bits) — same speed as hardware div */
-        double inv = born_precise_recip(sigma[j]);
-        for (int i = 0; i < m; i++) {
-            /* FMA-aware complex dot product for U reconstruction */
-            double sr = 0, si = 0;
-            for (int k = 0; k < n; k++) {
-                double mr = M_re[i*n+k], mi = M_im[i*n+k];
-                double vr = V_re[k*n+j], vi = V_im[k*n+j];
-                sr = fma(mr, vr, sr); sr = fma(-mi, vi, sr);
-                si = fma(mr, vi, si); si = fma( mi, vr, si);
+        memset(U_re, 0, (size_t)m * rank * sizeof(double));
+        memset(U_im, 0, (size_t)m * rank * sizeof(double));
+        for (int j = 0; j < rank; j++)
+            for (int i = 0; i < m; i++) {
+                U_re[i*rank+j] = W_re[i*m+j];
+                U_im[i*rank+j] = W_im[i*m+j];
             }
-            U_re[i*rank+j] = sr * inv;
-            U_im[i*rank+j] = si * inv;
+
+        /* V = M† U σ⁻¹, then Vc = V† */
+        for (int j = 0; j < rank; j++) {
+            if (sigma[j] < TSVD_EPS * sigma[0] || sigma[j] < TSVD_SAFE_MIN) {
+                sigma[j] = 0;
+                continue;
+            }
+            double inv = 1.0 / sigma[j];
+            for (int i = 0; i < n; i++) {
+                double sr = 0, si = 0;
+                for (int k = 0; k < m; k++) {
+                    double mr = M_re[k*n+i], mi = -M_im[k*n+i]; /* M†[i,k] = conj(M[k,i]) */
+                    double ur = W_re[k*m+j], ui = W_im[k*m+j];
+                    sr += mr*ur - mi*ui;
+                    si += mr*ui + mi*ur;
+                }
+                /* V[i,j] = (M† U σ⁻¹)[i,j] */
+                /* Vc[j,i] = conj(V[i,j]) */
+                Vc_re[j*n+i] =  sr * inv;
+                Vc_im[j*n+i] = -si * inv;
+            }
         }
+
+        free(H_re); free(H_im);
+        free(eig); free(W_re); free(W_im);
+    } else {
+        /* ═══ m >= n path: H = M†·M is n×n ═══ */
+        size_t hsz = (size_t)n * n;
+        double *H_re = (double *)calloc(hsz, sizeof(double));
+        double *H_im = (double *)calloc(hsz, sizeof(double));
+
+        for (int i = 0; i < n; i++)
+            for (int j = i; j < n; j++) {
+                double sr = 0, si = 0;
+                for (int k = 0; k < m; k++) {
+                    double ar = M_re[k*n+i], ai = -M_im[k*n+i]; /* conj */
+                    double br = M_re[k*n+j], bi =  M_im[k*n+j];
+                    sr += ar*br - ai*bi;
+                    si += ar*bi + ai*br;
+                }
+                H_re[i*n+j] = sr; H_im[i*n+j] = si;
+                H_re[j*n+i] = sr; H_im[j*n+i] = -si;
+            }
+
+        double *eig = (double *)calloc(n, sizeof(double));
+        double *V_re = (double *)calloc(hsz, sizeof(double));
+        double *V_im = (double *)calloc(hsz, sizeof(double));
+
+        tsvd_jacobi_hermitian(H_re, H_im, n, eig, V_re, V_im);
+
+        for (int i = 0; i < rank; i++)
+            sigma[i] = eig[i] > 0 ? sqrt(eig[i]) : 0;
+
+        /* U = M V σ⁻¹ */
+        memset(U_re, 0, (size_t)m * rank * sizeof(double));
+        memset(U_im, 0, (size_t)m * rank * sizeof(double));
+        for (int j = 0; j < rank; j++) {
+            if (sigma[j] < TSVD_EPS * sigma[0] || sigma[j] < TSVD_SAFE_MIN) break;
+            double inv = 1.0 / sigma[j];
+            for (int i = 0; i < m; i++) {
+                double sr = 0, si = 0;
+                for (int kk = 0; kk < n; kk++) {
+                    double mr = M_re[i*n+kk], mi = M_im[i*n+kk];
+                    double vr = V_re[kk*n+j], vi = V_im[kk*n+j];
+                    sr += mr*vr - mi*vi;
+                    si += mr*vi + mi*vr;
+                }
+                U_re[i*rank+j] = sr * inv;
+                U_im[i*rank+j] = si * inv;
+            }
+        }
+
+        /* V† */
+        for (int i = 0; i < rank; i++)
+            for (int j = 0; j < n; j++) {
+                Vc_re[i*n+j] =  V_re[j*n+i];
+                Vc_im[i*n+j] = -V_im[j*n+i];
+            }
+
+        free(H_re); free(H_im);
+        free(eig); free(V_re); free(V_im);
     }
-
-    /* V† = conj(V)^T  (rank × n) */
-    for (int i = 0; i < rank; i++)
-        for (int j = 0; j < n; j++) {
-            Vc_re[i*n+j] =  V_re[j*n+i];
-            Vc_im[i*n+j] = -V_im[j*n+i];
-        }
-
-    free(H_re); free(H_im);
-    free(eig);
-    free(V_re); free(V_im);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -861,6 +911,45 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
     int c_rank = rank < mc ? rank : mc;
     if (c_rank > mr) c_rank = mr;
 
+    /* LAYER 10: Direct SVD for thin compressed matrices.
+     * When mc ≤ 36 (D²), the randomized projection adds numerical noise
+     * (poorly conditioned Ω with zero oversampling) and power iteration
+     * amplifies the vesica/wave spectral gap to catastrophic levels.
+     * Materialize the small dense matrix and use exact Jacobi SVD. */
+    if (mc <= 36) {
+        double *D_re = (double *)calloc((size_t)mr * mc, sizeof(double));
+        double *D_im = (double *)calloc((size_t)mr * mc, sizeof(double));
+        for (int e = 0; e < nnz; e++) {
+            D_re[csp[e].row * mc + csp[e].col] = csp[e].re;
+            D_im[csp[e].row * mc + csp[e].col] = csp[e].im;
+        }
+        double *dU_re = (double *)calloc((size_t)mr * c_rank, sizeof(double));
+        double *dU_im = (double *)calloc((size_t)mr * c_rank, sizeof(double));
+        double *dS    = (double *)calloc(c_rank, sizeof(double));
+        double *dV_re = (double *)calloc((size_t)c_rank * mc, sizeof(double));
+        double *dV_im = (double *)calloc((size_t)c_rank * mc, sizeof(double));
+
+        tsvd_truncated(D_re, D_im, mr, mc, c_rank,
+                       dU_re, dU_im, dS, dV_re, dV_im);
+
+        /* Scatter to original coordinates */
+        for (int j = 0; j < c_rank && j < rank; j++) {
+            sigma[j] = dS[j];
+            if (dS[j] < TSVD_EPS * dS[0] || dS[j] < TSVD_SAFE_MIN) break;
+            for (int i = 0; i < mr; i++)
+                { U_re[row_map[i]*rank+j] = dU_re[i*c_rank+j];
+                  U_im[row_map[i]*rank+j] = dU_im[i*c_rank+j]; }
+            for (int i = 0; i < mc; i++)
+                { Vc_re[j*n+col_map[i]] = dV_re[j*mc+i];
+                  Vc_im[j*n+col_map[i]] = dV_im[j*mc+i]; }
+        }
+        free(D_re); free(D_im);
+        free(dU_re); free(dU_im); free(dS);
+        free(dV_re); free(dV_im);
+        free(csp); free(row_map); free(col_map);
+        return;
+    }
+
     int p = c_rank < 10 ? c_rank : 10;
     int ell = c_rank + p;
     if (ell > mc) ell = mc;
@@ -893,9 +982,16 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
 
     /* UPGRADE 3: Adaptive power iterations
      * Simulation finding: 10^48:1 compression = huge spectral gaps.
-     * q=1 suffices for very sparse inputs. */
+     * q=1 suffices for very sparse inputs.
+     *
+     * LAYER 10: When ell >= mc, the random projection already spans the
+     * full column space — power iteration adds no benefit and amplifies
+     * the spectral gap between vesica and wave channels to catastrophic
+     * levels (100:1 → 10^14:1 at q=3), numerically zeroing wave σ values.
+     * Set q=0 for exact full-space projection. */
     int q;
-    if (nnz <= c_rank * 2)       q = 1;  /* very sparse: gap is huge */
+    if (ell >= mc)                    q = 0;  /* full column space captured */
+    else if (nnz <= c_rank * 2)       q = 1;  /* very sparse: gap is huge */
     else if (nnz <= c_rank * 10) q = 2;  /* moderate sparsity */
     else                          q = 3;  /* dense: need full amplification */
     for (int qi = 0; qi < q; qi++) {
@@ -1252,7 +1348,7 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
 {
     /* ── Path 3: BYPASS — D ≠ 6 or invalid env counts ── */
     if (D != TSVD_VESICA_D || num_envA == 0 || num_envB == 0) {
-        tsvd_truncated_sparse(M_re, M_im, m, n, chi,
+        tsvd_truncated(M_re, M_im, m, n, chi,
                               U_re, U_im, sigma, Vc_re, Vc_im);
         return;
     }
@@ -1293,104 +1389,16 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
     /* ═══════════════════════════════════════════════════════════════════════
      * PATH 1: VESICA DIRECT — Geometric factorization, NO SVD
      *
-     * When wave < 1%, the doubly-folded Θ lives entirely in the
-     * vesica subspace (3nEA × 3nEB).
+     * LAYER 10: PATH 1 (vesica-only SVD) was merged into PATH 2.
+     * The original PATH 1 extracted only the 3nEA × 3nEB vesica subspace
+     * and discarded wave channels entirely. For boundary sites (num_envB=1),
+     * this halved the column space from 6→3, permanently capping bond rank
+     * at 3 — a cascading rank collapse that caused all deep-circuit failures.
+     *
+     * Now all wave fractions flow through PATH 2's full folded SVD.
+     * When wave < 1%, the wave singular values are naturally ~0 and get
+     * epsilon-truncated — same result without information loss.
      * ═══════════════════════════════════════════════════════════════════════ */
-
-    if (wave_frac < 0.01) {
-        int cm = TSVD_VESICA_D2 * num_envA;
-        int cn = TSVD_VESICA_D2 * num_envB;
-        int phys_rank = chi < n ? chi : n;
-        if (phys_rank > m) phys_rank = m;
-
-        int v_rank = chi < cn ? chi : cn;
-        if (v_rank > cm) v_rank = cm;
-
-        double *vM_re = (double *)calloc((size_t)cm * cn, sizeof(double));
-        double *vM_im = (double *)calloc((size_t)cm * cn, sizeof(double));
-        for (int r = 0; r < cm; r++)
-            for (int c = 0; c < cn; c++) {
-                vM_re[r*cn + c] = FF_re[r*n + c];
-                vM_im[r*cn + c] = FF_im[r*n + c];
-            }
-
-        double *fU_re = (double *)calloc((size_t)cm * v_rank, sizeof(double));
-        double *fU_im = (double *)calloc((size_t)cm * v_rank, sizeof(double));
-        double *fS    = (double *)calloc(v_rank, sizeof(double));
-        double *fV_re = (double *)calloc((size_t)v_rank * cn, sizeof(double));
-        double *fV_im = (double *)calloc((size_t)v_rank * cn, sizeof(double));
-
-        tsvd_truncated(vM_re, vM_im, cm, cn, v_rank,
-                       fU_re, fU_im, fS, fV_re, fV_im);
-
-        int s_idx = 0;
-        for (int s = 0; s < v_rank; s++) {
-            if (fS[s] < TSVD_EPS * (fS[0] > 0 ? fS[0] : 1.0)) break;
-            sigma[s_idx] = fS[s];
-
-            /* Unfold U: vesica slot p → physical k=a and k=b */
-            for (int eA = 0; eA < num_envA; eA++) {
-                for (int p = 0; p < TSVD_VESICA_D2; p++) {
-                    int a = pairs[p][0], b = pairs[p][1];
-                    int r_v = p * num_envA + eA;
-                    int row_a = a * num_envA + eA;
-                    int row_b = b * num_envA + eA;
-                    double ur = fU_re[r_v*v_rank + s], ui = fU_im[r_v*v_rank + s];
-                    U_re[row_a * phys_rank + s_idx] = TSVD_INV_SQRT2 * ur;
-                    U_im[row_a * phys_rank + s_idx] = TSVD_INV_SQRT2 * ui;
-                    U_re[row_b * phys_rank + s_idx] = TSVD_INV_SQRT2 * ur;
-                    U_im[row_b * phys_rank + s_idx] = TSVD_INV_SQRT2 * ui;
-                }
-            }
-
-            /* Unfold V: vesica slot p → physical k=a and k=b */
-            for (int eB = 0; eB < num_envB; eB++) {
-                for (int p = 0; p < TSVD_VESICA_D2; p++) {
-                    int a = pairs[p][0], b = pairs[p][1];
-                    int c_v = p * num_envB + eB;
-                    int col_a = a * num_envB + eB;
-                    int col_b = b * num_envB + eB;
-                    double vr = fV_re[s*cn + c_v], vi = fV_im[s*cn + c_v];
-                    Vc_re[s_idx * n + col_a] = TSVD_INV_SQRT2 * vr;
-                    Vc_im[s_idx * n + col_a] = TSVD_INV_SQRT2 * vi;
-                    Vc_re[s_idx * n + col_b] = TSVD_INV_SQRT2 * vr;
-                    Vc_im[s_idx * n + col_b] = TSVD_INV_SQRT2 * vi;
-                }
-            }
-            s_idx++;
-        }
-
-        /* Pad remaining sigma with 0 */
-        for (int i = s_idx; i < phys_rank; i++) sigma[i] = 0;
-
-        free(vM_re); free(vM_im);
-        free(fU_re); free(fU_im); free(fS);
-        free(fV_re); free(fV_im);
-
-        /* Post-unfold rank revalidation: the Hadamard spread can inflate
-         * apparent rank. Check actual contribution of each sigma in the
-         * physical (unfolded) basis and zero negligible ones. */
-        if (s_idx > 0) {
-            double ref = 0;
-            for (int r = 0; r < m; r++)
-                ref += U_re[r*phys_rank]*U_re[r*phys_rank]
-                     + U_im[r*phys_rank]*U_im[r*phys_rank];
-            ref = sigma[0] * sqrt(ref > 0 ? ref : 1.0);
-
-            for (int s = 1; s < s_idx; s++) {
-                double col_norm2 = 0;
-                for (int r = 0; r < m; r++)
-                    col_norm2 += U_re[r*phys_rank+s]*U_re[r*phys_rank+s]
-                               + U_im[r*phys_rank+s]*U_im[r*phys_rank+s];
-                double contrib = sigma[s] * sqrt(col_norm2 > 0 ? col_norm2 : 0);
-                if (contrib < TSVD_EPS * ref)
-                    sigma[s] = 0;
-            }
-        }
-
-        free(FF_re); free(FF_im);
-        return;
-    }
 
     /* ═══════════════════════════════════════════════════════════════════════
      * PATH 2: VESICA + miniSVD — Wave present but partially symmetric
@@ -1407,7 +1415,7 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
         double *fV_re  = (double *)calloc((size_t)rank * n, sizeof(double));
         double *fV_im  = (double *)calloc((size_t)rank * n, sizeof(double));
 
-        tsvd_truncated_sparse(FF_re, FF_im, m, n, rank,
+        tsvd_truncated(FF_re, FF_im, m, n, rank,
                               fU_re, fU_im, fS, fV_re, fV_im);
 
         /* Unfold U rows: inverse fold with winning syntheme */
@@ -1452,23 +1460,13 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
         free(fU_re); free(fU_im); free(fS);
         free(fV_re); free(fV_im);
 
-        /* Post-unfold rank revalidation (Path 2) */
-        if (rank > 1) {
-            double ref = 0;
-            for (int r = 0; r < m; r++)
-                ref += U_re[r*rank]*U_re[r*rank] + U_im[r*rank]*U_im[r*rank];
-            ref = sigma[0] * sqrt(ref > 0 ? ref : 1.0);
-
-            for (int s = 1; s < rank; s++) {
-                double col_norm2 = 0;
-                for (int r = 0; r < m; r++)
-                    col_norm2 += U_re[r*rank+s]*U_re[r*rank+s]
-                               + U_im[r*rank+s]*U_im[r*rank+s];
-                double contrib = sigma[s] * sqrt(col_norm2 > 0 ? col_norm2 : 0);
-                if (contrib < TSVD_EPS * ref)
-                    sigma[s] = 0;
-            }
-        }
+        /* LAYER 10: Post-unfold rank revalidation was removed.
+         * The Hadamard unfold distributes energy across paired rows (a↔b),
+         * making the unfolded U column norm a poor proxy for significance.
+         * Wave-dominated singular directions had reduced ||U[:,s]|| after
+         * unfold, causing genuine rank-6 Θ matrices to be truncated to
+         * rank-3 (direct SVD confirmed all 6 σ were significant).
+         * The SVD's own TSVD_EPS cutoff already handles true negligibles. */
     }
 
     free(FF_re); free(FF_im);
