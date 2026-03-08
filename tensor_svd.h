@@ -773,9 +773,9 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
     if (nnz == 1) {
         double mag2 = sp[0].re * sp[0].re + sp[0].im * sp[0].im;
         if (mag2 > TSVD_SAFE_MIN) {
-            double mag = mag2 * born_precise_isqrt(mag2);
+            double mag = sqrt(mag2);
             sigma[0] = mag;
-            double inv = born_precise_recip(mag);
+            double inv = 1.0 / mag;
             U_re[sp[0].row * rank] = sp[0].re * inv;
             U_im[sp[0].row * rank] = sp[0].im * inv;
             Vc_re[sp[0].col] = 1.0;
@@ -1045,7 +1045,7 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
     tsvd_jacobi_hermitian(BBh_re, BBh_im, ell, eig, Ub_re, Ub_im);
 
     for (int i = 0; i < c_rank && i < rank; i++)
-        sigma[i] = (i < ell && eig[i] > 0) ? eig[i] * born_precise_isqrt(eig[i]) : 0;
+        sigma[i] = (i < ell && eig[i] > 0) ? sqrt(eig[i]) : 0;
 
     /* ── Step 6: Reconstruct U and V† with coordinate decompression ──
      * U_compressed = Q × Ub  (mr × c_rank)
@@ -1073,7 +1073,7 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
     /* UPGRADE 4 continued: dead sigma skip */
     for (int j = 0; j < c_rank && j < rank; j++) {
         if (sigma[j] < TSVD_EPS * sigma[0] || sigma[j] < TSVD_SAFE_MIN) break;
-        double inv = born_precise_recip(sigma[j]);
+        double inv = 1.0 / sigma[j];
         for (int i = 0; i < mc; i++) {
             double sr = 0, si = 0;
             for (int k = 0; k < ell; k++) {
@@ -1108,6 +1108,17 @@ static void tsvd_truncated_sparse(const double *M_re, const double *M_im,
                                    double *sigma,
                                    double *Vc_re, double *Vc_im)
 {
+    /* For small matrices, use exact dense Jacobi SVD directly.
+     * The Gram-matrix approach with m<n fix handles these at machine
+     * precision, without the information loss from sparse COO thresholding
+     * and randomized projection. */
+    int mn = m < n ? m : n;
+    if (mn <= 256) {
+        tsvd_truncated(M_re, M_im, m, n, chi,
+                       U_re, U_im, sigma, Vc_re, Vc_im);
+        return;
+    }
+
     /* UPGRADE 5: Frobenius norm pre-check
      * Simulation finding: self-compressed states make many gates no-ops.
      * Skip entire SVD if total energy is negligible. */
@@ -1348,7 +1359,7 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
 {
     /* ── Path 3: BYPASS — D ≠ 6 or invalid env counts ── */
     if (D != TSVD_VESICA_D || num_envA == 0 || num_envB == 0) {
-        tsvd_truncated(M_re, M_im, m, n, chi,
+        tsvd_truncated_sparse(M_re, M_im, m, n, chi,
                               U_re, U_im, sigma, Vc_re, Vc_im);
         return;
     }
@@ -1415,7 +1426,7 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
         double *fV_re  = (double *)calloc((size_t)rank * n, sizeof(double));
         double *fV_im  = (double *)calloc((size_t)rank * n, sizeof(double));
 
-        tsvd_truncated(FF_re, FF_im, m, n, rank,
+        tsvd_truncated_sparse(FF_re, FF_im, m, n, rank,
                               fU_re, fU_im, fS, fV_re, fV_im);
 
         /* Unfold U rows: inverse fold with winning syntheme */
