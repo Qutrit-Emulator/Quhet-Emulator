@@ -7,11 +7,11 @@ If there is no test folder, don't clone this!
 </p>
 
 <p align="center">
-Note: Presently it is fine to clone this, I feel satisfied and will not update it for a bit unless I find serious errors. The previous version lacked a way to measure in tensor, so sorry about that!!
+Note: 3.7 is somewhat heavier than prior released, because now we're keeping 4096 amplitudes instead of 36.. if running the same bench as Willow, it will complete in roughly 15 minutes.
 </p>
 
 
-# HexState Engine v3.6
+# HexState Engine v3.7
 
 **D=6 hexagonal quantum simulator with native S₆ outer automorphism, triality views, and tensor network overlays spanning 1D to 6D.**
 
