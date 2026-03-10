@@ -1558,7 +1558,7 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
                        pairs, FF_re, FF_im);
 
     double wave_frac = best_wave;
-    fprintf(stderr, "VESICA: best_synth=%d wave_frac=%.6f nEA=%d nEB=%d\n", best_synth, wave_frac, num_envA, num_envB);
+    /* omni_sweep debug disabled for performance */
 
     /* ═══════════════════════════════════════════════════════════════════════
      * PATH 1: VESICA DIRECT — Geometric factorization, NO SVD
@@ -1573,6 +1573,136 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
      * When wave < 1%, the wave singular values are naturally ~0 and get
      * epsilon-truncated — same result without information loss.
      * ═══════════════════════════════════════════════════════════════════════ */
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * PATH 1.5: FLAT CUBE DECOMPOSITION
+     *
+     * "A triangle is really 3 cubes which are completely flat."
+     *
+     * When wave_frac < 1%, the folded matrix has nearly all energy in the
+     * vesica block (rows/cols 0..3nE-1). If this block is additionally
+     * BLOCK-DIAGONAL — each pair p ∈ {0,1,2} only couples to itself —
+     * then we can decompose into 3 independent nEA × nEB SVDs.
+     *
+     * Detection: measure cross-pair energy (p≠q) vs diagonal energy (p==q)
+     * in the vesica-vesica sub-block of the folded matrix FF.
+     *
+     * Speedup: 3 SVDs of size (nEA × nEB) instead of 1 SVD of (3nEA × 3nEB).
+     * For nEA = nEB = 1: each "SVD" is |FF[p,p]|, O(1). Total rank = 3.
+     * For nEA = nEB = k: each SVD is k×k. Speedup = 9k²/3k² = 3×.
+     *
+     * Output rank = Σ per_pair_rank ≤ 3 × min(nEA, nEB).
+     * The unfold maps vesica-pair indices back to physical indices.
+     * ═══════════════════════════════════════════════════════════════════════ */
+
+    if (wave_frac < 0.01) {
+        /* Check block-diagonal structure of the vesica-vesica block.
+         * Diagonal blocks: p==q (same pair). Off-diagonal: p≠q (cross-pair). */
+        double diag_E = 0, off_E = 0;
+        for (int pA = 0; pA < 3; pA++)
+            for (int pB = 0; pB < 3; pB++)
+                for (int eA = 0; eA < num_envA; eA++)
+                    for (int eB = 0; eB < num_envB; eB++) {
+                        int r = pA * num_envA + eA;
+                        int c = pB * num_envB + eB;
+                        double e = FF_re[r*n+c]*FF_re[r*n+c] + FF_im[r*n+c]*FF_im[r*n+c];
+                        if (pA == pB) diag_E += e;
+                        else          off_E  += e;
+                    }
+
+        if (diag_E > TSVD_SAFE_MIN && off_E < 1e-20 * diag_E) {
+            /* ── Cubes are independent! Decompose per-pair. ── */
+            int per_rank = num_envA < num_envB ? num_envA : num_envB;
+            int total_rank = 3 * per_rank;
+            if (total_rank > chi) total_rank = chi;
+
+            /* Per-pair SVDs */
+            double *pU_re[3], *pU_im[3], *pS[3], *pVc_re[3], *pVc_im[3];
+            int actual_rank[3];
+
+            for (int p = 0; p < 3; p++) {
+                pU_re[p]  = (double *)calloc((size_t)num_envA * per_rank, sizeof(double));
+                pU_im[p]  = (double *)calloc((size_t)num_envA * per_rank, sizeof(double));
+                pS[p]     = (double *)calloc(per_rank, sizeof(double));
+                pVc_re[p] = (double *)calloc((size_t)per_rank * num_envB, sizeof(double));
+                pVc_im[p] = (double *)calloc((size_t)per_rank * num_envB, sizeof(double));
+
+                /* Extract the (nEA × nEB) block for pair p */
+                double *blk_re = (double *)calloc((size_t)num_envA * num_envB, sizeof(double));
+                double *blk_im = (double *)calloc((size_t)num_envA * num_envB, sizeof(double));
+
+                for (int eA = 0; eA < num_envA; eA++)
+                    for (int eB = 0; eB < num_envB; eB++) {
+                        int r = p * num_envA + eA;
+                        int c = p * num_envB + eB;
+                        blk_re[eA * num_envB + eB] = FF_re[r * n + c];
+                        blk_im[eA * num_envB + eB] = FF_im[r * n + c];
+                    }
+
+                tsvd_truncated(blk_re, blk_im, num_envA, num_envB, per_rank,
+                               pU_re[p], pU_im[p], pS[p], pVc_re[p], pVc_im[p]);
+
+                /* Count actual nonzero singular values */
+                actual_rank[p] = 0;
+                for (int s = 0; s < per_rank; s++)
+                    if (pS[p][s] > TSVD_SAFE_MIN) actual_rank[p]++;
+
+                free(blk_re); free(blk_im);
+            }
+
+            /* ── Merge per-pair results into combined output ──
+             * Combined sigma: interleave pairs [σ₀₀, σ₁₀, σ₂₀, σ₀₁, σ₁₁, σ₂₁, ...]
+             * But simpler: concatenate [pair0 sigmas, pair1 sigmas, pair2 sigmas] */
+            int out_rank = actual_rank[0] + actual_rank[1] + actual_rank[2];
+            if (out_rank > chi) out_rank = chi;
+            if (out_rank < 1) out_rank = 1;
+
+            /* Clear output */
+            memset(sigma, 0, chi * sizeof(double));
+
+            int s_out = 0;
+            for (int p = 0; p < 3 && s_out < out_rank; p++) {
+                int a = pairs[p][0], b = pairs[p][1];
+                for (int s = 0; s < actual_rank[p] && s_out < out_rank; s++, s_out++) {
+                    sigma[s_out] = pS[p][s];
+
+                    /* Unfold U: vesica pair p → physical indices a, b */
+                    for (int eA = 0; eA < num_envA; eA++) {
+                        double v_r = pU_re[p][eA * actual_rank[p] + s];
+                        double v_i = pU_im[p][eA * actual_rank[p] + s];
+                        int row_a = a * num_envA + eA;
+                        int row_b = b * num_envA + eA;
+                        U_re[row_a * out_rank + s_out] = TSVD_INV_SQRT2 * v_r;
+                        U_im[row_a * out_rank + s_out] = TSVD_INV_SQRT2 * v_i;
+                        U_re[row_b * out_rank + s_out] = TSVD_INV_SQRT2 * v_r;
+                        U_im[row_b * out_rank + s_out] = TSVD_INV_SQRT2 * v_i;
+                    }
+
+                    /* Unfold V†: vesica pair p → physical indices a, b */
+                    for (int eB = 0; eB < num_envB; eB++) {
+                        double v_r = pVc_re[p][s * num_envB + eB];
+                        double v_i = pVc_im[p][s * num_envB + eB];
+                        int col_a = a * num_envB + eB;
+                        int col_b = b * num_envB + eB;
+                        Vc_re[s_out * n + col_a] = TSVD_INV_SQRT2 * v_r;
+                        Vc_im[s_out * n + col_a] = TSVD_INV_SQRT2 * v_i;
+                        Vc_re[s_out * n + col_b] = TSVD_INV_SQRT2 * v_r;
+                        Vc_im[s_out * n + col_b] = TSVD_INV_SQRT2 * v_i;
+                    }
+                }
+            }
+
+            /* Cleanup per-pair allocations */
+            for (int p = 0; p < 3; p++) {
+                free(pU_re[p]); free(pU_im[p]); free(pS[p]);
+                free(pVc_re[p]); free(pVc_im[p]);
+            }
+
+            free(FF_re); free(FF_im);
+            return;
+        }
+    }
+
 
     /* ═══════════════════════════════════════════════════════════════════════
      * PATH 2: VESICA + miniSVD — Wave present but partially symmetric
