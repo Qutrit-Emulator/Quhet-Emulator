@@ -1567,17 +1567,26 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
         if (rank > m) rank = m;
 
         /* ── Pre-hoc geometric rank from wave fraction ──
-         * Formula: est = ceil(3 + 6 × wave_frac)
-         *   wave=0.00 → 3 (vesica-only: 3 pairs = 3 singular values)
-         *   wave=0.08 → 4 (slight wave leakage: +1 direction)
-         *   wave=0.25 → 5 (moderate wave: +2 directions)
-         *   wave=0.50 → 6 (equal vesica/wave: full rank)
+         * CIRCLE BISECTION COMPRESSION:
+         * The vesica fold splits D=6 into 3 convergent + 3 divergent.
+         * If wave_frac is low, the state lives mostly in the 3 vesica
+         * channels → effective rank ≈ 3, not 6.
          *
-         * +1 safety buffer to avoid chopping real information.
+         * Formula: est = 3 + ceil(3 × wave_frac²)
+         *   wave=0.00 → 3 (pure vesica: rank-3 compression)
+         *   wave=0.10 → 3 (90% vesica: still rank-3)
+         *   wave=0.25 → 3 (75% vesica: still rank-3, wave is noise)
+         *   wave=0.40 → 4 (60% vesica: 1 wave direction matters)
+         *   wave=0.50 → 4 (50/50: 1 wave direction + buffer)
+         *   wave=0.58+→ 5-6 (wave-dominant: approaching full rank)
+         *
+         * The quadratic squeezes low-wave states hard into rank-3.
          * Post-hoc tsvd_geometric_rank() acts as a final safety net. */
         {
-            int est_rank = (int)(3.0 + 6.0 * wave_frac) + 1;  /* ceil + 1 buffer */
-            if (est_rank < 3) est_rank = 3;                     /* minimum: vesica pairs */
+            double wf2 = wave_frac * wave_frac;   /* quadratic squeeze */
+            int est_rank = 3 + (int)(3.0 * wf2 + 0.5);  /* round */
+            if (est_rank < 3) est_rank = 3;
+            if (est_rank > 6) est_rank = 6;
             if (est_rank < rank) rank = est_rank;
         }
 
