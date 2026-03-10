@@ -162,10 +162,36 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
                 return;
             }
 
-            /* Pattern B disabled: the paired-off-diagonal check with 1e-10
-             * tolerance incorrectly triggers for DFT·CZ-evolved states that
-             * have nearly-uniform structure but rank > 3. The generic Jacobi
-             * sweeps handle all cases correctly. */
+            /* ─── PATTERN B (12.5%): M†M has paired off-diag at (0,3),(1,4),(2,5) ───
+             * Tight tolerance: only fires for exact paired structure, not
+             * approximate matches from DFT·CZ-evolved states. */
+            {
+                double pair_E = 0, other_E = 0;
+                for (int i = 0; i < 6; i++)
+                    for (int j = i + 1; j < 6; j++) {
+                        double e = H_re[i*6+j]*H_re[i*6+j] + H_im[i*6+j]*H_im[i*6+j];
+                        if ((i==0 && j==3) || (i==1 && j==4) || (i==2 && j==5))
+                            pair_E += e;
+                        else
+                            other_E += e;
+                    }
+
+                if (pair_E > TSVD_SAFE_MIN && other_E < 1e-20 * pair_E) {
+                    /* All off-diagonal energy is in the 3 vesica pairs */
+                    double d1 = sqrt(H_re[0*6+3]*H_re[0*6+3] + H_im[0*6+3]*H_im[0*6+3]);
+                    for (int p = 0; p < 3; p++) {
+                        int a = TSVD_PAIR_A[p], b = TSVD_PAIR_B[p];
+                        diag[a] = d0 + d1;   /* symmetric eigenvector */
+                        diag[b] = d0 - d1;   /* antisymmetric eigenvector */
+                        /* V: (|a⟩ + |b⟩)/√2 for eigenvalue d0+d1 */
+                        W_re[a*6+a] = TSVD_INV_SQRT2;
+                        W_re[b*6+a] = TSVD_INV_SQRT2;
+                        W_re[a*6+b] = TSVD_INV_SQRT2;
+                        W_re[b*6+b] = -TSVD_INV_SQRT2;
+                    }
+                    return;
+                }
+            }
         }
     }
 
@@ -1532,7 +1558,7 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
                        pairs, FF_re, FF_im);
 
     double wave_frac = best_wave;
-    /* omni_sweep debug disabled for performance */
+    fprintf(stderr, "VESICA: best_synth=%d wave_frac=%.6f nEA=%d nEB=%d\n", best_synth, wave_frac, num_envA, num_envB);
 
     /* ═══════════════════════════════════════════════════════════════════════
      * PATH 1: VESICA DIRECT — Geometric factorization, NO SVD
@@ -1578,13 +1604,18 @@ static void tsvd_vesica_truncated_sparse(const double *M_re, const double *M_im,
          *   wave=0.25 → 3 (75% vesica: still rank-3, wave is noise)
          *   wave=0.40 → 4 (60% vesica: 1 wave direction matters)
          *   wave=0.50 → 4 (50/50: 1 wave direction + buffer)
-         *   wave=0.58+→ 5-6 (wave-dominant: approaching full rank)
          *
-         * The quadratic squeezes low-wave states hard into rank-3.
-         * Post-hoc tsvd_geometric_rank() acts as a final safety net. */
+         * Linear ceiling: est = 3 + ceil(6 × wave_frac)
+         *   wave=0.00 → 3 (pure vesica: rank-3 compression)
+         *   wave=0.10 → 4 (slight wave: 1 extra direction)
+         *   wave=0.34 → 6 (moderate wave: full rank, honest)
+         *   wave=0.50 → 6 (full rank)
+         *
+         * This is more conservative than the old quadratic squeeze,
+         * preventing rank truncation for genuinely entangled states
+         * like CZ|+⟩|+⟩ which need rank 6. */
         {
-            double wf2 = wave_frac * wave_frac;   /* quadratic squeeze */
-            int est_rank = 3 + (int)(3.0 * wf2 + 0.5);  /* round */
+            int est_rank = 3 + (int)ceil(6.0 * wave_frac);
             if (est_rank < 3) est_rank = 3;
             if (est_rank > 6) est_rank = 6;
             if (est_rank < rank) rank = est_rank;
