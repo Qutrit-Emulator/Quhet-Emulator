@@ -124,13 +124,47 @@ void tns6d_gate_1site(Tns6dGrid *g, int x, int y, int z, int w, int v, int u,
     int reg = g->site_reg[site];
     if (reg < 0) return;
     QuhitRegister *r = &g->eng->registers[reg];
-    uint8_t mask = g->tri_sites ? g->tri_sites[site].active_mask : 0x3F;
+    uint8_t mask = (g->bypass_vesica || !g->tri_sites) ? 0x3F
+                   : g->tri_sites[site].active_mask;
     unsigned __int128 chi_power = (unsigned __int128)TNS6D_C12;
     tri_reg_gate_1site_masked(r, U_re, U_im, mask, chi_power);
 
-    /* Mirror to triality site */
-    if (g->tri_sites)
+    /* Mirror to triality site (skip if bypassed) */
+    if (g->tri_sites && !g->bypass_vesica)
         tri_site_apply_gate(&g->tri_sites[site], U_re, U_im);
+}
+
+/* ═══════════════ PRODUCT STATE ═══════════════ */
+
+void tns6d_set_product_state(Tns6dGrid *g, int x, int y, int z, int w, int v, int u,
+                             const double *amps_re, const double *amps_im)
+{
+    int site = tns6d_flat(g, x, y, z, w, v, u);
+    int reg = g->site_reg[site];
+    if (reg < 0) return;
+    QuhitRegister *r = &g->eng->registers[reg];
+    r->num_nonzero = 0;
+    for (int k = 0; k < TNS6D_D; k++) {
+        double re = amps_re[k], im = amps_im[k];
+        if (re*re + im*im > 1e-30) {
+            r->entries[r->num_nonzero].basis_state = (basis_t)k * TNS6D_C12;
+            r->entries[r->num_nonzero].amp_re = re;
+            r->entries[r->num_nonzero].amp_im = im;
+            r->num_nonzero++;
+        }
+    }
+
+    /* Sync triality overlay site to match new physical state */
+    if (g->tri_sites) {
+        TriOverlaySite *ts = &g->tri_sites[site];
+        triality_ensure_view(&ts->tri, VIEW_EDGE);
+        for (int k = 0; k < TNS6D_D; k++) {
+            ts->tri.edge_re[k] = amps_re[k];
+            ts->tri.edge_im[k] = amps_im[k];
+        }
+        ts->tri.dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED | DIRTY_EXOTIC;
+        tri_site_sync(ts);
+    }
 }
 
 /* ═══════════════ 2-SITE GATE (generic axis) ═══════════════ */
@@ -242,7 +276,10 @@ static void tns6d_gate_2site_generic(Tns6dGrid *g, int sA, int sB,
     double *Vr=(double*)calloc((size_t)chi*sdB,sizeof(double));
     double *Vi=(double*)calloc((size_t)chi*sdB,sizeof(double));
 
-    tsvd_vesica_truncated_sparse(T2r,T2i,sdA,sdB,D,nEA,nEB,chi,Ur,Ui,sig,Vr,Vi);
+    if (g->bypass_vesica)
+        tsvd_truncated_sparse(T2r,T2i,sdA,sdB,chi,Ur,Ui,sig,Vr,Vi);
+    else
+        tsvd_vesica_truncated_sparse(T2r,T2i,sdA,sdB,D,nEA,nEB,chi,Ur,Ui,sig,Vr,Vi);
     free(T2r);free(T2i);
 
     int rank=chi<sdB?chi:sdB; if(rank>sdA) rank=sdA;
