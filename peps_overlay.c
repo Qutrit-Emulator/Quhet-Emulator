@@ -161,19 +161,21 @@ void peps_gate_1site(PepsGrid *grid, int x, int y,
 {
     int site = y * grid->Lx + x;
 
-    /* ── Triality-masked register gate on physical index k ── */
+    /* ── Register gate on physical index k ── */
     if (grid->eng && grid->site_reg) {
         int reg_idx = grid->site_reg[site];
         if (reg_idx >= 0) {
             QuhitRegister *reg = &grid->eng->registers[reg_idx];
-            uint8_t mask = grid->tri_sites ? grid->tri_sites[site].active_mask : 0x3F;
+            /* bypass_vesica → use full mask (triality may be stale after 2-site gates) */
+            uint8_t mask = (grid->bypass_vesica || !grid->tri_sites) ? 0x3F
+                           : grid->tri_sites[site].active_mask;
             unsigned __int128 chi_power = (unsigned __int128)PEPS_CHI4;
             tri_reg_gate_1site_masked(reg, U_re, U_im, mask, chi_power);
         }
     }
 
-    /* Mirror to triality site */
-    if (grid->tri_sites)
+    /* Mirror to triality site (skip if bypassed to avoid desyncing) */
+    if (grid->tri_sites && !grid->bypass_vesica)
         tri_site_apply_gate(&grid->tri_sites[site], U_re, U_im);
 }
 
@@ -491,9 +493,13 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
     double *Vc_re = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
     double *Vc_im = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
 
-    tsvd_vesica_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B,
-                   D, num_EA, num_EB, chi,
-                   U_re, U_im, sig, Vc_re, Vc_im);
+    if (grid->bypass_vesica)
+        tsvd_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B, chi,
+                              U_re, U_im, sig, Vc_re, Vc_im);
+    else
+        tsvd_vesica_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B,
+                       D, num_EA, num_EB, chi,
+                       U_re, U_im, sig, Vc_re, Vc_im);
     free(Th2_re); free(Th2_im);
 
     /* ── 5. Update bond weight ── */
@@ -550,9 +556,9 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
     free(uniq_envA); free(uniq_envB);
 
     /* Mirror to triality sites (replaces engine quhit CZ) */
-    if (grid->tri_sites)
+    if (grid->tri_sites && !grid->bypass_vesica)
         tri_site_apply_cz(&grid->tri_sites[sA], &grid->tri_sites[sB]);
-    else if (grid->eng && grid->q_phys)
+    else if (grid->eng && grid->q_phys && !grid->bypass_vesica)
         quhit_apply_cz(grid->eng, grid->q_phys[sA], grid->q_phys[sB]);
 
     free(wu_A); free(wd_A); free(wl_A);
@@ -755,9 +761,13 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
     double *Vc_re = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
     double *Vc_im = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
 
-    tsvd_vesica_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B,
-                   D, num_EA, num_EB, chi,
-                   U_re, U_im, sig, Vc_re, Vc_im);
+    if (grid->bypass_vesica)
+        tsvd_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B, chi,
+                              U_re, U_im, sig, Vc_re, Vc_im);
+    else
+        tsvd_vesica_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B,
+                       D, num_EA, num_EB, chi,
+                       U_re, U_im, sig, Vc_re, Vc_im);
     free(Th2_re); free(Th2_im);
 
     /* ── 5. Update bond weight ── */
@@ -814,9 +824,9 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
     free(uniq_envA); free(uniq_envB);
 
     /* Mirror to triality sites (replaces engine quhit CZ) */
-    if (grid->tri_sites)
+    if (grid->tri_sites && !grid->bypass_vesica)
         tri_site_apply_cz(&grid->tri_sites[sA], &grid->tri_sites[sB]);
-    else if (grid->eng && grid->q_phys)
+    else if (grid->eng && grid->q_phys && !grid->bypass_vesica)
         quhit_apply_cz(grid->eng, grid->q_phys[sA], grid->q_phys[sB]);
 
     free(wu_A); free(wl_A); free(wr_A);
