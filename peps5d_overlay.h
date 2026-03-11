@@ -62,6 +62,7 @@ typedef struct {
     uint32_t       *q_phys;
     int            *site_reg;
     TriOverlaySite *tri_sites;
+    int bypass_vesica;         /* If set, use standard SVD (no D=6 fold)*/
 } Tns5dGrid;
 
 /* ═══════════════ API ═══════════════ */
