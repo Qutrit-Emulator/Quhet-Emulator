@@ -124,9 +124,22 @@ void peps_set_product_state(PepsGrid *grid, int x, int y,
     /* Write product state: |k,0,0,0,0⟩ for each physical level k */
     for (int k = 0; k < PEPS_D; k++) {
         if (amps_re[k] * amps_re[k] + amps_im[k] * amps_im[k] > 1e-30)
-            quhit_reg_sv_set(grid->eng, reg, (basis_t)k, amps_re[k], amps_im[k]);
+            quhit_reg_sv_set(grid->eng, reg, (basis_t)((uint64_t)k * PEPS_CHI4), amps_re[k], amps_im[k]);
+    }
+
+    /* Sync triality overlay site to match new physical state */
+    if (grid->tri_sites) {
+        TriOverlaySite *ts = &grid->tri_sites[site];
+        triality_ensure_view(&ts->tri, VIEW_EDGE);
+        for (int k = 0; k < PEPS_D; k++) {
+            ts->tri.edge_re[k] = amps_re[k];
+            ts->tri.edge_im[k] = amps_im[k];
+        }
+        ts->tri.dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED | DIRTY_EXOTIC;
+        tri_site_sync(ts);
     }
 }
+
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * 1-SITE GATE — Pure Magic Pointer: O(entries × D)
