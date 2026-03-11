@@ -164,6 +164,18 @@ void tns3d_set_product_state(Tns3dGrid *g, int x, int y, int z,
         if (amps_re[k] * amps_re[k] + amps_im[k] * amps_im[k] > 1e-30)
             quhit_reg_sv_set(g->eng, reg, (basis_t)k * TNS3D_C6, amps_re[k], amps_im[k]);
     }
+
+    /* Sync triality overlay site to match new physical state */
+    if (g->tri_sites) {
+        TriOverlaySite *ts = &g->tri_sites[site];
+        triality_ensure_view(&ts->tri, VIEW_EDGE);
+        for (int k = 0; k < TNS3D_D; k++) {
+            ts->tri.edge_re[k] = amps_re[k];
+            ts->tri.edge_im[k] = amps_im[k];
+        }
+        ts->tri.dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED | DIRTY_EXOTIC;
+        tri_site_sync(ts);
+    }
 }
 
 /* ═══════════════ 1-SITE GATE ═══════════════ */
@@ -187,12 +199,13 @@ void tns3d_gate_1site(Tns3dGrid *g, int x, int y, int z,
     if (reg_idx < 0 || !g->eng) return;
 
     QuhitRegister *r = &g->eng->registers[reg_idx];
-    uint8_t mask = g->tri_sites ? g->tri_sites[site].active_mask : 0x3F;
+    uint8_t mask = (g->bypass_vesica || !g->tri_sites) ? 0x3F
+                   : g->tri_sites[site].active_mask;
     unsigned __int128 chi_power = (unsigned __int128)TNS3D_C6;
     tri_reg_gate_1site_masked(r, U_re, U_im, mask, chi_power);
 
-    /* Mirror to triality site */
-    if (g->tri_sites)
+    /* Mirror to triality site (skip if bypassed) */
+    if (g->tri_sites && !g->bypass_vesica)
         tri_site_apply_gate(&g->tri_sites[site], U_re, U_im);
 }
 
@@ -351,9 +364,13 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
     double *Vc_re = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
     double *Vc_im = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
 
-    tsvd_vesica_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B,
-                   D, num_EA, num_EB, chi,
-                   U_re, U_im, sig, Vc_re, Vc_im);
+    if (g->bypass_vesica)
+        tsvd_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B, chi,
+                              U_re, U_im, sig, Vc_re, Vc_im);
+    else
+        tsvd_vesica_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B,
+                       D, num_EA, num_EB, chi,
+                       U_re, U_im, sig, Vc_re, Vc_im);
     free(Th2_re); free(Th2_im);
 
     int rank = chi < svddim_B ? chi : svddim_B;
