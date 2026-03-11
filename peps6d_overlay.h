@@ -56,10 +56,14 @@ typedef struct {
     uint32_t        *q_phys;
     int             *site_reg;
     TriOverlaySite  *tri_sites;
+    int bypass_vesica;         /* If set, use standard SVD (no D=6 fold)*/
 } Tns6dGrid;
 
 Tns6dGrid *tns6d_init(int Lx, int Ly, int Lz, int Lw, int Lv, int Lu);
 void       tns6d_free(Tns6dGrid *g);
+
+void tns6d_set_product_state(Tns6dGrid *g, int x, int y, int z, int w, int v, int u,
+                             const double *amps_re, const double *amps_im);
 
 void tns6d_gate_1site(Tns6dGrid *g, int x, int y, int z, int w, int v, int u,
                       const double *U_re, const double *U_im);
