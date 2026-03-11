@@ -100,6 +100,18 @@ void mps_set_product_state(MpsChain *c, int site,
         if (amps_re[k] * amps_re[k] + amps_im[k] * amps_im[k] > 1e-30)
             quhit_reg_sv_set(c->eng, reg, (basis_t)k * MPS_C2, amps_re[k], amps_im[k]);
     }
+
+    /* Sync triality overlay site to match new physical state */
+    if (c->tri_sites) {
+        TriOverlaySite *ts = &c->tri_sites[site];
+        triality_ensure_view(&ts->tri, VIEW_EDGE);
+        for (int k = 0; k < MPS_D; k++) {
+            ts->tri.edge_re[k] = amps_re[k];
+            ts->tri.edge_im[k] = amps_im[k];
+        }
+        ts->tri.dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED | DIRTY_EXOTIC;
+        tri_site_sync(ts);
+    }
 }
 
 /* ═══════════════ 1-SITE GATE ═══════════════ */
@@ -111,12 +123,13 @@ void mps_gate_1site(MpsChain *c, int site,
     if (reg_idx < 0 || !c->eng) return;
 
     QuhitRegister *r = &c->eng->registers[reg_idx];
-    uint8_t mask = c->tri_sites ? c->tri_sites[site].active_mask : 0x3F;
+    uint8_t mask = (c->bypass_vesica || !c->tri_sites) ? 0x3F
+                   : c->tri_sites[site].active_mask;
     unsigned __int128 chi_power = (unsigned __int128)MPS_C2;
     tri_reg_gate_1site_masked(r, U_re, U_im, mask, chi_power);
 
-    /* Mirror to triality site */
-    if (c->tri_sites)
+    /* Mirror to triality site (skip if bypassed) */
+    if (c->tri_sites && !c->bypass_vesica)
         tri_site_apply_gate(&c->tri_sites[site], U_re, U_im);
 }
 
@@ -277,9 +290,13 @@ void mps_gate_bond(MpsChain *c, int site,
     double *Vc_re = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
     double *Vc_im = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
 
-    tsvd_vesica_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B,
-                   D, num_EA, num_EB, chi,
-                   U_re, U_im, sig, Vc_re, Vc_im);
+    if (c->bypass_vesica)
+        tsvd_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B, chi,
+                              U_re, U_im, sig, Vc_re, Vc_im);
+    else
+        tsvd_vesica_truncated_sparse(Th2_re, Th2_im, svddim_A, svddim_B,
+                       D, num_EA, num_EB, chi,
+                       U_re, U_im, sig, Vc_re, Vc_im);
 
     free(Th2_re); free(Th2_im);
 
