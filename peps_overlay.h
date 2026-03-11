@@ -68,6 +68,7 @@ typedef struct {
     QuhitEngine *eng;          /* HexState Engine reference             */
     int *site_reg;             /* [Ly * Lx] per-site register indices   */
     TriOverlaySite *tri_sites; /* [Ly * Lx] per-site triality state     */
+    int bypass_vesica;         /* If set, use standard SVD (no D=6 fold)*/
 } PepsGrid;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
