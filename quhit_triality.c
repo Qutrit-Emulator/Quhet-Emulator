@@ -96,12 +96,10 @@ static void dft6_inverse(const double *in_re, const double *in_im,
  * ═══════════════════════════════════════════════════════════════════════ */
 
 void triality_init(TrialityQuhit *q) {
-    memset(q, 0, sizeof(*q));
+    memset(q, 0, sizeof(TrialityQuhit));
     q->edge_re[0] = 1.0;       /* |0⟩ in computational basis */
-    q->vertex_re[0] = 1.0;
-    q->diag_re[0] = 1.0;
 
-    /* Actually compute the correct views of |0⟩ */
+    /* Compute the correct views of |0⟩ via DFT₆ */
     dft6_forward(q->edge_re, q->edge_im, q->vertex_re, q->vertex_im);
     dft6_forward(q->vertex_re, q->vertex_im, q->diag_re, q->diag_im);
 
@@ -113,20 +111,20 @@ void triality_init(TrialityQuhit *q) {
     q->active_mask  = 0x01;   /* only |0⟩ is active */
     q->active_count = 1;
     q->real_valued  = 1;      /* |0⟩ is real */
+    q->delta_valid = 0;       /* Fix #5: exotic cache starts invalid */
     q->exotic_syntheme = 0;   /* default exotic: {(0,1),(2,3),(4,5)} */
 }
 
 void triality_init_basis(TrialityQuhit *q, int k) {
-    memset(q, 0, sizeof(*q));
+    memset(q, 0, sizeof(TrialityQuhit));
     q->edge_re[k] = 1.0;
-    q->primary = VIEW_EDGE;
     q->dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED | DIRTY_EXOTIC;
-
-    /* Enhancement flags */
+    q->primary = VIEW_EDGE;
     q->eigenstate_class = -1;
-    q->active_mask  = (uint8_t)(1 << k);
+    q->active_mask = (uint8_t)(1 << k);
     q->active_count = 1;
-    q->real_valued  = 1;
+    q->real_valued = 1;
+    q->delta_valid = 0;  /* Fix #5 */
     q->exotic_syntheme = 0;
 }
 
@@ -384,6 +382,70 @@ void triality_ensure_view(TrialityQuhit *q, int view) {
         return;
     }
 
+    /* ── Fix #3: Inverse fold path — Vertex→Edge via IDFT₃ + unfold ──
+     * Reverse of the forward fold path. IDFT₆ = fold_inverse(IDFT₃+untwiddle(vertex)).
+     * Cost: O(18) vs O(36) for direct IDFT₆. */
+    if (source == VIEW_VERTEX && view == VIEW_EDGE) {
+        /* Vertex → Folded (inverse of Stages 2-3): IDFT₃ + untwiddle */
+        /* We directly compute the full IDFT₆ but through the combined path:
+         * Since IDFT₆ = fold_inverse ∘ (IDFT₃⊗I₂) ∘ untwiddle,
+         * use the existing fold_inverse for the final step. */
+        static const double w3_re = -0.5;
+        static const double w3_im = 0.86602540378443864676;
+        static const double n3 = 0.57735026918962576451; /* 1/√3 */
+
+        /* Stage 1 (inverse of Stage 3): IDFT₃ ⊗ I₂ per parity */
+        double tw_re[6], tw_im[6];
+        for (int p = 0; p < 2; p++) {
+            double a_re = q->vertex_re[p],     a_im = q->vertex_im[p];
+            double b_re = q->vertex_re[2 + p], b_im = q->vertex_im[2 + p];
+            double c_re = q->vertex_re[4 + p], c_im = q->vertex_im[4 + p];
+
+            /* j=0: (a + b + c) / √3 */
+            tw_re[0 + p*3] = n3 * (a_re + b_re + c_re);
+            tw_im[0 + p*3] = n3 * (a_im + b_im + c_im);
+
+            /* j=1: (a + ω₃⁻¹·b + ω₃⁻²·c) / √3 */
+            double wb_re = w3_re * b_re + w3_im * b_im;  /* ω₃⁻¹ = conj(ω₃) */
+            double wb_im = w3_re * b_im - w3_im * b_re;
+            double wc_re = w3_re * c_re - w3_im * c_im;  /* ω₃⁻² = conj(ω₃²) */
+            double wc_im = w3_re * c_im + w3_im * c_re;
+            tw_re[1 + p*3] = n3 * (a_re + wb_re + wc_re);
+            tw_im[1 + p*3] = n3 * (a_im + wb_im + wc_im);
+
+            /* j=2: (a + ω₃⁻²·b + ω₃⁻¹·c) / √3 */
+            double w2b_re = w3_re * b_re - w3_im * b_im;  /* ω₃⁻² */
+            double w2b_im = w3_re * b_im + w3_im * b_re;
+            double w2c_re = w3_re * c_re + w3_im * c_im;  /* ω₃⁻¹ */
+            double w2c_im = w3_re * c_im - w3_im * c_re;
+            tw_re[2 + p*3] = n3 * (a_re + w2b_re + w2c_re);
+            tw_im[2 + p*3] = n3 * (a_im + w2b_im + w2c_im);
+        }
+
+        /* Stage 2 (inverse twiddle): multiply indices 4,5 by ω₆⁻¹, ω₆⁻² */
+        {
+            double r = tw_re[4], i = tw_im[4];
+            tw_re[4] = W6I_RE[1] * r - W6I_IM[1] * i;  /* ω₆⁻¹ */
+            tw_im[4] = W6I_RE[1] * i + W6I_IM[1] * r;
+        }
+        {
+            double r = tw_re[5], i = tw_im[5];
+            tw_re[5] = W6I_RE[2] * r - W6I_IM[2] * i;  /* ω₆⁻² */
+            tw_im[5] = W6I_RE[2] * i + W6I_IM[2] * r;
+        }
+
+        /* Stage 3: inverse fold → edge */
+        fold_inverse(tw_re, tw_im, q->edge_re, q->edge_im);
+
+        q->dirty &= ~DIRTY_EDGE;
+        /* Also cache the folded intermediate */
+        memcpy(q->folded_re, tw_re, sizeof(tw_re));
+        memcpy(q->folded_im, tw_im, sizeof(tw_im));
+        q->dirty &= ~DIRTY_FOLDED;
+        triality_stats.folded_to_vertex++;  /* Count as fold-path usage */
+        return;
+    }
+
     convert_view(q, source, view);
     q->dirty &= ~view_dirty_bit(view);
 }
@@ -425,6 +487,7 @@ void triality_phase(TrialityQuhit *q, const double *phi_re, const double *phi_im
             triality_stats.gates_edge++;
             q->primary = VIEW_EDGE;
             q->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+            q->delta_valid = 0;  /* Fix #5 */
             return;
         }
     }
@@ -441,12 +504,14 @@ void triality_phase(TrialityQuhit *q, const double *phi_re, const double *phi_im
     q->real_valued = 0;
     q->primary = VIEW_EDGE;
     q->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+    q->delta_valid = 0;  /* Fix #5 */
     triality_stats.gates_edge++;
 }
 
 /* Single-phase: one basis state only — O(1) */
 void triality_phase_single(TrialityQuhit *q, int k, double phi_re, double phi_im) {
     triality_ensure_view(q, VIEW_EDGE);
+    q->delta_valid = 0;  /* Fix #5: always invalidate on gate call */
     if (!(q->active_mask & (1 << k))) {
         triality_stats.mask_skips++;
         return; /* Enhancement 3: skip if this basis state is zero */
@@ -476,6 +541,7 @@ void triality_z(TrialityQuhit *q) {
     q->real_valued = 0;   /* Z introduces complex phases (ω has imaginary part) */
     q->primary = VIEW_EDGE;
     q->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+    q->delta_valid = 0;  /* Fix #5 */
     triality_stats.gates_edge++;
     /* Z preserves eigenstate_class: Z|ψ⟩ scales by ω per component,
      * but if ψ is a DFT₆ eigenstate, Z|ψ⟩ = X|ψ⟩ rotated... clear it. */
@@ -502,6 +568,7 @@ void triality_shift(TrialityQuhit *q, int delta) {
     q->active_mask = 0x3F; q->active_count = 6; /* Edge view now dirty, mask is stale */
     q->primary = VIEW_VERTEX;
     q->dirty |= DIRTY_EDGE | DIRTY_DIAGONAL | DIRTY_FOLDED;
+    q->delta_valid = 0;  /* Fix #5 */
     triality_stats.gates_vertex++;
 }
 
@@ -526,6 +593,7 @@ void triality_dft(TrialityQuhit *q) {
     q->real_valued = 0;  /* DFT introduces complex amplitudes */
     q->eigenstate_class = -1;  /* Clear (might still be eigenstate but need re-detect) */
     q->active_mask = 0x3F; q->active_count = 6; /* DFT spreads to all states */
+    q->delta_valid = 0;  /* Fix #5 */
     triality_stats.gates_edge++;
 }
 
@@ -541,6 +609,7 @@ void triality_idft(TrialityQuhit *q) {
     q->real_valued = 0;
     q->eigenstate_class = -1;
     q->active_mask = 0x3F; q->active_count = 6;
+    q->delta_valid = 0;  /* Fix #5 */
     triality_stats.gates_edge++;
 }
 
@@ -562,9 +631,27 @@ void triality_unitary(TrialityQuhit *q, int view,
     memcpy(v_im, out_im, sizeof(out_im));
     q->primary = view;
     q->dirty = DIRTY_ALL & ~view_dirty_bit(view);
-    q->real_valued = 0;
     q->eigenstate_class = -1;
-    q->active_mask = 0x3F; q->active_count = 6; /* Unitary may spread */
+    q->delta_valid = 0;  /* Fix #5: invalidate exotic cache */
+
+    /* Fix #6: Compute actual active_mask from output instead of conservative 0x3F */
+    uint8_t mask = 0;
+    int count = 0;
+    for (int k = 0; k < TRI_D; k++) {
+        if (out_re[k] * out_re[k] + out_im[k] * out_im[k] > 1e-30) {
+            mask |= (uint8_t)(1 << k);
+            count++;
+        }
+    }
+    q->active_mask = mask;
+    q->active_count = (uint8_t)count;
+
+    /* Fix #6: Detect real-valued from output */
+    int is_real = 1;
+    for (int k = 0; k < TRI_D; k++) {
+        if (fabs(out_im[k]) > 1e-15) { is_real = 0; break; }
+    }
+    q->real_valued = (uint8_t)is_real;
 
     if (view == VIEW_EDGE)     triality_stats.gates_edge++;
     if (view == VIEW_VERTEX)   triality_stats.gates_vertex++;
@@ -584,6 +671,13 @@ void triality_unitary(TrialityQuhit *q, int view,
 void triality_cz(TrialityQuhit *a, TrialityQuhit *b) {
     triality_ensure_view(a, VIEW_EDGE);
     triality_ensure_view(b, VIEW_EDGE);
+
+    /* Fix #4: Refresh active_mask from live edge amplitudes.
+     * The mask may be stale if a prior operation (shift, DFT) changed
+     * the primary view and the mask was set conservatively to 0x3F.
+     * Since we just ensured edge view, recomputing is cheap: O(D). */
+    triality_update_mask(a);
+    triality_update_mask(b);
 
     /* Enhancement 3: skip inactive basis states in the CZ inner loop.
      * This is the biggest win — D_eff × D_eff iterations instead of 36. */
@@ -711,6 +805,7 @@ cz_renorm:
     a->eigenstate_class = -1; b->eigenstate_class = -1;
     a->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
     b->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+    a->delta_valid = 0; b->delta_valid = 0;  /* Fix #5: invalidate exotic cache */
     triality_stats.gates_edge += 2;
 }
 
@@ -781,6 +876,7 @@ int triality_measure(TrialityQuhit *q, int view, uint64_t *rng_state) {
     q->active_count = 1;
     q->real_valued  = (fabs(v_im[outcome]) < 1e-15) ? 1 : 0;
     q->eigenstate_class = -1;
+    q->delta_valid = 0;  /* Fix #5 */
 
     return outcome;
 }
@@ -1729,6 +1825,7 @@ void triality_unfold_syntheme(TrialityQuhit *q, int syntheme_idx) {
     q->real_valued = 0;
     q->eigenstate_class = -1;
     q->active_mask = 0x3F; q->active_count = 6;
+    q->delta_valid = 0;  /* Fix #5 */
     triality_stats.exotic_folds++;
 }
 
@@ -1749,6 +1846,7 @@ void triality_exotic_gate(TrialityQuhit *q, S6Perm sigma) {
     q->real_valued = 0;
     q->eigenstate_class = -1;
     q->active_mask = 0x3F; q->active_count = 6;
+    q->delta_valid = 0;  /* Fix #5 */
     triality_stats.exotic_gates++;
 }
 
@@ -1765,35 +1863,24 @@ double triality_cz_dual(TrialityQuhit *a, TrialityQuhit *b) {
     /* First, do the standard CZ */
     triality_cz(a, b);
 
-    /* Now compute what the exotic CZ WOULD have given */
+    /* Fix #1: Compute the REAL exotic invariant Δ for both sites.
+     * Instead of the old hardcoded exotic_perm approximation,
+     * use s6_exotic_invariant() which sweeps all 720 S₆ permutations
+     * and measures the true distance between standard and exotic channels.
+     * Returns the average Δ of both sites. */
     triality_ensure_view(a, VIEW_EDGE);
     triality_ensure_view(b, VIEW_EDGE);
 
-    /* Standard probabilities after CZ */
-    double std_probs_a[TRI_D], std_probs_b[TRI_D];
-    for (int k = 0; k < TRI_D; k++) {
-        std_probs_a[k] = a->edge_re[k]*a->edge_re[k] + a->edge_im[k]*a->edge_im[k];
-        std_probs_b[k] = b->edge_re[k]*b->edge_re[k] + b->edge_im[k]*b->edge_im[k];
-    }
+    double delta_a = s6_exotic_invariant(a->edge_re, a->edge_im);
+    double delta_b = s6_exotic_invariant(b->edge_re, b->edge_im);
 
-    /* Exotic probabilities: what if we had used φ-twisted CZ?
-     * For the exotic CZ, the phase would be ω^(φ_a(j)·φ_b(k)) instead of ω^(j·k).
-     * We approximate by looking at the exotic-permuted probabilities. */
-    static const int exotic_perm[6] = {1,0,3,2,5,4}; /* φ((01)) */
-    double exo_probs_a[TRI_D], exo_probs_b[TRI_D];
-    for (int k = 0; k < TRI_D; k++) {
-        int ek = exotic_perm[k];
-        exo_probs_a[k] = a->edge_re[ek]*a->edge_re[ek] + a->edge_im[ek]*a->edge_im[ek];
-        exo_probs_b[k] = b->edge_re[ek]*b->edge_re[ek] + b->edge_im[ek]*b->edge_im[ek];
-    }
+    /* Cache the computed invariants */
+    a->cached_delta = delta_a;
+    a->delta_valid = 1;
+    b->cached_delta = delta_b;
+    b->delta_valid = 1;
 
-    /* Statistical distance */
-    double dist = 0;
-    for (int k = 0; k < TRI_D; k++) {
-        dist += fabs(std_probs_a[k] - exo_probs_a[k]);
-        dist += fabs(std_probs_b[k] - exo_probs_b[k]);
-    }
-    return dist / 4.0; /* Normalize: max distance is 1 per quhit */
+    return (delta_a + delta_b) / 2.0;
 }
 
 /* ── Exotic Measurement ──
@@ -1959,4 +2046,81 @@ void triality_dual_probabilities(TrialityQuhit *q, int view,
     }
     if (total > 1e-30)
         for (int k = 0; k < TRI_D; k++) probs_exo[k] /= total;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * FIX #5: CACHED EXOTIC INVARIANT
+ *
+ * The exotic invariant Δ is a pure function of the state vector.
+ * If the state hasn't changed since the last computation, return
+ * the cached value. This avoids the 720-permutation sweep.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+void triality_invalidate_exotic_cache(TrialityQuhit *q) {
+    q->delta_valid = 0;
+}
+
+double triality_exotic_invariant_cached(TrialityQuhit *q) {
+    if (q->delta_valid) return q->cached_delta;
+
+    triality_ensure_view(q, VIEW_EDGE);
+    q->cached_delta = s6_exotic_invariant(q->edge_re, q->edge_im);
+
+    /* Also compute the full fingerprint while we're at it */
+    s6_exotic_fingerprint(q->edge_re, q->edge_im, q->cached_fingerprint);
+
+    q->delta_valid = 1;
+    return q->cached_delta;
+}
+
+void triality_exotic_fingerprint_cached(TrialityQuhit *q, double *deltas) {
+    if (q->delta_valid) {
+        /* Cache is valid — just copy */
+        memcpy(deltas, q->cached_fingerprint, 11 * sizeof(double));
+        return;
+    }
+
+    triality_ensure_view(q, VIEW_EDGE);
+    s6_exotic_fingerprint(q->edge_re, q->edge_im, deltas);
+    q->cached_delta = s6_exotic_invariant(q->edge_re, q->edge_im);
+    memcpy(q->cached_fingerprint, deltas, 11 * sizeof(double));
+    q->delta_valid = 1;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * FIX #7: LAZY QUHIT FORCE MATERIALIZE
+ *
+ * Compiles the accumulated lazy chain into a TrialityQuhit with
+ * edge amplitudes populated and all flags set. Use when a two-body
+ * operation (CZ) needs actual state data from a lazy quhit.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+void ltri_force_materialize(LazyTrialityQuhit *lq, TrialityQuhit *out) {
+    double edge_re[TRI_D], edge_im[TRI_D];
+    ltri_materialize(lq, edge_re, edge_im);
+
+    /* Initialize the output quhit with the materialized edge amplitudes */
+    memset(out, 0, sizeof(TrialityQuhit));
+    memcpy(out->edge_re, edge_re, sizeof(edge_re));
+    memcpy(out->edge_im, edge_im, sizeof(edge_im));
+    out->primary = VIEW_EDGE;
+    out->dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED | DIRTY_EXOTIC;
+    out->eigenstate_class = -1;
+    out->delta_valid = 0;
+
+    /* Compute actual enhancement flags from the materialized state */
+    uint8_t mask = 0;
+    int count = 0;
+    int is_real = 1;
+    for (int k = 0; k < TRI_D; k++) {
+        double mag2 = edge_re[k] * edge_re[k] + edge_im[k] * edge_im[k];
+        if (mag2 > 1e-30) {
+            mask |= (uint8_t)(1 << k);
+            count++;
+        }
+        if (fabs(edge_im[k]) > 1e-15) is_real = 0;
+    }
+    out->active_mask = mask;
+    out->active_count = (uint8_t)count;
+    out->real_valued = (uint8_t)is_real;
 }
