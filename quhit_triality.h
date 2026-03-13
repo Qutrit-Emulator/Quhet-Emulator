@@ -65,6 +65,11 @@ typedef struct {
     uint8_t active_mask;       /* Bitmask of non-zero basis states (6 bits) */
     uint8_t active_count;      /* popcount(active_mask), 1..6 */
     uint8_t real_valued;       /* 1 if all imaginary parts are zero */
+
+    /* ── Exotic invariant cache (Fix #5) ── */
+    double  cached_delta;          /* Cached exotic invariant Δ */
+    double  cached_fingerprint[11];/* Cached conjugacy-class deltas */
+    uint8_t delta_valid;           /* 1 if cached values are up-to-date */
 } TrialityQuhit;
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -220,6 +225,13 @@ void triality_unfold(TrialityQuhit *q);
 /* Convert Edge↔Vertex via the folded intermediate (O(18) vs O(36)) */
 void triality_ensure_view_via_fold(TrialityQuhit *q, int target_view);
 
+/* Cached exotic invariant — returns Δ without recomputing if state is unchanged */
+double triality_exotic_invariant_cached(TrialityQuhit *q);
+void   triality_exotic_fingerprint_cached(TrialityQuhit *q, double *deltas);
+
+/* Invalidate exotic cache (called internally after state-modifying operations) */
+void triality_invalidate_exotic_cache(TrialityQuhit *q);
+
 /* ── Enhancement 2: Eigenstate Detection ── */
 /* Detect if state is a DFT₆ eigenstate. Sets eigenstate_class.
  * Returns eigenstate_class (0..3) or -1 if not an eigenstate. */
@@ -329,6 +341,10 @@ void ltri_phase(LazyTrialityQuhit *q, const double *phi_re, const double *phi_im
 
 /* Materialize — apply accumulated transform, return edge-view amplitudes */
 void ltri_materialize(LazyTrialityQuhit *q, double *out_re, double *out_im);
+
+/* Force materialize — compile oracle + apply chain, producing a TrialityQuhit.
+ * Use this when a two-body operation (CZ) needs actual amplitudes. */
+void ltri_force_materialize(LazyTrialityQuhit *q, TrialityQuhit *out);
 
 /* Measure — materialize + Born sample */
 int ltri_measure(LazyTrialityQuhit *q, int view, uint64_t *rng_state);
