@@ -112,6 +112,21 @@ typedef struct {
 } HPCGateEntry;
 
 /* ═══════════════════════════════════════════════════════════════════════
+ * PER-SITE ADJACENCY LIST — O(degree) edge lookup
+ *
+ * Each site maintains a list of edge indices that touch it.
+ * This is the optimization that turns O(N×E) → O(N×degree) = O(N).
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+#define HPC_ADJ_INIT 16  /* Initial adjacency list capacity per site */
+
+typedef struct {
+    uint64_t *edge_ids;  /* Indices into the graph's edge array         */
+    uint64_t  count;     /* Number of edges touching this site          */
+    uint64_t  capacity;  /* Allocated capacity                          */
+} HPCAdjList;
+
+/* ═══════════════════════════════════════════════════════════════════════
  * HPC GRAPH — The Devil's state representation
  *
  * This struct IS the state. The 6^N state vector does not exist.
@@ -127,6 +142,9 @@ typedef struct {
     uint64_t        n_edges;
     uint64_t        edge_cap;
     HPCEdge        *edges;          /* Weighted phase edge list          */
+
+    /* ── Adjacency Lists ── O(1) per-site edge lookup */
+    HPCAdjList     *adj;            /* Per-site adjacency lists          */
 
     /* ── Gate Log ── */
     uint64_t        n_log;
@@ -164,6 +182,14 @@ static inline HPCGraph *hpc_create(uint64_t n_sites)
     g->edges = (HPCEdge *)calloc(g->edge_cap, sizeof(HPCEdge));
     g->n_edges = 0;
 
+    /* Initialize per-site adjacency lists */
+    g->adj = (HPCAdjList *)calloc(n_sites, sizeof(HPCAdjList));
+    for (uint64_t i = 0; i < n_sites; i++) {
+        g->adj[i].capacity = HPC_ADJ_INIT;
+        g->adj[i].edge_ids = (uint64_t *)calloc(HPC_ADJ_INIT, sizeof(uint64_t));
+        g->adj[i].count = 0;
+    }
+
     g->log_cap = HPC_INIT_LOG;
     g->gate_log = (HPCGateEntry *)calloc(g->log_cap, sizeof(HPCGateEntry));
     g->n_log = 0;
@@ -177,6 +203,11 @@ static inline HPCGraph *hpc_create(uint64_t n_sites)
 static inline void hpc_destroy(HPCGraph *g)
 {
     if (!g) return;
+    if (g->adj) {
+        for (uint64_t i = 0; i < g->n_sites; i++)
+            free(g->adj[i].edge_ids);
+        free(g->adj);
+    }
     free(g->locals);
     free(g->edges);
     free(g->gate_log);
@@ -192,6 +223,45 @@ static inline void hpc_grow_edges(HPCGraph *g)
     if (g->n_edges < g->edge_cap) return;
     g->edge_cap *= 2;
     g->edges = (HPCEdge *)realloc(g->edges, g->edge_cap * sizeof(HPCEdge));
+}
+
+static inline void hpc_grow_adj(HPCAdjList *a)
+{
+    if (a->count < a->capacity) return;
+    a->capacity *= 2;
+    a->edge_ids = (uint64_t *)realloc(a->edge_ids,
+                                       a->capacity * sizeof(uint64_t));
+}
+
+static inline void hpc_adj_add(HPCGraph *g, uint64_t site, uint64_t edge_id)
+{
+    HPCAdjList *a = &g->adj[site];
+    hpc_grow_adj(a);
+    a->edge_ids[a->count++] = edge_id;
+}
+
+static inline void hpc_adj_remove(HPCGraph *g, uint64_t site, uint64_t edge_id)
+{
+    HPCAdjList *a = &g->adj[site];
+    for (uint64_t i = 0; i < a->count; i++) {
+        if (a->edge_ids[i] == edge_id) {
+            a->edge_ids[i] = a->edge_ids[--a->count];
+            return;
+        }
+    }
+}
+
+/* Replace one edge ID with another in a site's adjacency list */
+static inline void hpc_adj_replace(HPCGraph *g, uint64_t site,
+                                    uint64_t old_id, uint64_t new_id)
+{
+    HPCAdjList *a = &g->adj[site];
+    for (uint64_t i = 0; i < a->count; i++) {
+        if (a->edge_ids[i] == old_id) {
+            a->edge_ids[i] = new_id;
+            return;
+        }
+    }
 }
 
 static inline void hpc_grow_log(HPCGraph *g)
@@ -292,7 +362,8 @@ static inline void hpc_cz(HPCGraph *g, uint64_t site_a, uint64_t site_b)
 {
     hpc_grow_edges(g);
 
-    HPCEdge *e = &g->edges[g->n_edges];
+    uint64_t eid = g->n_edges;
+    HPCEdge *e = &g->edges[eid];
     memset(e, 0, sizeof(HPCEdge));
     e->type = HPC_EDGE_CZ;
     e->site_a = site_a;
@@ -302,6 +373,10 @@ static inline void hpc_cz(HPCGraph *g, uint64_t site_a, uint64_t site_b)
 
     g->n_edges++;
     g->cz_edges++;
+
+    /* Maintain adjacency lists */
+    hpc_adj_add(g, site_a, eid);
+    hpc_adj_add(g, site_b, eid);
 
     HPCGateEntry entry = {
         .type = HPC_GATE_CZ,
@@ -339,7 +414,8 @@ static inline void hpc_general_2site(HPCGraph *g, uint64_t site_a,
 
     hpc_grow_edges(g);
 
-    HPCEdge *e = &g->edges[g->n_edges];
+    uint64_t eid = g->n_edges;
+    HPCEdge *e = &g->edges[eid];
     memset(e, 0, sizeof(HPCEdge));
     e->type = HPC_EDGE_PHASE;
     e->site_a = site_a;
@@ -367,8 +443,6 @@ static inline void hpc_general_2site(HPCGraph *g, uint64_t site_a,
 
             if (mag > max_mag) max_mag = mag;
 
-            /* Fidelity contribution: how much of the row's norm
-             * is captured by the diagonal entry */
             double row_norm2 = 0.0;
             for (int m = 0; m < HPC_D; m++) {
                 for (int n = 0; n < HPC_D; n++) {
@@ -387,6 +461,11 @@ static inline void hpc_general_2site(HPCGraph *g, uint64_t site_a,
 
     g->n_edges++;
     g->phase_edges++;
+
+    /* Maintain adjacency lists */
+    hpc_adj_add(g, site_a, eid);
+    hpc_adj_add(g, site_b, eid);
+
     hpc_update_fidelity_stats(g);
 
     HPCGateEntry entry = {
@@ -473,36 +552,75 @@ static inline double hpc_probability(const HPCGraph *g,
 /* ═══════════════════════════════════════════════════════════════════════
  * MARGINAL PROBABILITY — P(site_k = v)
  *
- * Sums |ψ(..., i_k=v, ...)|² over connected partner configurations.
- * Smart: only enumerates sites connected by edges to site k.
+ * Uses per-site adjacency lists for O(degree) edge lookup.
+ * Only enumerates sites connected by edges to site k.
  * Disconnected sites contribute 1.0 (they're normalized independently).
+ *
+ * OPTIMIZED: O(degree) edge lookup via adjacency list.
+ * Old version: O(E) scan → O(N×E) = O(N²) total.
+ * New version: O(degree) lookup → O(N×degree) = O(N) for bounded-degree lattices.
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static inline double hpc_marginal(const HPCGraph *g,
                                    uint64_t site, uint32_t value)
 {
-    /* Find connected sites */
-    uint64_t connected[128];
-    uint64_t n_connected = 0;
-
-    for (uint64_t e = 0; e < g->n_edges; e++) {
-        uint64_t sa = g->edges[e].site_a;
-        uint64_t sb = g->edges[e].site_b;
-        if (sa == site || sb == site) {
-            uint64_t partner = (sa == site) ? sb : sa;
-            int found = 0;
-            for (uint64_t c = 0; c < n_connected; c++)
-                if (connected[c] == partner) { found = 1; break; }
-            if (!found && n_connected < 128)
-                connected[n_connected++] = partner;
-        }
-    }
+    const HPCAdjList *adj = &g->adj[site];
 
     /* Product state: no edges touching this site */
-    if (n_connected == 0) {
+    if (adj->count == 0) {
         const TrialityQuhit *q = &g->locals[site];
         return q->edge_re[value] * q->edge_re[value] +
                q->edge_im[value] * q->edge_im[value];
+    }
+
+    /* Find unique connected sites via adjacency list — O(degree) */
+    uint64_t connected[128];
+    uint64_t conn_edge_ids[512];  /* Edge IDs in connected subsystem */
+    uint64_t n_connected = 0;
+    uint64_t n_conn_edges = 0;
+
+    for (uint64_t i = 0; i < adj->count; i++) {
+        uint64_t eid = adj->edge_ids[i];
+        const HPCEdge *edge = &g->edges[eid];
+        uint64_t partner = (edge->site_a == site) ? edge->site_b : edge->site_a;
+
+        /* Add edge to subsystem edge list */
+        if (n_conn_edges < 512)
+            conn_edge_ids[n_conn_edges++] = eid;
+
+        /* Add partner to connected list (dedup) */
+        int found = 0;
+        for (uint64_t c = 0; c < n_connected; c++)
+            if (connected[c] == partner) { found = 1; break; }
+        if (!found && n_connected < 128)
+            connected[n_connected++] = partner;
+    }
+
+    /* Also find edges between connected partners (not touching site)
+     * by scanning adjacency lists of connected sites — O(degree²) */
+    for (uint64_t c = 0; c < n_connected; c++) {
+        const HPCAdjList *padj = &g->adj[connected[c]];
+        for (uint64_t i = 0; i < padj->count; i++) {
+            uint64_t eid = padj->edge_ids[i];
+            const HPCEdge *edge = &g->edges[eid];
+            uint64_t sa = edge->site_a, sb = edge->site_b;
+            if (sa == site || sb == site) continue;  /* Already counted */
+
+            /* Check if both ends are in connected set */
+            int a_in = 0, b_in = 0;
+            for (uint64_t c2 = 0; c2 < n_connected; c2++) {
+                if (connected[c2] == sa) a_in = 1;
+                if (connected[c2] == sb) b_in = 1;
+            }
+            if (a_in && b_in) {
+                /* Dedup edge */
+                int dup = 0;
+                for (uint64_t e2 = 0; e2 < n_conn_edges; e2++)
+                    if (conn_edge_ids[e2] == eid) { dup = 1; break; }
+                if (!dup && n_conn_edges < 512)
+                    conn_edge_ids[n_conn_edges++] = eid;
+            }
+        }
     }
 
     /* Entangled: enumerate D^n_connected configurations */
@@ -533,41 +651,38 @@ static inline double hpc_marginal(const HPCGraph *g,
             amp_im = new_im;
         }
 
-        /* Phase contributions from all edges in the connected subsystem */
-        for (uint64_t e = 0; e < g->n_edges; e++) {
-            uint64_t sa = g->edges[e].site_a;
-            uint64_t sb = g->edges[e].site_b;
+        /* Phase contributions from edges in the connected subsystem only */
+        for (uint64_t ei = 0; ei < n_conn_edges; ei++) {
+            const HPCEdge *edge = &g->edges[conn_edge_ids[ei]];
+            uint64_t sa = edge->site_a;
+            uint64_t sb = edge->site_b;
 
             uint32_t va = 0, vb = 0;
-            int involves_subsystem = 0;
 
+            /* Resolve values for both endpoints */
             if (sa == site) {
                 va = value;
                 for (uint64_t c = 0; c < n_connected; c++)
-                    if (connected[c] == sb) { vb = partner_vals[c]; involves_subsystem = 1; break; }
-                if (!involves_subsystem) continue;
+                    if (connected[c] == sb) { vb = partner_vals[c]; break; }
             } else if (sb == site) {
                 vb = value;
                 for (uint64_t c = 0; c < n_connected; c++)
-                    if (connected[c] == sa) { va = partner_vals[c]; involves_subsystem = 1; break; }
-                if (!involves_subsystem) continue;
+                    if (connected[c] == sa) { va = partner_vals[c]; break; }
             } else {
-                int found_a = 0, found_b = 0;
                 for (uint64_t c = 0; c < n_connected; c++) {
-                    if (connected[c] == sa) { va = partner_vals[c]; found_a = 1; }
-                    if (connected[c] == sb) { vb = partner_vals[c]; found_b = 1; }
+                    if (connected[c] == sa) va = partner_vals[c];
+                    if (connected[c] == sb) vb = partner_vals[c];
                 }
-                if (!found_a || !found_b) continue;
             }
 
             double w_re, w_im;
-            if (g->edges[e].type == HPC_EDGE_CZ) {
+            if (edge->type == HPC_EDGE_CZ) {
                 uint32_t phase_idx = (va * vb) % HPC_D;
                 w_re = HPC_W6_RE[phase_idx];
                 w_im = HPC_W6_IM[phase_idx];
             } else {
-                w_re = g->edges[e].w_re[va][vb];
-                w_im = g->edges[e].w_im[va][vb];
+                w_re = edge->w_re[va][vb];
+                w_im = edge->w_im[va][vb];
             }
 
             double new_re = amp_re * w_re - amp_im * w_im;
@@ -583,10 +698,103 @@ static inline double hpc_marginal(const HPCGraph *g,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ * EDGE COMPACTION — Merge parallel CZ edges
+ *
+ * Multiple CZ edges between the same pair of sites can be merged:
+ *   CZ × CZ = CZ with phase ω^(2·a·b) → equivalent to CZ^2
+ *   n CZ edges → one edge with accumulated phase ω^(n·a·b)
+ *
+ * For n ≡ 0 mod 6: the edge cancels (ω^6 = 1) → remove entirely.
+ * For n ≡ 1 mod 6: standard CZ.
+ * For n ≡ 3 mod 6: anti-CZ (ω³ = -1).
+ *
+ * This preserves perfect phase coherence at any lattice scale.
+ * Without compaction, d-wave pairing bleeds out as parallel edges
+ * fragment the phase structure.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static inline void hpc_compact_edges(HPCGraph *g)
+{
+    /* Count CZ edges between each pair, merge into accumulated phase.
+     * For bounded-degree lattices, this is O(E × degree) ≈ O(E). */
+
+    for (uint64_t e = 0; e < g->n_edges; ) {
+        HPCEdge *edge = &g->edges[e];
+        if (edge->type != HPC_EDGE_CZ) { e++; continue; }
+
+        uint64_t sa = edge->site_a, sb = edge->site_b;
+
+        /* Count and remove duplicate CZ edges for this pair */
+        int cz_count = 1;  /* This edge counts as 1 */
+        for (uint64_t e2 = e + 1; e2 < g->n_edges; ) {
+            HPCEdge *other = &g->edges[e2];
+            if (other->type == HPC_EDGE_CZ &&
+                ((other->site_a == sa && other->site_b == sb) ||
+                 (other->site_a == sb && other->site_b == sa))) {
+                cz_count++;
+
+                /* Remove adjacency entries for the duplicate */
+                hpc_adj_remove(g, other->site_a, e2);
+                hpc_adj_remove(g, other->site_b, e2);
+
+                /* Swap-remove the duplicate edge */
+                uint64_t last = g->n_edges - 1;
+                if (e2 != last) {
+                    /* Update adjacency for the edge being swapped in */
+                    hpc_adj_replace(g, g->edges[last].site_a, last, e2);
+                    hpc_adj_replace(g, g->edges[last].site_b, last, e2);
+                    g->edges[e2] = g->edges[last];
+                }
+                g->n_edges--;
+                g->cz_edges--;
+            } else {
+                e2++;
+            }
+        }
+
+        /* Reduce cz_count mod 6 */
+        int reduced = cz_count % 6;
+
+        if (reduced == 0) {
+            /* Complete cancellation: ω^(6k) = 1 → remove edge entirely */
+            hpc_adj_remove(g, sa, e);
+            hpc_adj_remove(g, sb, e);
+
+            uint64_t last = g->n_edges - 1;
+            if (e != last) {
+                hpc_adj_replace(g, g->edges[last].site_a, last, e);
+                hpc_adj_replace(g, g->edges[last].site_b, last, e);
+                g->edges[e] = g->edges[last];
+            }
+            g->n_edges--;
+            g->cz_edges--;
+        } else if (reduced == 1) {
+            /* Standard CZ — already correct, just advance */
+            e++;
+        } else {
+            /* Convert to general phase edge with accumulated phase:
+             * w(a,b) = ω^(reduced · a · b) */
+            edge->type = HPC_EDGE_PHASE;
+            edge->fidelity = 1.0;  /* Still exact */
+            for (int a = 0; a < HPC_D; a++) {
+                for (int b = 0; b < HPC_D; b++) {
+                    uint32_t phase_idx = (uint32_t)(reduced * a * b) % HPC_D;
+                    edge->w_re[a][b] = HPC_W6_RE[phase_idx];
+                    edge->w_im[a][b] = HPC_W6_IM[phase_idx];
+                }
+            }
+            g->cz_edges--;
+            g->phase_edges++;
+            e++;
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  * BORN SAMPLING — Collapse site k
  *
- * Computes marginal probabilities, samples an outcome,
- * absorbs CZ phases into partners, removes resolved edges.
+ * Uses adjacency lists for O(degree) edge identification.
+ * Absorbs CZ phases into partners, removes resolved edges.
  * This IS measurement-induced disentanglement.
  * ═══════════════════════════════════════════════════════════════════════ */
 
@@ -622,46 +830,71 @@ static inline uint32_t hpc_measure(HPCGraph *g, uint64_t site,
     g->locals[site].delta_valid = 0;
     triality_update_mask(&g->locals[site]);
 
-    /* Absorb edge phases into partners and remove resolved edges */
-    for (uint64_t e = 0; e < g->n_edges; ) {
-        HPCEdge *edge = &g->edges[e];
-        if (edge->site_a == site || edge->site_b == site) {
-            uint64_t partner = (edge->site_a == site) ?
-                                edge->site_b : edge->site_a;
-            TrialityQuhit *p = &g->locals[partner];
+    /* Collect edge IDs touching this site from adjacency list — O(degree) */
+    uint64_t edges_to_remove[512];
+    uint64_t n_remove = 0;
+    const HPCAdjList *adj = &g->adj[site];
+    for (uint64_t i = 0; i < adj->count && n_remove < 512; i++)
+        edges_to_remove[n_remove++] = adj->edge_ids[i];
 
-            /* Absorb the phase: partner[k] *= w(outcome, k) or w(k, outcome) */
-            for (int k = 0; k < HPC_D; k++) {
-                double w_re, w_im;
-                if (edge->type == HPC_EDGE_CZ) {
-                    uint32_t phase_idx = (outcome * k) % HPC_D;
-                    w_re = HPC_W6_RE[phase_idx];
-                    w_im = HPC_W6_IM[phase_idx];
-                } else if (edge->site_a == site) {
-                    w_re = edge->w_re[outcome][k];
-                    w_im = edge->w_im[outcome][k];
-                } else {
-                    w_re = edge->w_re[k][outcome];
-                    w_im = edge->w_im[k][outcome];
-                }
+    /* Absorb phases and remove edges */
+    for (uint64_t r = 0; r < n_remove; r++) {
+        uint64_t eid = edges_to_remove[r];
+        if (eid >= g->n_edges) continue;  /* Already removed by swap */
 
-                double old_re = p->edge_re[k], old_im = p->edge_im[k];
-                p->edge_re[k] = old_re * w_re - old_im * w_im;
-                p->edge_im[k] = old_re * w_im + old_im * w_re;
+        HPCEdge *edge = &g->edges[eid];
+        /* Verify this edge still touches our site (may have been swapped) */
+        if (edge->site_a != site && edge->site_b != site) continue;
+
+        uint64_t partner = (edge->site_a == site) ?
+                            edge->site_b : edge->site_a;
+        TrialityQuhit *p = &g->locals[partner];
+
+        /* Absorb the phase: partner[k] *= w(outcome, k) or w(k, outcome) */
+        for (int k = 0; k < HPC_D; k++) {
+            double w_re, w_im;
+            if (edge->type == HPC_EDGE_CZ) {
+                uint32_t phase_idx = (outcome * k) % HPC_D;
+                w_re = HPC_W6_RE[phase_idx];
+                w_im = HPC_W6_IM[phase_idx];
+            } else if (edge->site_a == site) {
+                w_re = edge->w_re[outcome][k];
+                w_im = edge->w_im[outcome][k];
+            } else {
+                w_re = edge->w_re[k][outcome];
+                w_im = edge->w_im[k][outcome];
             }
-            p->dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
-            p->delta_valid = 0;
 
-            /* Track edge type removal */
-            if (edge->type == HPC_EDGE_CZ) g->cz_edges--;
-            else if (edge->type == HPC_EDGE_PHASE) g->phase_edges--;
-            else g->syntheme_edges--;
-
-            /* Swap-remove */
-            g->edges[e] = g->edges[--g->n_edges];
-        } else {
-            e++;
+            double old_re = p->edge_re[k], old_im = p->edge_im[k];
+            p->edge_re[k] = old_re * w_re - old_im * w_im;
+            p->edge_im[k] = old_re * w_im + old_im * w_re;
         }
+        p->dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+        p->delta_valid = 0;
+
+        /* Track edge type removal */
+        if (edge->type == HPC_EDGE_CZ) g->cz_edges--;
+        else if (edge->type == HPC_EDGE_PHASE) g->phase_edges--;
+        else g->syntheme_edges--;
+
+        /* Remove from adjacency lists */
+        hpc_adj_remove(g, site, eid);
+        hpc_adj_remove(g, partner, eid);
+
+        /* Swap-remove the edge */
+        uint64_t last = g->n_edges - 1;
+        if (eid != last) {
+            /* Update adjacency for the swapped-in edge */
+            hpc_adj_replace(g, g->edges[last].site_a, last, eid);
+            hpc_adj_replace(g, g->edges[last].site_b, last, eid);
+            g->edges[eid] = g->edges[last];
+
+            /* Update remaining removal targets that pointed to 'last' */
+            for (uint64_t r2 = r + 1; r2 < n_remove; r2++)
+                if (edges_to_remove[r2] == last)
+                    edges_to_remove[r2] = eid;
+        }
+        g->n_edges--;
     }
 
     g->measurements++;
