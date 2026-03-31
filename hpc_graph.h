@@ -623,17 +623,38 @@ static inline double hpc_marginal(const HPCGraph *g,
         }
     }
 
-    /* Entangled: enumerate D^n_connected configurations */
-    double total_prob = 0.0;
-    uint64_t n_configs = 1;
-    for (uint64_t c = 0; c < n_connected; c++) n_configs *= HPC_D;
+    /* ═══ Component 4: Δ-Gated Fast Path ═══
+     * Instead of enumerating all D^n_connected configurations,
+     * only enumerate basis states that have nonzero amplitude
+     * (tracked by active_mask). For states confined to k of 6
+     * basis states, this reduces from 6^n to k^n configs.
+     *
+     * From the Faustian Pact: Δ≈0 states use fewer basis states,
+     * making this optimization most effective when it matters most. */
 
+    /* Build per-partner active state lists */
+    uint32_t partner_active[128][6];
+    uint32_t partner_active_count[128];
+    uint64_t n_configs = 1;
+
+    for (uint64_t c = 0; c < n_connected; c++) {
+        const TrialityQuhit *q_c = &g->locals[connected[c]];
+        uint8_t mask = q_c->active_mask ? q_c->active_mask : 0x3F;
+        int cnt = 0;
+        for (int k = 0; k < HPC_D; k++)
+            if (mask & (1 << k)) partner_active[c][cnt++] = k;
+        partner_active_count[c] = cnt;
+        n_configs *= cnt;
+    }
+
+    double total_prob = 0.0;
     for (uint64_t cfg = 0; cfg < n_configs; cfg++) {
         uint32_t partner_vals[128];
         uint64_t tmp = cfg;
         for (uint64_t c = 0; c < n_connected; c++) {
-            partner_vals[c] = tmp % HPC_D;
-            tmp /= HPC_D;
+            uint32_t idx_in_active = tmp % partner_active_count[c];
+            partner_vals[c] = partner_active[c][idx_in_active];
+            tmp /= partner_active_count[c];
         }
 
         /* Compute amplitude for this configuration */
