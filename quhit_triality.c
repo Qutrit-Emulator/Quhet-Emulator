@@ -1104,6 +1104,15 @@ void triality_refresh_flags(TrialityQuhit *q) {
     triality_update_mask(q);
     triality_detect_real(q);
     triality_detect_eigenstate(q);
+
+    /* Component 3: Auto-select the minimum-entropy syntheme for the exotic view.
+     * This ensures the exotic view always shows the most concentrated form.
+     * From the Scrying Mirror: entropy varies 1.775–1.927 across synthemes. */
+    int optimal = s6_min_entropy_syntheme(q->edge_re, q->edge_im);
+    if (optimal != q->exotic_syntheme) {
+        q->exotic_syntheme = optimal;
+        q->dirty |= DIRTY_EXOTIC;  /* Exotic view needs recompute */
+    }
 }
 
 void triality_stats_print(void) {
