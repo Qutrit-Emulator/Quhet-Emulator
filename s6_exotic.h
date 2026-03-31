@@ -105,4 +105,45 @@ double s6_exotic_entropy(const double *re, const double *im,
 void s6_exotic_fingerprint(const double *re, const double *im,
                            double *class_deltas);
 
+/* ══ Adaptive Measurement Basis Selection ══
+ * Returns the syntheme index (0-14) that minimizes expected
+ * information destruction for the given state, or -1 if
+ * standard-basis measurement is optimal.
+ *
+ * Based on Faustian Pact experiment: low-Δ states benefit from
+ * exotic measurement, high-Δ states are devastated by it.
+ * Cost: O(15 × D²). */
+int s6_optimal_measure_basis(const double *re, const double *im);
+
+/* ══ Cross-Syntheme Entanglement Witness ══
+ * Cheap approximation of the exotic invariant Δ.
+ * Folds through 3 strategically chosen synthemes (S0, S7, S14)
+ * and returns the average pairwise statistical distance scaled
+ * to approximate Δ.
+ *
+ * Cost: O(90) — 48× cheaper than full Δ computation.
+ * Accuracy: r > 0.9 correlation with true Δ. */
+double s6_cross_syntheme_witness(const double *re, const double *im);
+
+/* ══ Minimum-Entropy Syntheme ══
+ * Returns the syntheme index whose fold basis concentrates
+ * the state's probability into the fewest components.
+ * Cost: O(15 × D). */
+int s6_min_entropy_syntheme(const double *re, const double *im);
+
+/* ══ Synthematic Total Tomography ══
+ * Reconstructs a D=6 state vector from its projections through
+ * the 5 synthemes of one synthematic total.
+ *
+ * Input: fold_data[5][6] — for each of the 5 synthemes in
+ *        total total_idx, the 6 complex fold components.
+ * Output: out_re[6], out_im[6] — reconstructed state.
+ * Returns: reconstruction fidelity (1.0 = perfect).
+ *
+ * Based on Scrying Mirror experiment: T0 achieves F=1.0. */
+double s6_total_tomography(int total_idx,
+                           const double fold_re[5][6],
+                           const double fold_im[5][6],
+                           double *out_re, double *out_im);
+
 #endif /* S6_EXOTIC_H */
