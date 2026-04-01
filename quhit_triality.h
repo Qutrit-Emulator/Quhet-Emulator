@@ -35,14 +35,16 @@
 #define VIEW_DIAGONAL 2   /* Conjugate Fourier (DFT₆²) — Magenta square */
 #define VIEW_FOLDED   3   /* Antipodal fold: Stage 1 of factored DFT₆ */
 #define VIEW_EXOTIC   4   /* Exotic fold: syntheme-parameterized (outer automorphism) */
+#define VIEW_TETRA    5   /* Tetrahedral eigenbasis: DFT₆ eigenspace decomposition */
 
-/* Dirty bitmask: bit 0 = edge, bit 1 = vertex, bit 2 = diag, bit 3 = folded, bit 4 = exotic */
+/* Dirty bitmask: bit 0-5 for each view */
 #define DIRTY_EDGE     0x01
 #define DIRTY_VERTEX   0x02
 #define DIRTY_DIAGONAL 0x04
 #define DIRTY_FOLDED   0x08
 #define DIRTY_EXOTIC   0x10
-#define DIRTY_ALL      0x1F
+#define DIRTY_TETRA    0x20
+#define DIRTY_ALL      0x3F
 
 /* ═══════════════════════════════════════════════════════════════════════
  * THE TRIALITY QUHIT
@@ -55,6 +57,7 @@ typedef struct {
     double diag_re[TRI_D],   diag_im[TRI_D];      /* |ψ⟩ in conjugate basis */
     double folded_re[TRI_D], folded_im[TRI_D];    /* Antipodal fold intermediate */
     double exotic_re[TRI_D], exotic_im[TRI_D];    /* Exotic fold (alt syntheme) */
+    double tetra_re[TRI_D],  tetra_im[TRI_D];     /* DFT₆ eigenbasis coefficients */
     int    exotic_syntheme;                        /* Which syntheme to use for exotic view */
 
     uint8_t dirty;      /* Which views are stale (bits 0-3) */
@@ -225,6 +228,19 @@ void triality_unfold(TrialityQuhit *q);
 /* Convert Edge↔Vertex via the folded intermediate (O(18) vs O(36)) */
 void triality_ensure_view_via_fold(TrialityQuhit *q, int target_view);
 
+/* ── Enhancement 5: Tetrahedral Eigenbasis ── */
+/* Decompose state into DFT₆ eigenspaces {λ=1(×2), λ=-1(×2), λ=i, λ=-i}.
+ * Once cached, all view conversions and DFT/IDFT gates become O(D). */
+void triality_ensure_tetra(TrialityQuhit *q);
+
+/* Convert from tetra cache to any standard view — O(D²) but avoids
+ * needing a clean standard view as starting point */
+void triality_tetra_to_view(TrialityQuhit *q, int target_view);
+
+/* DFT₆ via tetra: multiply each eigencomponent by λ — O(D) */
+void triality_dft_via_tetra(TrialityQuhit *q);
+void triality_idft_via_tetra(TrialityQuhit *q);
+
 /* Cached exotic invariant — returns Δ without recomputing if state is unchanged */
 double triality_exotic_invariant_cached(TrialityQuhit *q);
 void   triality_exotic_fingerprint_cached(TrialityQuhit *q, double *deltas);
@@ -278,6 +294,8 @@ typedef struct {
     uint64_t exotic_folds;       /* exotic syntheme fold operations */
     uint64_t exotic_gates;       /* exotic-automorphism gate applications */
     uint64_t dual_measurements;  /* dual standard+exotic measurements */
+    uint64_t tetra_conversions;  /* view conversions via tetrahedral eigenbasis */
+    uint64_t tetra_dft_skips;    /* DFT/IDFT operations done via tetra O(D) path */
 } TrialityStats;
 
 extern TrialityStats triality_stats;
@@ -351,5 +369,19 @@ int ltri_measure(LazyTrialityQuhit *q, int view, uint64_t *rng_state);
 
 /* Stats */
 void ltri_stats_print(const LazyTrialityQuhit *q);
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * HEXAGRAM INTERCONVERSION
+ * Convert between triality (vertex model) and hexagram (edge model).
+ * Requires quhit_hexagram.h and hexagram_init_tables() called first.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+struct HexagramQuhit;  /* forward declaration */
+
+/* Convert triality quhit → hexagram quhit via H₆ transform */
+void triality_to_hexagram(TrialityQuhit *src, struct HexagramQuhit *dst);
+
+/* Convert hexagram quhit → triality quhit via H₆† transform */
+void hexagram_to_triality(struct HexagramQuhit *src, TrialityQuhit *dst);
 
 #endif /* QUHIT_TRIALITY_H */
