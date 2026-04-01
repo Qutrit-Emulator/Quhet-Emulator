@@ -103,7 +103,7 @@ void triality_init(TrialityQuhit *q) {
     dft6_forward(q->edge_re, q->edge_im, q->vertex_re, q->vertex_im);
     dft6_forward(q->vertex_re, q->vertex_im, q->diag_re, q->diag_im);
 
-    q->dirty = DIRTY_FOLDED | DIRTY_EXOTIC;
+    q->dirty = DIRTY_FOLDED | DIRTY_EXOTIC | DIRTY_TETRA;
     q->primary = VIEW_EDGE;
 
     /* Enhancement flags */
@@ -118,7 +118,7 @@ void triality_init(TrialityQuhit *q) {
 void triality_init_basis(TrialityQuhit *q, int k) {
     memset(q, 0, sizeof(TrialityQuhit));
     q->edge_re[k] = 1.0;
-    q->dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED | DIRTY_EXOTIC;
+    q->dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED | DIRTY_EXOTIC | DIRTY_TETRA;
     q->primary = VIEW_EDGE;
     q->eigenstate_class = -1;
     q->active_mask = (uint8_t)(1 << k);
@@ -306,6 +306,14 @@ static void convert_view(TrialityQuhit *q, int from, int to) {
 void triality_ensure_view(TrialityQuhit *q, int view) {
     if (!(q->dirty & view_dirty_bit(view))) return;  /* Already clean */
 
+    /* ── Enhancement 5: Tetrahedral fast path ──
+     * If tetra is clean but the target view is dirty, recover from tetra.
+     * This avoids a full DFT₆ — instead we do λⁿ·tetra then T×tetra. */
+    if (!(q->dirty & DIRTY_TETRA) && view <= VIEW_DIAGONAL) {
+        triality_tetra_to_view(q, view);
+        return;
+    }
+
     /* ── Enhancement 2: Eigenstate shortcut ──
      * DFT₆ eigenstates are identical in all views (up to eigenvalue phase).
      * F|ψ⟩ = λ|ψ⟩, so vertex = λ·edge, diag = λ²·edge.
@@ -486,7 +494,7 @@ void triality_phase(TrialityQuhit *q, const double *phi_re, const double *phi_im
             triality_stats.real_fast_path++;
             triality_stats.gates_edge++;
             q->primary = VIEW_EDGE;
-            q->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+            q->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED | DIRTY_TETRA;
             q->delta_valid = 0;  /* Fix #5 */
             return;
         }
@@ -503,7 +511,7 @@ void triality_phase(TrialityQuhit *q, const double *phi_re, const double *phi_im
     /* Phase gate may introduce imaginary parts */
     q->real_valued = 0;
     q->primary = VIEW_EDGE;
-    q->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+    q->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED | DIRTY_TETRA;
     q->delta_valid = 0;  /* Fix #5 */
     triality_stats.gates_edge++;
 }
@@ -521,7 +529,7 @@ void triality_phase_single(TrialityQuhit *q, int k, double phi_re, double phi_im
     q->edge_im[k] = re * phi_im + im * phi_re;
     if (fabs(phi_im) > 1e-15) q->real_valued = 0;
     q->primary = VIEW_EDGE;
-    q->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+    q->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED | DIRTY_TETRA;
     triality_stats.gates_edge++;
 }
 
@@ -540,7 +548,7 @@ void triality_z(TrialityQuhit *q) {
     }
     q->real_valued = 0;   /* Z introduces complex phases (ω has imaginary part) */
     q->primary = VIEW_EDGE;
-    q->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+    q->dirty |= DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED | DIRTY_TETRA;
     q->delta_valid = 0;  /* Fix #5 */
     triality_stats.gates_edge++;
     /* Z preserves eigenstate_class: Z|ψ⟩ scales by ω per component,
@@ -567,7 +575,7 @@ void triality_shift(TrialityQuhit *q, int delta) {
     q->eigenstate_class = -1; /* Shift breaks eigenstate */
     q->active_mask = 0x3F; q->active_count = 6; /* Edge view now dirty, mask is stale */
     q->primary = VIEW_VERTEX;
-    q->dirty |= DIRTY_EDGE | DIRTY_DIAGONAL | DIRTY_FOLDED;
+    q->dirty |= DIRTY_EDGE | DIRTY_DIAGONAL | DIRTY_FOLDED | DIRTY_TETRA;
     q->delta_valid = 0;  /* Fix #5 */
     triality_stats.gates_vertex++;
 }
@@ -589,7 +597,7 @@ void triality_dft(TrialityQuhit *q) {
 
     dft6_forward(tmp_re, tmp_im, q->edge_re, q->edge_im);
     q->primary = VIEW_EDGE;
-    q->dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+    q->dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED | DIRTY_EXOTIC | DIRTY_TETRA;
     q->real_valued = 0;  /* DFT introduces complex amplitudes */
     q->eigenstate_class = -1;  /* Clear (might still be eigenstate but need re-detect) */
     q->active_mask = 0x3F; q->active_count = 6; /* DFT spreads to all states */
@@ -605,7 +613,7 @@ void triality_idft(TrialityQuhit *q) {
     memcpy(tmp_im, q->edge_im, sizeof(tmp_im));
     dft6_inverse(tmp_re, tmp_im, q->edge_re, q->edge_im);
     q->primary = VIEW_EDGE;
-    q->dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+    q->dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED | DIRTY_EXOTIC | DIRTY_TETRA;
     q->real_valued = 0;
     q->eigenstate_class = -1;
     q->active_mask = 0x3F; q->active_count = 6;
@@ -1012,6 +1020,199 @@ void triality_ensure_view_via_fold(TrialityQuhit *q, int target_view) {
     }
     /* For other views, fall back to standard */
     triality_ensure_view(q, target_view);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * ENHANCEMENT 5: TETRAHEDRAL EIGENBASIS
+ *
+ * DFT₆ has eigenvalues {1, -1, i, -i} with multiplicities {2, 2, 1, 1}.
+ * Any state decomposes into these 4 eigenspaces (6 eigenvectors total).
+ *
+ * Once cached in the eigenbasis:
+ *   - DFT₆:  multiply each component by its eigenvalue → O(D)
+ *   - IDFT₆: multiply by conjugate eigenvalue → O(D)
+ *   - View conversion: apply λⁿ then T → O(D²) but from ANY dirty state
+ *
+ * The 4 eigenspaces correspond to the 4 vertices of the tetrahedron
+ * inscribed in the cube whose edges define the 3 triality views.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* T maps tetra→edge:  edge = T × tetra
+ * T† maps edge→tetra: tetra = T† × edge
+ * Columns ordered: λ=1 (×2), λ=-1 (×2), λ=i (×1), λ=-i (×1) */
+
+static const double TETRA_TO_EDGE_RE[36] = {
+    +0.8391210551713808, -0.0000000000000002, +0.5439447166468928, -0.0000000000000000, +0.0000000000000003, -0.0000000000000000,
+    +0.2432594724848628, +0.5405470133003926, -0.3752663441429122, +0.0843314257205145, +0.6532814824381888, -0.2705980500730983,
+    +0.2432594724848627, -0.2975766753297839, -0.3752663441429118, -0.4595632394582247, +0.2705980500730981, +0.6532814824381883,
+    +0.2432594724848627, -0.4859406759412170, -0.3752663441429117, +0.7504636274754213, -0.0000000000000005, -0.0000000000000005,
+    +0.2432594724848627, -0.2975766753297834, -0.3752663441429116, -0.4595632394582254, -0.2705980500730989, -0.6532814824381882,
+    +0.2432594724848627, +0.5405470133003922, -0.3752663441429114, +0.0843314257205145, -0.6532814824381878, +0.2705980500730987,
+};
+static const double TETRA_TO_EDGE_IM[36] = {
+    +0.0000000000000000, +0.0000000000000000, +0.0000000000000000, +0.0000000000000001, +0.0000000000000002, +0.0000000000000000,
+    -0.0000000000000000, -0.0263785533033470, +0.0000000000000001, -0.0011441038385107, +0.0000000000000000, +0.0000000000000001,
+    +0.0000000000000001, +0.0145216641640333, +0.0000000000000000, +0.0062347821326423, +0.0000000000000000, +0.0000000000000000,
+    +0.0000000000000002, +0.0237137782786277, +0.0000000000000001, -0.0101813565882631, +0.0000000000000000, -0.0000000000000001,
+    +0.0000000000000002, +0.0145216641640335, +0.0000000000000001, +0.0062347821326419, +0.0000000000000000, +0.0000000000000002,
+    +0.0000000000000003, -0.0263785533033474, +0.0000000000000001, -0.0011441038385105, +0.0000000000000003, +0.0000000000000000,
+};
+
+static const double EDGE_TO_TETRA_RE[36] = {
+    +0.8391210551713808, +0.2432594724848628, +0.2432594724848627, +0.2432594724848627, +0.2432594724848627, +0.2432594724848627,
+    -0.0000000000000002, +0.5405470133003926, -0.2975766753297839, -0.4859406759412170, -0.2975766753297834, +0.5405470133003922,
+    +0.5439447166468928, -0.3752663441429122, -0.3752663441429118, -0.3752663441429117, -0.3752663441429116, -0.3752663441429114,
+    -0.0000000000000000, +0.0843314257205145, -0.4595632394582247, +0.7504636274754213, -0.4595632394582254, +0.0843314257205145,
+    +0.0000000000000003, +0.6532814824381888, +0.2705980500730981, -0.0000000000000005, -0.2705980500730989, -0.6532814824381878,
+    -0.0000000000000000, -0.2705980500730983, +0.6532814824381883, -0.0000000000000005, -0.6532814824381882, +0.2705980500730987,
+};
+static const double EDGE_TO_TETRA_IM[36] = {
+    -0.0000000000000000, +0.0000000000000000, -0.0000000000000001, -0.0000000000000002, -0.0000000000000002, -0.0000000000000003,
+    -0.0000000000000000, +0.0263785533033470, -0.0145216641640333, -0.0237137782786277, -0.0145216641640335, +0.0263785533033474,
+    -0.0000000000000000, -0.0000000000000001, -0.0000000000000000, -0.0000000000000001, -0.0000000000000001, -0.0000000000000001,
+    -0.0000000000000001, +0.0011441038385107, -0.0062347821326423, +0.0101813565882631, -0.0062347821326419, +0.0011441038385105,
+    -0.0000000000000002, -0.0000000000000000, -0.0000000000000000, -0.0000000000000000, -0.0000000000000000, -0.0000000000000003,
+    -0.0000000000000000, -0.0000000000000001, -0.0000000000000000, +0.0000000000000001, -0.0000000000000002, -0.0000000000000000,
+};
+
+/* Eigenvalue per tetra index */
+static const double TETRA_EIGENVAL_RE[6] = {+1.0, +1.0, -1.0, -1.0, +0.0, -0.0};
+static const double TETRA_EIGENVAL_IM[6] = {+0.0, +0.0, +0.0, +0.0, +1.0, -1.0};
+
+/* Conjugate eigenvalue for IDFT */
+static const double TETRA_EIGENVAL_CONJ_RE[6] = {+1.0, +1.0, -1.0, -1.0, +0.0, -0.0};
+static const double TETRA_EIGENVAL_CONJ_IM[6] = {+0.0, +0.0, +0.0, +0.0, -1.0, +1.0};
+
+/* ── edge_to_tetra: tetra = T† × edge — O(D²) ── */
+static void edge_to_tetra(const double *edge_re, const double *edge_im,
+                           double *tetra_re, double *tetra_im)
+{
+    for (int j = 0; j < TRI_D; j++) {
+        double sr = 0, si = 0;
+        for (int k = 0; k < TRI_D; k++) {
+            double tr = EDGE_TO_TETRA_RE[j * TRI_D + k];
+            double ti = EDGE_TO_TETRA_IM[j * TRI_D + k];
+            sr += tr * edge_re[k] - ti * edge_im[k];
+            si += tr * edge_im[k] + ti * edge_re[k];
+        }
+        tetra_re[j] = sr;
+        tetra_im[j] = si;
+    }
+}
+
+/* ── tetra_to_edge: edge = T × tetra — O(D²) ── */
+static void tetra_to_edge_convert(const double *tetra_re, const double *tetra_im,
+                                   double *edge_re, double *edge_im)
+{
+    for (int j = 0; j < TRI_D; j++) {
+        double sr = 0, si = 0;
+        for (int k = 0; k < TRI_D; k++) {
+            double tr = TETRA_TO_EDGE_RE[j * TRI_D + k];
+            double ti = TETRA_TO_EDGE_IM[j * TRI_D + k];
+            sr += tr * tetra_re[k] - ti * tetra_im[k];
+            si += tr * tetra_im[k] + ti * tetra_re[k];
+        }
+        edge_re[j] = sr;
+        edge_im[j] = si;
+    }
+}
+
+/* ── Public API ── */
+
+void triality_ensure_tetra(TrialityQuhit *q) {
+    if (!(q->dirty & DIRTY_TETRA)) return;  /* Already clean */
+
+    /* Need edge view to decompose */
+    triality_ensure_view(q, VIEW_EDGE);
+    edge_to_tetra(q->edge_re, q->edge_im, q->tetra_re, q->tetra_im);
+    q->dirty &= ~DIRTY_TETRA;
+    triality_stats.tetra_conversions++;
+}
+
+void triality_tetra_to_view(TrialityQuhit *q, int target_view) {
+    triality_ensure_tetra(q);
+
+    if (target_view == VIEW_EDGE || target_view == VIEW_VERTEX ||
+        target_view == VIEW_DIAGONAL)
+    {
+        /* Compute λⁿ·tetra then transform back to edge.
+         * n = (target_view - VIEW_EDGE + 3) % 3 DFT applications.
+         * λⁿ for each eigenvalue:
+         *   n=0: {1,1,-1,-1,i,-i}^0  = {1,1,1,1,1,1}     (edge)
+         *   n=1: {1,1,-1,-1,i,-i}^1  = {1,1,-1,-1,i,-i}   (vertex)
+         *   n=2: {1,1,-1,-1,i,-i}^2  = {1,1,1,1,-1,-1}    (diagonal)
+         */
+        int n = target_view;  /* VIEW_EDGE=0, VIEW_VERTEX=1, VIEW_DIAGONAL=2 */
+        double scaled_re[TRI_D], scaled_im[TRI_D];
+
+        for (int k = 0; k < TRI_D; k++) {
+            /* Compute λⁿ for eigenvalue k */
+            double lr = TETRA_EIGENVAL_RE[k], li = TETRA_EIGENVAL_IM[k];
+            double pr = 1.0, pi = 0.0;
+            for (int s = 0; s < n; s++) {
+                double tr = pr * lr - pi * li;
+                double ti = pr * li + pi * lr;
+                pr = tr; pi = ti;
+            }
+            /* Multiply tetra[k] by λⁿ */
+            scaled_re[k] = q->tetra_re[k] * pr - q->tetra_im[k] * pi;
+            scaled_im[k] = q->tetra_re[k] * pi + q->tetra_im[k] * pr;
+        }
+
+        /* Transform back: view = T × (λⁿ · tetra) */
+        double *dst_re = view_re(q, target_view);
+        double *dst_im = view_im(q, target_view);
+        tetra_to_edge_convert(scaled_re, scaled_im, dst_re, dst_im);
+        q->dirty &= ~view_dirty_bit(target_view);
+        triality_stats.tetra_conversions++;
+    }
+}
+
+void triality_dft_via_tetra(TrialityQuhit *q) {
+    triality_ensure_tetra(q);
+
+    /* DFT₆ in eigenbasis = multiply each component by its eigenvalue.
+     * This is O(D) instead of O(D²). */
+    for (int k = 0; k < TRI_D; k++) {
+        double tr = q->tetra_re[k], ti = q->tetra_im[k];
+        double lr = TETRA_EIGENVAL_RE[k], li = TETRA_EIGENVAL_IM[k];
+        q->tetra_re[k] = tr * lr - ti * li;
+        q->tetra_im[k] = tr * li + ti * lr;
+    }
+
+    /* Tetra is still valid (we just updated it).
+     * All standard views are now stale — they need to be reconstructed
+     * from the new tetra coefficients. */
+    q->dirty = (DIRTY_EDGE | DIRTY_VERTEX | DIRTY_DIAGONAL |
+                DIRTY_FOLDED | DIRTY_EXOTIC);
+    /* DIRTY_TETRA is NOT set — tetra is the authoritative source */
+
+    /* Also update enhancement flags conservatively */
+    q->real_valued = 0;
+    q->eigenstate_class = -1;
+    q->active_mask = 0x3F; q->active_count = 6;
+    q->delta_valid = 0;
+    triality_stats.tetra_dft_skips++;
+}
+
+void triality_idft_via_tetra(TrialityQuhit *q) {
+    triality_ensure_tetra(q);
+
+    /* IDFT₆ = multiply by conjugate eigenvalue */
+    for (int k = 0; k < TRI_D; k++) {
+        double tr = q->tetra_re[k], ti = q->tetra_im[k];
+        double lr = TETRA_EIGENVAL_CONJ_RE[k], li = TETRA_EIGENVAL_CONJ_IM[k];
+        q->tetra_re[k] = tr * lr - ti * li;
+        q->tetra_im[k] = tr * li + ti * lr;
+    }
+
+    q->dirty = (DIRTY_EDGE | DIRTY_VERTEX | DIRTY_DIAGONAL |
+                DIRTY_FOLDED | DIRTY_EXOTIC);
+    q->real_valued = 0;
+    q->eigenstate_class = -1;
+    q->active_mask = 0x3F; q->active_count = 6;
+    q->delta_valid = 0;
+    triality_stats.tetra_dft_skips++;
 }
 
 /* ── Enhancement 2: Eigenstate Detection ── */
