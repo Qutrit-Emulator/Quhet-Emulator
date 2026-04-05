@@ -504,7 +504,7 @@ static void z6_mobius_converge_bignum(MobiusAmplitudeSheet *ms) {
         }
     }
 
-    int MAX_ITER = 15;
+    int MAX_ITER = 50;
     for (int it = 0; it < MAX_ITER; it++) {
         printf("      [Arbitrary-Precision BP] Iteration %d / %d\n", it + 1, MAX_ITER);
         for (int eid = 0; eid < n_edges; eid++) {
@@ -723,12 +723,25 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
         for (int d = 0; d < 6; d++) {
             BigInt b6_mod; bigint_set_u64(&b6_mod, 6);
+
+            /* Nested phase resolution: shift into the blk-th base-6 digit of the value.
+             * This extracts (val / 6^blk) % 6, giving a unique phase per depth level
+             * rather than all blocks collapsing to the same modulo-6 bucket. */
+            BigInt shift_div_A; bigint_copy(&shift_div_A, &powersA[d]);
+            BigInt shift_div_B; bigint_copy(&shift_div_B, &powersB[d]);
+            for (int si = 0; si < blk; si++) {
+                BigInt qt, rm;
+                bigint_div_mod(&shift_div_A, &b6_mod, &qt, &rm);
+                bigint_copy(&shift_div_A, &qt);
+                bigint_div_mod(&shift_div_B, &b6_mod, &qt, &rm);
+                bigint_copy(&shift_div_B, &qt);
+            }
             BigInt qA, qB, rA_mod, rB_mod;
-            bigint_div_mod(&powersA[d], &b6_mod, &qA, &rA_mod);
-            bigint_div_mod(&powersB[d], &b6_mod, &qB, &rB_mod);
-            
-            int d_A = bigint_to_u64(&rA_mod);
-            int d_B = bigint_to_u64(&rB_mod);
+            bigint_div_mod(&shift_div_A, &b6_mod, &qA, &rA_mod);
+            bigint_div_mod(&shift_div_B, &b6_mod, &qB, &rB_mod);
+
+            int d_A = (int)bigint_to_u64(&rA_mod);
+            int d_B = (int)bigint_to_u64(&rB_mod);
 
             double phase_A = 2.0 * 3.14159265358979323846 * d_A / 6.0;
             double phase_B = 2.0 * 3.14159265358979323846 * d_B / 6.0;
@@ -785,9 +798,9 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                     double w;
                     switch(diff) {
                         case 0: w = 1.000; break;
-                        case 1: case 5: w = 0.755; break;
-                        case 2: case 4: w = 0.431; break;
-                        case 3: w = 0.325; break;
+                        case 1: case 5: w = 0.100; break;
+                        case 2: case 4: w = 0.010; break;
+                        case 3: w = 0.001; break;
                     }
                     edge->w_re[va][vb] = w;
                     edge->w_im[va][vb] = 0.0;
@@ -817,9 +830,9 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                     double w;
                     switch(diff) {
                         case 0: w = 1.000; break;
-                        case 1: case 5: w = 0.755; break;
-                        case 2: case 4: w = 0.431; break;
-                        case 3: w = 0.325; break;
+                        case 1: case 5: w = 0.100; break;
+                        case 2: case 4: w = 0.010; break;
+                        case 3: w = 0.001; break;
                     }
                     edge->w_re[va][vb] = w;
                     edge->w_im[va][vb] = 0.0;
@@ -917,37 +930,43 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     printf("\n  ═══ QUANTUM MONTE CARLO PERIOD EXTRACTION ═══\n");
     int success = 0;
     int num_shots = 1000000;
+
+    /* MCMC state: one digit per scale position, persisted across shots.
+     * Shot 1 seeds from argmax of marginals. Subsequent shots flip exactly
+     * one randomly chosen scale position to a new random digit (≠ current),
+     * ensuring the walk always explores fresh frequency strings. */
+    int mcmc_state[1600] = {0};
+
+    /* LCM accumulator: the true period r divides every valid R/F convergent.
+     * Collecting their LCM incrementally recovers r without hitting it directly. */
+    BigInt global_lcm; bigint_set_u64(&global_lcm, 1);
+
     for (int shot = 1; shot <= num_shots; shot++) {
         BigInt freq;
         bigint_set_u64(&freq, 0);
         BigInt power_of_6;
         bigint_set_u64(&power_of_6, 1);
 
-        /* The Quantum Roll: Collapse the global wave function probabilistically */
-        for (int scale = 0; scale < n_sites_raw; scale++) {
-            double r = (double)rand() / RAND_MAX;
-            double cdf = 0.0;
-            int sampled_digit = 5;
-            if (shot == 1) {
-                double max_p = 0.0;
+        if (shot == 1) {
+            /* Seed: argmax of marginal distribution */
+            for (int scale = 0; scale < n_sites_raw; scale++) {
+                double max_p = -1.0;
+                int best = 0;
                 for (int d = 0; d < 6; d++) {
-                    if (marginals[scale][d] > max_p) {
-                        max_p = marginals[scale][d];
-                        sampled_digit = d;
-                    }
+                    if (marginals[scale][d] > max_p) { max_p = marginals[scale][d]; best = d; }
                 }
-            } else {
-                for (int d = 0; d < 6; d++) {
-                    cdf += marginals[scale][d];
-                    if (r <= cdf) {
-                        sampled_digit = d;
-                        break;
-                    }
-                }
+                mcmc_state[scale] = best;
             }
+        } else {
+            /* Flip exactly one position to a uniformly random different digit */
+            int flip = rand() % n_sites_raw;
+            mcmc_state[flip] = (mcmc_state[flip] + 1 + rand() % 5) % 6;
+        }
 
+        /* Build frequency from current MCMC state */
+        for (int scale = 0; scale < n_sites_raw; scale++) {
             BigInt d_bi, term, tmp;
-            bigint_set_u64(&d_bi, sampled_digit);
+            bigint_set_u64(&d_bi, mcmc_state[scale]);
             bigint_mul(&term, &d_bi, &power_of_6);
             bigint_add(&tmp, &freq, &term);
             bigint_copy(&freq, &tmp);
@@ -956,15 +975,45 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             bigint_mul(&new_pow, &power_of_6, &b6);
             bigint_copy(&power_of_6, &new_pow);
         }
-        
+
         if (shot % 10000 == 0) {
             printf("  [Shot %7d] Sweeping the multiversal timeline...\n", shot);
+            fflush(stdout);
         }
-        
+
         success = generate_and_try_periods(&freq, &reg_sz, a_val, N, factor_p, factor_q);
         if (success) {
-            printf("\n  [Shot %3d] ★ THE OUROBOROS BITES ITS TAIL. FACTORS DISCOVERED! ★\n", shot);
+            printf("\n  [Shot %d] ★ THE OUROBOROS BITES ITS TAIL. FACTORS DISCOVERED! ★\n", shot);
             break;
+        }
+
+        /* LCM cross-period correlator: accumulate R/F denominators.
+         * Every 50 shots, test whether global_lcm itself is the true period. */
+        if (!bigint_is_zero(&freq)) {
+            BigInt r_cand, rem;
+            bigint_div_mod(&reg_sz, &freq, &r_cand, &rem);
+            if (!bigint_is_zero(&r_cand) && bigint_cmp(&r_cand, N) < 0 &&
+                !bigint_is_zero(&r_cand)) {
+                BigInt gcd_v, prod;
+                bigint_gcd(&gcd_v, &global_lcm, &r_cand);
+                bigint_mul(&prod, &global_lcm, &r_cand);
+                BigInt new_lcm, lcm_rem;
+                bigint_div_mod(&prod, &gcd_v, &new_lcm, &lcm_rem);
+                /* Only keep if it hasn't grown past N (prevents runaway LCM) */
+                if (bigint_cmp(&new_lcm, N) < 0) {
+                    bigint_copy(&global_lcm, &new_lcm);
+                } else {
+                    bigint_set_u64(&global_lcm, 1); /* reset */
+                }
+
+                if (shot % 50 == 0) {
+                    if (try_period(&global_lcm, a_val, N, factor_p, factor_q)) {
+                        success = 1;
+                        printf("\n  [Shot %d] ★ LCM CORRELATOR FOUND THE PERIOD! ★\n", shot);
+                        break;
+                    }
+                }
+            }
         }
     }
 
