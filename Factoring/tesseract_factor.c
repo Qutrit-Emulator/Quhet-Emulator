@@ -629,7 +629,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                             BigInt *factor_p, BigInt *factor_q)
 {
     uint32_t nbits = bigint_bitlen(N);
-    int n_sites_raw = (int)((nbits * 2 * 1000) / 2585) + 1;
+    int n_sites_raw = (int)((nbits * 2 * 1000) / 2585) + 3;
     if (n_sites_raw > 1600) n_sites_raw = 1600;
     if (n_sites_raw < 4) n_sites_raw = 4;
     
@@ -723,23 +723,15 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
         for (int d = 0; d < 6; d++) {
             BigInt b6_mod; bigint_set_u64(&b6_mod, 6);
-            BigInt rA_mod, rB_mod;
-            bigint_div_mod(&powersA[d], &b6_mod, NULL, &rA_mod);
-            bigint_div_mod(&powersB[d], &b6_mod, NULL, &rB_mod);
+            BigInt qA, qB, rA_mod, rB_mod;
+            bigint_div_mod(&powersA[d], &b6_mod, &qA, &rA_mod);
+            bigint_div_mod(&powersB[d], &b6_mod, &qB, &rB_mod);
             
             int d_A = bigint_to_u64(&rA_mod);
             int d_B = bigint_to_u64(&rB_mod);
 
-            /* The quantum phase is proportional to a^x mod N over the space of N */
-            /* We must represent powersA[d] / N as a double to get the precise phase angle */
-            char pA_str[1300], pB_str[1300], n_str[1300];
-            bigint_to_decimal(pA_str, sizeof(pA_str), &powersA[d]);
-            bigint_to_decimal(pB_str, sizeof(pB_str), &powersB[d]);
-            bigint_to_decimal(n_str, sizeof(n_str), N);
-            
-            /* High precision float parsing to build the QPE angle! */
-            double phase_A = 2.0 * M_PI * (atof(pA_str) / atof(n_str));
-            double phase_B = 2.0 * M_PI * (atof(pB_str) / atof(n_str));
+            double phase_A = 2.0 * 3.14159265358979323846 * d_A / 6.0;
+            double phase_B = 2.0 * 3.14159265358979323846 * d_B / 6.0;
 
             int site0 = blk * 6 + 0;
             int site1 = blk * 6 + 1;
