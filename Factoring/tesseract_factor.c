@@ -128,6 +128,15 @@ static int generate_and_try_periods(const BigInt *freq, const BigInt *reg_size,
             bigint_sub(&r_minus, &r_cand, &one);
             if (try_period(&r_plus, a_val, N, factor_p, factor_q)) return 1;
             if (try_period(&r_minus, a_val, N, factor_p, factor_q)) return 1;
+            /* Harmonic search: true period could be k * R/F */
+            for (int k = 2; k <= 6; k++) {
+                BigInt rk, k_bi;
+                bigint_set_u64(&k_bi, k);
+                bigint_mul(&rk, &r_cand, &k_bi);
+                if (bigint_cmp(&rk, N) < 0) {
+                    if (try_period(&rk, a_val, N, factor_p, factor_q)) return 1;
+                }
+            }
         }
     }
 
@@ -904,7 +913,8 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             double sum_prob = 0.0;
             for (int d = 0; d < 6; d++) {
                 double re = mobius->sheets[site].dressed_re[d];
-                double prob = re * re; // Real amplitude isolated from BP
+                double im = mobius->sheets[site].dressed_im[d];
+                double prob = re * re + im * im; /* Full Born probability |ψ|² */
                 marginals[scale][d] = prob;
                 sum_prob += prob;
             }
@@ -997,6 +1007,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
 int main(void)
 {
+    srand(time(NULL));
     triality_exotic_init();
     s6_exotic_init();
     triality_stats_reset();
