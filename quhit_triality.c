@@ -711,11 +711,12 @@ void triality_cz(TrialityQuhit *a, TrialityQuhit *b) {
     if ((mb & ~MASK_EVEN) == 0 && mb) { tri_b = TRI_EVEN; nb = __builtin_popcount(mb); }
     else if ((mb & ~MASK_ODD) == 0 && mb) { tri_b = TRI_ODD; nb = __builtin_popcount(mb); }
 
+    double eff_a_re[TRI_D] = {0}, eff_a_im[TRI_D] = {0};
+    double eff_b_re[TRI_D] = {0}, eff_b_im[TRI_D] = {0};
+    int skipped = 0;
+
     if (tri_a && tri_b) {
         /* Both confined to triangles — iterate only triangle indices */
-        double eff_a_re[TRI_D] = {0}, eff_a_im[TRI_D] = {0};
-        double eff_b_re[TRI_D] = {0}, eff_b_im[TRI_D] = {0};
-
         for (int ti = 0; ti < 3; ti++) {
             int j = tri_a[ti];
             if (!(ma & (1 << j))) continue;
@@ -750,9 +751,6 @@ void triality_cz(TrialityQuhit *a, TrialityQuhit *b) {
     }
 
     /* Compute effective phases from partner */
-    double eff_a_re[TRI_D] = {0}, eff_a_im[TRI_D] = {0};
-    double eff_b_re[TRI_D] = {0}, eff_b_im[TRI_D] = {0};
-
     for (int j = 0; j < TRI_D; j++) {
         if (!(ma & (1 << j))) continue;  /* a[j] is zero */
         double aprob = a->edge_re[j]*a->edge_re[j] + a->edge_im[j]*a->edge_im[j];
@@ -766,8 +764,6 @@ void triality_cz(TrialityQuhit *a, TrialityQuhit *b) {
             eff_b_im[k] += aprob * W6_IM[idx];
         }
     }
-
-    int skipped = 0;
     /* Apply effective phases */
     for (int j = 0; j < TRI_D; j++) {
         if (!(ma & (1 << j))) { skipped++; continue; }
