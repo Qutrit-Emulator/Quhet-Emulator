@@ -67,10 +67,11 @@ static int try_period(const BigInt *r, const BigInt *a_val, const BigInt *N,
     BigInt h_minus, p1;
     bigint_sub(&h_minus, &half_pow, &one);
     bigint_gcd(&p1, &h_minus, N);
+    BigInt dummy_rem; bigint_clear(&dummy_rem);
 
     if (bigint_cmp(&p1, &one) > 0 && bigint_cmp(&p1, N) < 0) {
         bigint_copy(factor_p, &p1);
-        bigint_div_mod(N, &p1, factor_q, &(BigInt){0});
+        bigint_div_mod(N, &p1, factor_q, &dummy_rem);
         char p_str[1300];
         bigint_to_decimal(p_str, sizeof(p_str), &p1);
         printf("    gcd(a^(r/2)-1, N) = %s ✓\n", p_str);
@@ -84,7 +85,7 @@ static int try_period(const BigInt *r, const BigInt *a_val, const BigInt *N,
 
     if (bigint_cmp(&p2, &one) > 0 && bigint_cmp(&p2, N) < 0) {
         bigint_copy(factor_p, &p2);
-        bigint_div_mod(N, &p2, factor_q, &(BigInt){0});
+        bigint_div_mod(N, &p2, factor_q, &dummy_rem);
         char p_str[1300];
         bigint_to_decimal(p_str, sizeof(p_str), &p2);
         printf("    gcd(a^(r/2)+1, N) = %s ✓\n", p_str);
@@ -300,8 +301,8 @@ static int factor_hensel_base6(const BigInt *N, BigInt *factor_p, BigInt *factor
 
     #define MAX_CAND 4000000
     typedef struct { BigInt p; BigInt q; } Cand;
-    Cand *cur = calloc(MAX_CAND, sizeof(Cand));
-    Cand *nxt = calloc(MAX_CAND, sizeof(Cand));
+    Cand *cur = (Cand*)calloc(MAX_CAND, sizeof(Cand));
+    Cand *nxt = (Cand*)calloc(MAX_CAND, sizeof(Cand));
     int nc = 0;
 
     /* Seed: p₀ ∈ {1, 5} */
@@ -467,51 +468,20 @@ static inline void bfp_from_double(BigInt *out, double p) {
     }
     uint64_t sig = (uint64_t)(p * (double)(1ULL << 53));
     bigint_set_u64(out, sig);
-    int shift_rem = BFP_BITS - 53;
-    int s_limbs = shift_rem / 64;
-    int s_bits = shift_rem % 64;
-    for (int i = BIGINT_LIMBS - 1; i >= s_limbs; i--) {
-        uint64_t high = out->limbs[i - s_limbs] << s_bits;
-        uint64_t low = (i - s_limbs - 1 >= 0) ? 
-                       (out->limbs[i - s_limbs - 1] >> (64 - s_bits)) : 0;
-        out->limbs[i] = high | low;
-    }
-    for (int i = 0; i < s_limbs; i++) out->limbs[i] = 0;
+    mpz_mul_2exp(out->z, out->z, BFP_BITS - 53);
 }
 
 static inline void bfp_shr(BigInt *a) {
-    int shift_limbs = BFP_BITS / 64;
-    int shift_bits = BFP_BITS % 64;
-    for (int i = 0; i < BIGINT_LIMBS - shift_limbs; i++) {
-        uint64_t low = a->limbs[i + shift_limbs] >> shift_bits;
-        uint64_t high = (i + shift_limbs + 1 < BIGINT_LIMBS) ? 
-                        (a->limbs[i + shift_limbs + 1] << (64 - shift_bits)) : 0;
-        a->limbs[i] = low | high;
-    }
-    for (int i = BIGINT_LIMBS - shift_limbs; i < BIGINT_LIMBS; i++) {
-        a->limbs[i] = 0;
-    }
+    mpz_fdiv_q_2exp(a->z, a->z, BFP_BITS);
 }
 
 static inline void bfp_shl(BigInt *a) {
-    int shift_limbs = BFP_BITS / 64;
-    int shift_bits = BFP_BITS % 64;
-    for (int i = BIGINT_LIMBS - 1; i >= shift_limbs; i--) {
-        uint64_t high = a->limbs[i - shift_limbs] << shift_bits;
-        uint64_t low = (i - shift_limbs - 1 >= 0) ? 
-                       (a->limbs[i - shift_limbs - 1] >> (64 - shift_bits)) : 0;
-        a->limbs[i] = high | low;
-    }
-    for (int i = 0; i < shift_limbs; i++) {
-        a->limbs[i] = 0;
-    }
+    mpz_mul_2exp(a->z, a->z, BFP_BITS);
 }
 
 static inline void bfp_mul(BigInt *out, const BigInt *a, const BigInt *b) {
-    BigInt tmp;
-    bigint_mul(&tmp, a, b);
-    bfp_shr(&tmp);
-    bigint_copy(out, &tmp);
+    mpz_mul(out->z, a->z, b->z);
+    mpz_fdiv_q_2exp(out->z, out->z, BFP_BITS);
 }
 
 typedef struct {
@@ -522,8 +492,8 @@ static void z6_mobius_converge_bignum(MobiusAmplitudeSheet *ms) {
     const HPCGraph *g = ms->graph;
     int n_edges = g->n_edges;
     if (n_edges == 0) return;
-    BignumEdgeMsg *msgs = calloc(n_edges, sizeof(BignumEdgeMsg));
-    BignumEdgeMsg *new_msgs = calloc(n_edges, sizeof(BignumEdgeMsg));
+    BignumEdgeMsg *msgs = (BignumEdgeMsg*)calloc(n_edges, sizeof(BignumEdgeMsg));
+    BignumEdgeMsg *new_msgs = (BignumEdgeMsg*)calloc(n_edges, sizeof(BignumEdgeMsg));
     
     printf("      [Arbitrary-Precision BP] Initializing %d edges at %d-bit fixed-point...\n", n_edges, BFP_BITS);
     BigInt one; bigint_clear(&one); bigint_set_bit(&one, BFP_BITS);
@@ -534,7 +504,7 @@ static void z6_mobius_converge_bignum(MobiusAmplitudeSheet *ms) {
         }
     }
 
-    int MAX_ITER = 30;
+    int MAX_ITER = 15;
     for (int it = 0; it < MAX_ITER; it++) {
         printf("      [Arbitrary-Precision BP] Iteration %d / %d\n", it + 1, MAX_ITER);
         for (int eid = 0; eid < n_edges; eid++) {
@@ -638,16 +608,7 @@ static void z6_mobius_converge_bignum(MobiusAmplitudeSheet *ms) {
                 bigint_div_mod(&num, &sum_m, &q, &r);
                 
                 BigInt q_shift; bigint_copy(&q_shift, &q);
-                int s_rem = BFP_BITS - 53;
-                int s_limbs = s_rem / 64;
-                int s_bits = s_rem % 64;
-                for (int i = 0; i < BIGINT_LIMBS - s_limbs; i++) {
-                    uint64_t low = q_shift.limbs[i + s_limbs] >> s_bits;
-                    uint64_t high = (i + s_limbs + 1 < BIGINT_LIMBS) ? 
-                                    (q_shift.limbs[i + s_limbs + 1] << (64 - s_bits)) : 0;
-                    q_shift.limbs[i] = low | high;
-                }
-                for (int i = BIGINT_LIMBS - s_limbs; i < BIGINT_LIMBS; i++) q_shift.limbs[i] = 0;
+                mpz_fdiv_q_2exp(q_shift.z, q_shift.z, BFP_BITS - 53);
                 uint64_t sig = bigint_to_u64(&q_shift);
                 double p_double = (double)sig / (double)(1ULL << 53);
                 
@@ -726,8 +687,9 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             bigint_gcd(&gcd_check, &val_minus_1, N);
             if (bigint_cmp(&gcd_check, &one) > 0 && bigint_cmp(&gcd_check, N) < 0) {
                 printf("\n  ✓✓✓ GCD CASCADE HIT at block %d (scale A)! ✓✓✓\n", blk);
+                BigInt dummy_rem; bigint_clear(&dummy_rem);
                 bigint_copy(factor_p, &gcd_check);
-                bigint_div_mod(N, &gcd_check, factor_q, &(BigInt){0});
+                bigint_div_mod(N, &gcd_check, factor_q, &dummy_rem);
                 hpc_destroy(graph);
                 return 1;
             }
@@ -737,8 +699,9 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             bigint_gcd(&gcd_check, &val_minus_1, N);
             if (bigint_cmp(&gcd_check, &one) > 0 && bigint_cmp(&gcd_check, N) < 0) {
                 printf("\n  ✓✓✓ GCD CASCADE HIT at block %d (scale B)! ✓✓✓\n", blk);
+                BigInt dummy_rem; bigint_clear(&dummy_rem);
                 bigint_copy(factor_p, &gcd_check);
-                bigint_div_mod(N, &gcd_check, factor_q, &(BigInt){0});
+                bigint_div_mod(N, &gcd_check, factor_q, &dummy_rem);
                 hpc_destroy(graph);
                 return 1;
             }
@@ -868,10 +831,8 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             hpc_adj_add(graph, s_head, eid);
         }
         
-        if (blk < 5 || (blk + 1) % 50 == 0) {
-            printf("      [debug] Completed block %d / %d\n", blk, n_blocks);
-            fflush(stdout);
-        }
+        printf("      [debug] Completed block %d / %d\n", blk, n_blocks);
+        fflush(stdout);
     }
 
 
@@ -967,11 +928,21 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             double r = (double)rand() / RAND_MAX;
             double cdf = 0.0;
             int sampled_digit = 5;
-            for (int d = 0; d < 6; d++) {
-                cdf += marginals[scale][d];
-                if (r <= cdf) {
-                    sampled_digit = d;
-                    break;
+            if (shot == 1) {
+                double max_p = 0.0;
+                for (int d = 0; d < 6; d++) {
+                    if (marginals[scale][d] > max_p) {
+                        max_p = marginals[scale][d];
+                        sampled_digit = d;
+                    }
+                }
+            } else {
+                for (int d = 0; d < 6; d++) {
+                    cdf += marginals[scale][d];
+                    if (r <= cdf) {
+                        sampled_digit = d;
+                        break;
+                    }
                 }
             }
 
@@ -1005,7 +976,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
  * MAIN
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-int main(void)
+int main(int argc, char **argv)
 {
     srand(time(NULL));
     triality_exotic_init();
@@ -1026,10 +997,11 @@ int main(void)
     printf("  ║                                                              ║\n");
     printf("  ╚════════════════════════════════════════════════════════════════╝\n\n");
 
-    /* Parse N and a from config */
+    /* Parse N and a from config or arguments */
     BigInt N, a_val;
-    if (bigint_from_decimal(&N, TARGET_N) != 0) {
-        printf("  ERROR: Invalid N = \"%s\"\n", TARGET_N);
+    const char *target_n_str = (argc > 1) ? argv[1] : TARGET_N;
+    if (bigint_from_decimal(&N, target_n_str) != 0) {
+        printf("  ERROR: Invalid N = \"%s\"\n", target_n_str);
         return 1;
     }
 
