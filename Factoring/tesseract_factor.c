@@ -242,7 +242,7 @@ static int generate_and_try_periods(const BigInt *freq, const BigInt *reg_size,
  * the Lovász swap — both only need word-size precision).
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-#define LLL_K       12              /* frequency samples to collect            */
+#define LLL_K       32              /* frequency samples to collect            */
 #define LLL_DIM     (LLL_K + 1)     /* lattice dimension                       */
 #define LLL_W_BITS  24              /* W = 2^24: products ≤ 13*(2^24)^2<2^52  */
 #define LLL_DELTA   0.75            /* Lovász δ                                */
@@ -360,6 +360,7 @@ static void lll_reduce_basis(long long B[LLL_DIM][LLL_DIM])
 static void lll_collect_freqs(int n, double (*marg)[6],
                                const BigInt *b6, BigInt out[LLL_K])
 {
+    (void)0; /* Dynamic temperature beam search: T cools from 0.8 (LSB) to 0.1 (MSB) */
     /* Diagnostic: show confidence at first few positions */
     printf("  [freq] marginal peak confidence at pos 0..4:");
     for (int s = 0; s < 5 && s < n; s++) {
@@ -400,12 +401,14 @@ static void lll_collect_freqs(int n, double (*marg)[6],
             }
         }
 
-        /* ── Temperature Beam Search (Boltzmann Sampling at T=0.5) ──
-         * To break degenerate convergence symmetry, we sample from the Gibbs 
-         * distribution over the beam paths rather than taking pure argmax. */
+        /* ── Dynamic Temperature Beam Search (Boltzmann Sampling) ──
+         * T cools linearly from 0.8 at the LSBs to 0.1 at the MSBs.
+         * High T at low digits explores branching harmonics;
+         * low T at high digits locks in the dominant prefix greedily. */
         int top_indices[LLL_K];
         int top_count = (next_count < LLL_K) ? next_count : LLL_K;
-        double TEMP = 0.5;
+        double TEMP = 0.8 - 0.7 * ((double)s / (double)(n > 1 ? n - 1 : 1));
+        if (TEMP < 0.1) TEMP = 0.1;
 
         for (int k = 0; k < top_count; k++) {
             /* 1. Find max for numerical stability */
@@ -956,7 +959,10 @@ static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed)
     }
 
     #define CAMP_MAX_ITER 200
-    #define CAMP_DAMPING  0.15   /* Lower than prob-domain for stability */
+    /* Simulated Annealing: damping starts high (0.5) and cools to 0.05 */
+    #define CAMP_DAMPING_START 0.50
+    #define CAMP_DAMPING_END   0.05
+    #define CAMP_COOL_ITERS   150  /* iterations over which cooling occurs */
     #define CAMP_TOL      1e-12
 
     double prev_residual = 1e30;
@@ -1037,13 +1043,16 @@ static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed)
                     }
                 }
 
-                /* Step 4: Damped update + compute residual */
+                /* Step 4: Damped update with annealing schedule */
+                double anneal_alpha = (it < CAMP_COOL_ITERS)
+                    ? CAMP_DAMPING_START * exp(log(CAMP_DAMPING_END / CAMP_DAMPING_START) * ((double)it / CAMP_COOL_ITERS))
+                    : CAMP_DAMPING_END;
                 double delta = 0.0;
                 for (int v = 0; v < 6; v++) {
-                    double upd_re = CAMP_DAMPING * new_re[v] +
-                                    (1.0 - CAMP_DAMPING) * msgs[eid].re[dir][v];
-                    double upd_im = CAMP_DAMPING * new_im[v] +
-                                    (1.0 - CAMP_DAMPING) * msgs[eid].im[dir][v];
+                    double upd_re = anneal_alpha * new_re[v] +
+                                    (1.0 - anneal_alpha) * msgs[eid].re[dir][v];
+                    double upd_im = anneal_alpha * new_im[v] +
+                                    (1.0 - anneal_alpha) * msgs[eid].im[dir][v];
 
                     double dr = upd_re - msgs[eid].re[dir][v];
                     double di = upd_im - msgs[eid].im[dir][v];
@@ -1287,8 +1296,13 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             edge->site_b = bypass_sites[j];
             edge->type = HPC_EDGE_PHASE;
             edge->fidelity = 1.0;
-            /* ── PHASE Attenuation: scale by 1/√n_blocks ── */
-            double phase_scale = 1.0 / sqrt((double)n_blocks);
+            /* ── Spectral Windowed PHASE Attenuation (Hann window) ──
+             * Hann(blk) = 0.5 * (1 - cos(2π * blk / (n_blocks - 1)))
+             * Tapers boundaries smoothly to zero, eliminating Gibbs ringing. */
+            double hann_w = (n_blocks > 1)
+                ? 0.5 * (1.0 - cos(2.0 * 3.14159265358979323846 * blk / (n_blocks - 1)))
+                : 1.0;
+            double phase_scale = hann_w / sqrt((double)n_blocks);
             for (int va = 0; va < 6; va++) {
                 for (int vb = 0; vb < 6; vb++) {
                     int diff = (va - vb + 6) % 6;
@@ -1349,8 +1363,11 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             edge->site_b = s_head;
             edge->type = HPC_EDGE_PHASE;
             edge->fidelity = 1.0;
-            /* ── PHASE Attenuation on bridge: scale by 1/√n_blocks ── */
-            double bridge_scale = 1.0 / sqrt((double)n_blocks);
+            /* ── Spectral Windowed PHASE Attenuation on bridge (Hann) ── */
+            double hann_bridge = (n_blocks > 1)
+                ? 0.5 * (1.0 - cos(2.0 * 3.14159265358979323846 * blk / (n_blocks - 1)))
+                : 1.0;
+            double bridge_scale = hann_bridge / sqrt((double)n_blocks);
             for (int va = 0; va < 6; va++) {
                 for (int vb = 0; vb < 6; vb++) {
                     int diff = (va - vb + 6) % 6;
