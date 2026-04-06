@@ -49,45 +49,52 @@
 static int try_period(const BigInt *r, const BigInt *a_val, const BigInt *N,
                       BigInt *factor_p, BigInt *factor_q)
 {
-    BigInt one, two, r_half, q_unused, r_mod;
-    bigint_set_u64(&one, 1);
-    bigint_set_u64(&two, 2);
+    /* Static temporaries — allocated once, reused forever */
+    static int tp_init = 0;
+    static BigInt tp_one, tp_two, tp_r_half, tp_q_unused, tp_r_mod;
+    static BigInt tp_half_pow, tp_h_minus, tp_p1, tp_dummy_rem;
+    static BigInt tp_h_plus, tp_p2;
+    if (!tp_init) {
+        bigint_set_u64(&tp_one, 1); bigint_set_u64(&tp_two, 2);
+        bigint_set_u64(&tp_r_half, 0); bigint_set_u64(&tp_q_unused, 0);
+        bigint_set_u64(&tp_r_mod, 0); bigint_set_u64(&tp_half_pow, 0);
+        bigint_set_u64(&tp_h_minus, 0); bigint_set_u64(&tp_p1, 0);
+        bigint_set_u64(&tp_dummy_rem, 0); bigint_set_u64(&tp_h_plus, 0);
+        bigint_set_u64(&tp_p2, 0);
+        tp_init = 1;
+    }
 
     /* r must be even */
-    bigint_div_mod(r, &two, &q_unused, &r_mod);
-    if (!bigint_is_zero(&r_mod)) return 0;
+    bigint_div_mod(r, &tp_two, &tp_q_unused, &tp_r_mod);
+    if (!bigint_is_zero(&tp_r_mod)) return 0;
 
-    bigint_div_mod(r, &two, &r_half, &r_mod);
+    bigint_div_mod(r, &tp_two, &tp_r_half, &tp_r_mod);
 
     /* a^(r/2) mod N */
-    BigInt half_pow;
-    bigint_pow_mod(&half_pow, a_val, &r_half, N);
+    bigint_pow_mod(&tp_half_pow, a_val, &tp_r_half, N);
 
     /* gcd(a^(r/2) - 1, N) */
-    BigInt h_minus, p1;
-    bigint_sub(&h_minus, &half_pow, &one);
-    bigint_gcd(&p1, &h_minus, N);
-    BigInt dummy_rem; bigint_clear(&dummy_rem);
+    bigint_sub(&tp_h_minus, &tp_half_pow, &tp_one);
+    bigint_gcd(&tp_p1, &tp_h_minus, N);
 
-    if (bigint_cmp(&p1, &one) > 0 && bigint_cmp(&p1, N) < 0) {
-        bigint_copy(factor_p, &p1);
-        bigint_div_mod(N, &p1, factor_q, &dummy_rem);
+    if (bigint_cmp(&tp_p1, &tp_one) > 0 && bigint_cmp(&tp_p1, N) < 0) {
+        bigint_copy(factor_p, &tp_p1);
+        bigint_div_mod(N, &tp_p1, factor_q, &tp_dummy_rem);
         char p_str[1300];
-        bigint_to_decimal(p_str, sizeof(p_str), &p1);
+        bigint_to_decimal(p_str, sizeof(p_str), &tp_p1);
         printf("    gcd(a^(r/2)-1, N) = %s ✓\n", p_str);
         return 1;
     }
 
     /* gcd(a^(r/2) + 1, N) */
-    BigInt h_plus, p2;
-    bigint_add(&h_plus, &half_pow, &one);
-    bigint_gcd(&p2, &h_plus, N);
+    bigint_add(&tp_h_plus, &tp_half_pow, &tp_one);
+    bigint_gcd(&tp_p2, &tp_h_plus, N);
 
-    if (bigint_cmp(&p2, &one) > 0 && bigint_cmp(&p2, N) < 0) {
-        bigint_copy(factor_p, &p2);
-        bigint_div_mod(N, &p2, factor_q, &dummy_rem);
+    if (bigint_cmp(&tp_p2, &tp_one) > 0 && bigint_cmp(&tp_p2, N) < 0) {
+        bigint_copy(factor_p, &tp_p2);
+        bigint_div_mod(N, &tp_p2, factor_q, &tp_dummy_rem);
         char p_str[1300];
-        bigint_to_decimal(p_str, sizeof(p_str), &p2);
+        bigint_to_decimal(p_str, sizeof(p_str), &tp_p2);
         printf("    gcd(a^(r/2)+1, N) = %s ✓\n", p_str);
         return 1;
     }
@@ -106,122 +113,120 @@ static int generate_and_try_periods(const BigInt *freq, const BigInt *reg_size,
                                      const BigInt *a_val, const BigInt *N,
                                      BigInt *factor_p, BigInt *factor_q)
 {
-    BigInt one;
-    bigint_set_u64(&one, 1);
+    /* Static temporaries — allocated once, reused forever */
+    static int gtp_init = 0;
+    static BigInt gtp_one, gtp_r_cand, gtp_rem, gtp_r_plus, gtp_r_minus;
+    static BigInt gtp_k_bi, gtp_rk;
+    static BigInt gtp_g;
+    static BigInt gtp_num, gtp_den, gtp_pm1, gtp_p0, gtp_qm1, gtp_q0;
+    static BigInt gtp_a0, gtp_cf_rem, gtp_a_next;
+    static BigInt gtp_m2, gtp_m3, gtp_m6, gtp_two_q, gtp_three_q, gtp_six_q;
+    static BigInt gtp_p_new, gtp_q_new, gtp_tmp;
+    static BigInt gtp_f2, gtp_f3;
+    if (!gtp_init) {
+        bigint_set_u64(&gtp_one, 1); bigint_set_u64(&gtp_r_cand, 0);
+        bigint_set_u64(&gtp_rem, 0); bigint_set_u64(&gtp_r_plus, 0);
+        bigint_set_u64(&gtp_r_minus, 0); bigint_set_u64(&gtp_k_bi, 0);
+        bigint_set_u64(&gtp_rk, 0); bigint_set_u64(&gtp_g, 0);
+        bigint_set_u64(&gtp_num, 0); bigint_set_u64(&gtp_den, 0);
+        bigint_set_u64(&gtp_pm1, 0); bigint_set_u64(&gtp_p0, 0);
+        bigint_set_u64(&gtp_qm1, 0); bigint_set_u64(&gtp_q0, 0);
+        bigint_set_u64(&gtp_a0, 0); bigint_set_u64(&gtp_cf_rem, 0);
+        bigint_set_u64(&gtp_a_next, 0);
+        bigint_set_u64(&gtp_m2, 2); bigint_set_u64(&gtp_m3, 3);
+        bigint_set_u64(&gtp_m6, 6);
+        bigint_set_u64(&gtp_two_q, 0); bigint_set_u64(&gtp_three_q, 0);
+        bigint_set_u64(&gtp_six_q, 0);
+        bigint_set_u64(&gtp_p_new, 0); bigint_set_u64(&gtp_q_new, 0);
+        bigint_set_u64(&gtp_tmp, 0);
+        bigint_set_u64(&gtp_f2, 0); bigint_set_u64(&gtp_f3, 0);
+        gtp_init = 1;
+    }
 
     if (bigint_is_zero(freq)) return 0;
 
-    /* frequency print silenced — fires every MCMC shot, floods output */
-
     /* r = R / F (direct division) */
-    {
-        BigInt r_cand, rem;
-        bigint_div_mod(reg_size, freq, &r_cand, &rem);
-        if (!bigint_is_zero(&r_cand) && bigint_cmp(&r_cand, &one) > 0) {
-            char r_str[1300];
-            bigint_to_decimal(r_str, sizeof(r_str), &r_cand);
-            printf("  Trying r = R/F = %s\n", r_str);
-            if (try_period(&r_cand, a_val, N, factor_p, factor_q)) return 1;
-            BigInt r_plus, r_minus;
-            bigint_add(&r_plus, &r_cand, &one);
-            bigint_sub(&r_minus, &r_cand, &one);
-            if (try_period(&r_plus, a_val, N, factor_p, factor_q)) return 1;
-            if (try_period(&r_minus, a_val, N, factor_p, factor_q)) return 1;
-            /* Harmonic search: true period could be k * R/F */
-            for (int k = 2; k <= 6; k++) {
-                BigInt rk, k_bi;
-                bigint_set_u64(&k_bi, k);
-                bigint_mul(&rk, &r_cand, &k_bi);
-                if (bigint_cmp(&rk, N) < 0) {
-                    if (try_period(&rk, a_val, N, factor_p, factor_q)) return 1;
-                }
+    bigint_div_mod(reg_size, freq, &gtp_r_cand, &gtp_rem);
+    if (!bigint_is_zero(&gtp_r_cand) && bigint_cmp(&gtp_r_cand, &gtp_one) > 0) {
+        char r_str[1300];
+        bigint_to_decimal(r_str, sizeof(r_str), &gtp_r_cand);
+        printf("  Trying r = R/F = %s\n", r_str);
+        if (try_period(&gtp_r_cand, a_val, N, factor_p, factor_q)) return 1;
+        bigint_add(&gtp_r_plus, &gtp_r_cand, &gtp_one);
+        bigint_sub(&gtp_r_minus, &gtp_r_cand, &gtp_one);
+        if (try_period(&gtp_r_plus, a_val, N, factor_p, factor_q)) return 1;
+        if (try_period(&gtp_r_minus, a_val, N, factor_p, factor_q)) return 1;
+        /* Harmonic search: true period could be k * R/F */
+        for (int k = 2; k <= 6; k++) {
+            bigint_set_u64(&gtp_k_bi, k);
+            bigint_mul(&gtp_rk, &gtp_r_cand, &gtp_k_bi);
+            if (bigint_cmp(&gtp_rk, N) < 0) {
+                if (try_period(&gtp_rk, a_val, N, factor_p, factor_q)) return 1;
             }
         }
     }
 
     /* r = gcd(F, R), and R/gcd */
-    {
-        BigInt g, r_cand, rem;
-        bigint_gcd(&g, freq, reg_size);
-        if (bigint_cmp(&g, &one) > 0) {
-            bigint_div_mod(reg_size, &g, &r_cand, &rem);
-            /* silenced printf("  Trying r = R/gcd(F,R) = %s\\n", r_str); */
-            if (try_period(&r_cand, a_val, N, factor_p, factor_q)) return 1;
-            if (try_period(&g, a_val, N, factor_p, factor_q)) return 1;
-        }
+    bigint_gcd(&gtp_g, freq, reg_size);
+    if (bigint_cmp(&gtp_g, &gtp_one) > 0) {
+        bigint_div_mod(reg_size, &gtp_g, &gtp_r_cand, &gtp_rem);
+        if (try_period(&gtp_r_cand, a_val, N, factor_p, factor_q)) return 1;
+        if (try_period(&gtp_g, a_val, N, factor_p, factor_q)) return 1;
     }
 
     /* Continued fraction convergents of F/R */
-    {
-        BigInt num, den;
-        bigint_copy(&num, freq);
-        bigint_copy(&den, reg_size);
+    bigint_copy(&gtp_num, freq);
+    bigint_copy(&gtp_den, reg_size);
 
-        BigInt pm1, p0, qm1, q0;
-        bigint_set_u64(&pm1, 1);
-        bigint_set_u64(&qm1, 0);
+    bigint_set_u64(&gtp_pm1, 1);
+    bigint_set_u64(&gtp_qm1, 0);
 
-        BigInt a0, rem;
-        bigint_div_mod(&num, &den, &a0, &rem);
-        bigint_copy(&p0, &a0);
-        bigint_set_u64(&q0, 1);
+    bigint_div_mod(&gtp_num, &gtp_den, &gtp_a0, &gtp_cf_rem);
+    bigint_copy(&gtp_p0, &gtp_a0);
+    bigint_set_u64(&gtp_q0, 1);
 
-        for (int step = 0; step < 3000; step++) {
-            if (bigint_cmp(&q0, N) >= 0) {
-                break;
-            }
-            if (bigint_cmp(&q0, &one) > 0) {
-                /* silenced CF step prints */
-                if (try_period(&q0, a_val, N, factor_p, factor_q)) return 1;
+    for (int step = 0; step < 3000; step++) {
+        if (bigint_cmp(&gtp_q0, N) >= 0) break;
 
-                /* Try multiples */
-                BigInt m2, m3, m6, two_q, three_q, six_q;
-                bigint_set_u64(&m2, 2);
-                bigint_set_u64(&m3, 3);
-                bigint_set_u64(&m6, 6);
-                bigint_mul(&two_q, &q0, &m2);
-                bigint_mul(&three_q, &q0, &m3);
-                bigint_mul(&six_q, &q0, &m6);
-                if (try_period(&two_q, a_val, N, factor_p, factor_q)) return 1;
-                if (try_period(&three_q, a_val, N, factor_p, factor_q)) return 1;
-                if (try_period(&six_q, a_val, N, factor_p, factor_q)) return 1;
-            }
+        if (bigint_cmp(&gtp_q0, &gtp_one) > 0) {
+            if (try_period(&gtp_q0, a_val, N, factor_p, factor_q)) return 1;
 
-            if (bigint_is_zero(&rem)) break;
-            bigint_copy(&num, &den);
-            bigint_copy(&den, &rem);
-
-            BigInt a_next;
-            bigint_div_mod(&num, &den, &a_next, &rem);
-
-            BigInt p_new, q_new, tmp;
-            bigint_mul(&tmp, &a_next, &p0);
-            bigint_add(&p_new, &tmp, &pm1);
-            bigint_mul(&tmp, &a_next, &q0);
-            bigint_add(&q_new, &tmp, &qm1);
-
-            bigint_copy(&pm1, &p0);
-            bigint_copy(&qm1, &q0);
-            bigint_copy(&p0, &p_new);
-            bigint_copy(&q0, &q_new);
+            /* Try multiples */
+            bigint_mul(&gtp_two_q, &gtp_q0, &gtp_m2);
+            bigint_mul(&gtp_three_q, &gtp_q0, &gtp_m3);
+            bigint_mul(&gtp_six_q, &gtp_q0, &gtp_m6);
+            if (try_period(&gtp_two_q, a_val, N, factor_p, factor_q)) return 1;
+            if (try_period(&gtp_three_q, a_val, N, factor_p, factor_q)) return 1;
+            if (try_period(&gtp_six_q, a_val, N, factor_p, factor_q)) return 1;
         }
+
+        if (bigint_is_zero(&gtp_cf_rem)) break;
+        bigint_copy(&gtp_num, &gtp_den);
+        bigint_copy(&gtp_den, &gtp_cf_rem);
+
+        bigint_div_mod(&gtp_num, &gtp_den, &gtp_a_next, &gtp_cf_rem);
+
+        bigint_mul(&gtp_tmp, &gtp_a_next, &gtp_p0);
+        bigint_add(&gtp_p_new, &gtp_tmp, &gtp_pm1);
+        bigint_mul(&gtp_tmp, &gtp_a_next, &gtp_q0);
+        bigint_add(&gtp_q_new, &gtp_tmp, &gtp_qm1);
+
+        bigint_copy(&gtp_pm1, &gtp_p0);
+        bigint_copy(&gtp_qm1, &gtp_q0);
+        bigint_copy(&gtp_p0, &gtp_p_new);
+        bigint_copy(&gtp_q0, &gtp_q_new);
     }
 
     /* Try F itself and small multiples */
-    {
-        BigInt m2, m3;
-        bigint_set_u64(&m2, 2);
-        bigint_set_u64(&m3, 3);
-        BigInt f2, f3;
-        bigint_mul(&f2, freq, &m2);
-        bigint_mul(&f3, freq, &m3);
-        if (try_period(freq, a_val, N, factor_p, factor_q)) return 1;
-        if (try_period(&f2, a_val, N, factor_p, factor_q)) return 1;
-        if (try_period(&f3, a_val, N, factor_p, factor_q)) return 1;
-    }
+    bigint_mul(&gtp_f2, freq, &gtp_m2);
+    bigint_mul(&gtp_f3, freq, &gtp_m3);
+    if (try_period(freq, a_val, N, factor_p, factor_q)) return 1;
+    if (try_period(&gtp_f2, a_val, N, factor_p, factor_q)) return 1;
+    if (try_period(&gtp_f3, a_val, N, factor_p, factor_q)) return 1;
 
     return 0;
 }
+
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * LLL LATTICE PERIOD RECOVERY  (ground-up, integer basis)
@@ -1427,8 +1432,9 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     /* ── Multi-Start BP: 5 random seeds, select lowest entropy basin ── */
     #define N_STARTS 5
     double best_entropy = 1e30;
-    double best_dressed_re[n_sites][6];
-    double best_dressed_im[n_sites][6];
+    /* Heap-allocate to prevent stack overflow with large N (n_sites can reach ~4800) */
+    double (*best_dressed_re)[6] = (double(*)[6])calloc(n_sites, sizeof(double[6]));
+    double (*best_dressed_im)[6] = (double(*)[6])calloc(n_sites, sizeof(double[6]));
 
     for (int start = 0; start < N_STARTS; start++) {
         z6_complex_amplitude_bp(mobius, (unsigned int)start);
@@ -1475,7 +1481,8 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     printf("      BP converged in %.3f sec\n", (double)(t_bp_end - t_bp_start) / CLOCKS_PER_SEC);
 
     /* Precompute marginal probabilities for all sites to serve as our quantum wave function */
-    double marginals[n_sites_raw][6];
+    /* Heap-allocate marginals (n_sites_raw can reach 1600) */
+    double (*marginals)[6] = (double(*)[6])calloc(n_sites_raw, sizeof(double[6]));
     for (int blk = 0; blk < n_blocks; blk++) {
         for (int offset = 0; offset <= 1; offset++) {
             int scale = 2 * blk + offset;
@@ -1528,6 +1535,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                                      N, a_val, factor_p, factor_q);
     if (success) {
         printf("\n  ★ LLL PERIOD RECOVERY SUCCEEDED ★\n");
+        free(best_dressed_re); free(best_dressed_im); free(marginals);
         return 1;
     }
 
@@ -1642,6 +1650,9 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     }
 
     free(p6_cache);
+    free(best_dressed_re);
+    free(best_dressed_im);
+    free(marginals);
     return success;
 }
 
