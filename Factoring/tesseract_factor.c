@@ -111,9 +111,7 @@ static int generate_and_try_periods(const BigInt *freq, const BigInt *reg_size,
 
     if (bigint_is_zero(freq)) return 0;
 
-    char f_str[1300];
-    bigint_to_decimal(f_str, sizeof(f_str), freq);
-    printf("  Composite frequency F = %s\n", f_str);
+    /* frequency print silenced — fires every MCMC shot, floods output */
 
     /* r = R / F (direct division) */
     {
@@ -224,6 +222,377 @@ static int generate_and_try_periods(const BigInt *freq, const BigInt *reg_size,
 
     return 0;
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * LLL LATTICE PERIOD RECOVERY  (ground-up, integer basis)
+ *
+ * Problem:  K frequency measurements, each F_i ≈ s_i * R / r.
+ * Recover the true period r.
+ *
+ * Lattice (dim = K+1, all-integer):
+ *   Row 0   :  [fh_0, fh_1, ..., fh_{K-1}, 1]   fh_i = round(F_i*W/R)
+ *   Row i>0 :  [0, ..., W (at col i-1), ..., 0]
+ *   W = 2^LLL_W_BITS
+ *
+ * A short vector satisfies v[j] = r*fh_j - s_j*W ≈ W*(r*F_j/R - s_j) ≈ 0
+ * and v[LLL_K] = ±r.  Reading |v[LLL_K]| from each reduced row gives r.
+ *
+ * Integer basis stays exact throughout; only Gram–Schmidt quantities
+ * are held in double (used solely to decide size-reduction quotients and
+ * the Lovász swap — both only need word-size precision).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#define LLL_K       12              /* frequency samples to collect            */
+#define LLL_DIM     (LLL_K + 1)     /* lattice dimension                       */
+#define LLL_W_BITS  24              /* W = 2^24: products ≤ 13*(2^24)^2<2^52  */
+#define LLL_DELTA   0.75            /* Lovász δ                                */
+
+/* fhat_i = round(F * 2^LLL_W_BITS / R), clamped to [0, W).                  *
+ * Uses GMP directly (F and R are BigInts, possibly thousands of bits).        */
+static long long lll_fhat(const BigInt *F, const BigInt *R)
+{
+    const long long W = 1LL << LLL_W_BITS;
+    BigInt scaled, quot, rem;
+    bigint_copy(&scaled, F);
+    mpz_mul_2exp(scaled.z, scaled.z, LLL_W_BITS);   /* scaled = F << LLL_W_BITS */
+    bigint_div_mod(&scaled, R, &quot, &rem);
+    /* quot = floor(F * W / R); add 1 if remainder >= R/2 (round) */
+    BigInt half_R, two_rem;
+    bigint_copy(&half_R, R);  mpz_fdiv_q_2exp(half_R.z, half_R.z, 1);
+    bigint_copy(&two_rem, &rem); mpz_mul_2exp(two_rem.z, two_rem.z, 1);
+    if (mpz_cmp(two_rem.z, R->z) >= 0) {
+        BigInt q1, one_bi; bigint_set_u64(&one_bi, 1);
+        bigint_add(&q1, &quot, &one_bi);
+        bigint_copy(&quot, &q1);
+    }
+    long long q = 0;
+    if (mpz_fits_ulong_p(quot.z)) q = (long long)mpz_get_ui(quot.z);
+    if (q < 0)    q = 0;
+    if (q >= W)   q = W - 1;
+    return q;
+}
+
+/* Recompute Gram–Schmidt from row `from` to LLL_DIM-1.
+ * B is the integer basis (long long, never modified here).
+ * Bs[i] holds the i-th GS vector as doubles; Bsq[i] = ||Bs[i]||^2.         */
+static void lll_gs(int from,
+                   long long B[LLL_DIM][LLL_DIM],
+                   double    Bs[LLL_DIM][LLL_DIM],
+                   double    Bsq[LLL_DIM])
+{
+    for (int i = from; i < LLL_DIM; i++) {
+        /* b*_i = b_i */
+        for (int l = 0; l < LLL_DIM; l++) Bs[i][l] = (double)B[i][l];
+        /* subtract projections onto all earlier b*_j */
+        for (int j = 0; j < i; j++) {
+            if (Bsq[j] < 1e-30) continue;
+            double mu = 0.0;
+            for (int l = 0; l < LLL_DIM; l++) mu += (double)B[i][l] * Bs[j][l];
+            mu /= Bsq[j];
+            for (int l = 0; l < LLL_DIM; l++) Bs[i][l] -= mu * Bs[j][l];
+        }
+        double sq = 0.0;
+        for (int l = 0; l < LLL_DIM; l++) sq += Bs[i][l] * Bs[i][l];
+        Bsq[i] = (sq < 1e-30) ? 1e-30 : sq;
+    }
+}
+
+/* mu_{k,j} = <B[k], Bs[j]> / Bsq[j]  (GS coefficient)                      */
+static double lll_mu(int k, int j,
+                     long long B[LLL_DIM][LLL_DIM],
+                     double    Bs[LLL_DIM][LLL_DIM],
+                     double    Bsq[LLL_DIM])
+{
+    if (Bsq[j] < 1e-30) return 0.0;
+    double d = 0.0;
+    for (int l = 0; l < LLL_DIM; l++) d += (double)B[k][l] * Bs[j][l];
+    return d / Bsq[j];
+}
+
+/* In-place LLL reduction of the integer basis B.
+ * After return the rows form an LLL-reduced basis (δ = LLL_DELTA).           */
+static void lll_reduce_basis(long long B[LLL_DIM][LLL_DIM])
+{
+    double Bs[LLL_DIM][LLL_DIM], Bsq[LLL_DIM];
+    lll_gs(0, B, Bs, Bsq);
+
+    int k = 1;
+    int guard = 0;
+    const int MAX_ITER = 200 * LLL_DIM * LLL_DIM;
+
+    while (k < LLL_DIM && guard++ < MAX_ITER) {
+
+        /* Size-reduction: walk j from k-1 down to 0 */
+        for (int j = k - 1; j >= 0; j--) {
+            double mu = lll_mu(k, j, B, Bs, Bsq);
+            if (fabs(mu) <= 0.5) continue;
+            long long q = (long long)round(mu);
+            for (int l = 0; l < LLL_DIM; l++) B[k][l] -= q * B[j][l];
+            /* Recompute GS from k (rows 0..k-1 unchanged) */
+            lll_gs(k, B, Bs, Bsq);
+        }
+
+        /* Lovász condition: ||b*_k||^2 >= (δ - μ_{k,k-1}^2) ||b*_{k-1}||^2  */
+        double mu_k = lll_mu(k, k-1, B, Bs, Bsq);
+        if (Bsq[k] >= (LLL_DELTA - mu_k * mu_k) * Bsq[k-1]) {
+            k++;
+        } else {
+            /* Swap rows k and k-1 */
+            for (int l = 0; l < LLL_DIM; l++) {
+                long long t = B[k][l]; B[k][l] = B[k-1][l]; B[k-1][l] = t;
+            }
+            /* Only need to recompute from k-1 */
+            lll_gs(k > 1 ? k-1 : 0, B, Bs, Bsq);
+            if (k > 1) k--;
+        }
+    }
+}
+
+/* Collect LLL_K frequency BigInts from the BP marginal distribution.
+ *
+ *   sample 0        : argmax at every position (most-likely string)
+ *   samples 1..K-1  : independently sample each position from its marginal
+ *                     CDF, using a different random seed per sample so each
+ *                     explores a different harmonic bin.
+ *
+ * Having diverse samples is critical: single-digit-flip perturbations all
+ * produce near-identical frequencies whose GCD / CF give nothing new.      */
+static void lll_collect_freqs(int n, double (*marg)[6],
+                               const BigInt *b6, BigInt out[LLL_K])
+{
+    /* Diagnostic: show confidence at first few positions */
+    printf("  [freq] marginal peak confidence at pos 0..4:");
+    for (int s = 0; s < 5 && s < n; s++) {
+        double mp = 0.0;
+        for (int d = 0; d < 6; d++) if (marg[s][d] > mp) mp = marg[s][d];
+        printf(" %.3f", mp);
+    }
+    printf("\n");
+
+    /* argmax digit at every position */
+    int best1[1600];
+    for (int s = 0; s < n; s++) {
+        double m1 = -1.0; int d1 = 0;
+        for (int d = 0; d < 6; d++)
+            if (marg[s][d] > m1) { m1 = marg[s][d]; d1 = d; }
+        best1[s] = d1;
+    }
+
+    /* Simple deterministic hash for reproducible per-sample randomness */
+    /* seed_k gives a different sequence for each sample index k */
+    for (int k = 0; k < LLL_K; k++) {
+        int digits[1600];
+        if (k == 0) {
+            /* Sample 0: pure argmax */
+            for (int s = 0; s < n; s++) digits[s] = best1[s];
+        } else {
+            /* Samples 1..K-1: independently sample each position from CDF.
+             * Use a linear-congruential hash of (k, s) as the "random" draw. */
+            unsigned int state = (unsigned int)(k * 2654435761u);
+            for (int s = 0; s < n; s++) {
+                state = state * 1664525u + 1013904223u;
+                double r = (state >> 8) / (double)(1u << 24); /* [0,1) */
+                double cdf = 0.0;
+                int chosen = 0;
+                for (int d = 0; d < 6; d++) {
+                    cdf += marg[s][d];
+                    if (r < cdf) { chosen = d; break; }
+                    chosen = d;
+                }
+                digits[s] = chosen;
+            }
+        }
+
+        /* Build BigInt from digits (LSB first) */
+        BigInt freq, p6;
+        bigint_set_u64(&freq, 0);
+        bigint_set_u64(&p6, 1);
+        for (int s = 0; s < n; s++) {
+            BigInt d_bi, term, tmp_bi;
+            bigint_set_u64(&d_bi, (uint64_t)digits[s]);
+            bigint_mul(&term, &d_bi, &p6);
+            bigint_add(&tmp_bi, &freq, &term);
+            bigint_copy(&freq, &tmp_bi);
+            BigInt np; bigint_mul(&np, &p6, b6);
+            bigint_copy(&p6, &np);
+        }
+        bigint_copy(&out[k], &freq);
+    }
+}
+
+
+/* Top-level period recovery — four strategies, ordered by reliability.
+ *
+ * Strategy 1 — CF on targeted samples:
+ *   Run generate_and_try_periods() on each of the K carefully-chosen
+ *   frequency strings.  This is the most direct path and works whenever
+ *   any sample lands on (or near) the true harmonic peak.
+ *
+ * Strategy 2 — Raw-frequency GCD:
+ *   If F_i = s_i * F* (different harmonics), then gcd(F_0,...,F_{K-1}) → F*.
+ *   Then r = R / F*. Works when samples span multiple distinct harmonics.
+ *
+ * Strategy 3 — LCM of period estimates:
+ *   Each R/F_i ≈ r/s_i. Their LCM converges toward r as more samples arrive.
+ *
+ * Strategy 4 — LLL lattice (W = 2^LLL_W_BITS):
+ *   Valid only when the true period r < W = 2^24 ≈ 16M.
+ *   For larger r the short-vector is longer than the W-norm rows; skipped.
+ *
+ * Returns 1 and writes factor_p/q on success, 0 otherwise.                  */
+static int lll_recover_period(int n_sites_raw, double (*marg)[6],
+                               const BigInt *b6, const BigInt *reg_sz,
+                               const BigInt *N,  const BigInt *a_val,
+                               BigInt *factor_p, BigInt *factor_q)
+{
+    printf("\n  ═══ MULTI-STRATEGY PERIOD RECOVERY ═══\n");
+
+    BigInt freqs[LLL_K];
+    for (int i = 0; i < LLL_K; i++) bigint_clear(&freqs[i]);
+    lll_collect_freqs(n_sites_raw, marg, b6, freqs);
+
+    int found = 0;
+    BigInt one_bi; bigint_set_u64(&one_bi, 1);
+
+    /* ── Strategy 1: CF (continued-fraction) on each targeted sample ───────
+     * Most direct: each frequency string is a candidate harmonic measurement.
+     * generate_and_try_periods() runs CF + harmonic fan on it.              */
+    printf("  [S1] CF on %d targeted frequency samples...\n", LLL_K);
+    for (int i = 0; i < LLL_K && !found; i++) {
+        if (bigint_is_zero(&freqs[i])) continue;
+        found = generate_and_try_periods(&freqs[i], reg_sz, a_val, N,
+                                         factor_p, factor_q);
+        if (found) printf("  [S1] Hit on sample %d\n", i);
+    }
+
+    /* ── Strategy 2: GCD of raw frequencies → base frequency F* ────────────
+     * F_i = s_i * F*  (different harmonics)  ⟹  gcd(F_i) = F* * gcd(s_i)
+     * As gcd(s_i) → 1 across coprime pairs, gcd(F_i) → F*.
+     * Period r = R / F*.                                                    */
+    if (!found) {
+        printf("  [S2] Running GCD of raw frequencies...\n");
+        BigInt gcd_f; bigint_set_u64(&gcd_f, 0);
+        for (int i = 0; i < LLL_K; i++) {
+            if (bigint_is_zero(&freqs[i])) continue;
+            if (bigint_is_zero(&gcd_f)) {
+                bigint_copy(&gcd_f, &freqs[i]);
+            } else {
+                BigInt g; bigint_gcd(&g, &gcd_f, &freqs[i]);
+                if (!bigint_is_zero(&g)) bigint_copy(&gcd_f, &g);
+            }
+            /* Try r = R / gcd_f at each step as gcd narrows */
+            if (bigint_cmp(&gcd_f, &one_bi) > 0) {
+                BigInt r_cand, rem;
+                bigint_div_mod(reg_sz, &gcd_f, &r_cand, &rem);
+                if (bigint_cmp(&r_cand, &one_bi) > 0 && bigint_cmp(&r_cand, N) < 0) {
+                    if (try_period(&r_cand, a_val, N, factor_p, factor_q)) {
+                        found = 1; printf("  [S2] r = R/gcd hit\n"); break;
+                    }
+                    /* Harmonic multiples */
+                    for (int m = 2; m <= 8 && !found; m++) {
+                        BigInt km, rk; bigint_set_u64(&km, (uint64_t)m);
+                        bigint_mul(&rk, &r_cand, &km);
+                        if (bigint_cmp(&rk, N) < 0)
+                            if (try_period(&rk, a_val, N, factor_p, factor_q)) {
+                                found = 1; printf("  [S2] %d*r hit\n", m);
+                            }
+                    }
+                }
+                /* Also try gcd_f itself as a period candidate */
+                if (!found && bigint_cmp(&gcd_f, N) < 0)
+                    if (try_period(&gcd_f, a_val, N, factor_p, factor_q)) {
+                        found = 1; printf("  [S2] gcd_f direct hit\n");
+                    }
+            }
+        }
+    }
+
+    /* ── Strategy 3: LCM of R/F_i period estimates ──────────────────────────
+     * R/F_i ≈ r/s_i.  LCM accumulates toward lcm(r/s_i) → r as harmonics
+     * span different prime factors of r.                                    */
+    if (!found) {
+        printf("  [S3] LCM of period estimates across %d samples...\n", LLL_K);
+        BigInt lcm_acc; bigint_set_u64(&lcm_acc, 1);
+        for (int i = 0; i < LLL_K && !found; i++) {
+            if (bigint_is_zero(&freqs[i])) continue;
+            BigInt r_i, rem_i;
+            bigint_div_mod(reg_sz, &freqs[i], &r_i, &rem_i);
+            if (bigint_is_zero(&r_i) || bigint_cmp(&r_i, &one_bi) <= 0) continue;
+            BigInt g, prod;
+            bigint_gcd(&g, &lcm_acc, &r_i);
+            bigint_mul(&prod, &lcm_acc, &r_i);
+            BigInt new_lcm, nr;
+            bigint_div_mod(&prod, &g, &new_lcm, &nr);
+            if (bigint_cmp(&new_lcm, N) < 0)
+                bigint_copy(&lcm_acc, &new_lcm);
+            else
+                bigint_set_u64(&lcm_acc, 1);
+            if (bigint_cmp(&lcm_acc, &one_bi) > 0)
+                if (try_period(&lcm_acc, a_val, N, factor_p, factor_q)) {
+                    found = 1; printf("  [S3] LCM hit after %d samples\n", i+1);
+                }
+        }
+    }
+
+    /* ── Strategy 4: LLL lattice short-vector (valid for r < 2^LLL_W_BITS) ─
+     * Builds (K+1)×(K+1) integer lattice.  The short vector has last
+     * coordinate ≈ ±r when r < W.  For larger r the W-norm trivial rows
+     * dominate and this produces no useful candidates — correctly noted.    */
+    if (!found) {
+        const long long W = 1LL << LLL_W_BITS;
+        printf("  [S4] LLL lattice (valid for r < 2^%d = %lld)...\n",
+               LLL_W_BITS, W);
+        printf("  fhat:");
+        for (int i = 0; i < LLL_K; i++) printf(" %lld", lll_fhat(&freqs[i], reg_sz));
+        printf("\n");
+
+        long long B[LLL_DIM][LLL_DIM];
+        memset(B, 0, sizeof B);
+        for (int j = 0; j < LLL_K; j++) B[0][j] = lll_fhat(&freqs[j], reg_sz);
+        B[0][LLL_K] = 1LL;
+        for (int i = 1; i <= LLL_K; i++) B[i][i-1] = W;
+
+        lll_reduce_basis(B);
+
+        /* Insertion-sort rows by L2 norm */
+        for (int i = 1; i < LLL_DIM; i++) {
+            double ni = 0.0;
+            for (int l = 0; l < LLL_DIM; l++) ni += (double)B[i][l]*(double)B[i][l];
+            long long tmp_row[LLL_DIM];
+            memcpy(tmp_row, B[i], LLL_DIM * sizeof(long long));
+            int j = i;
+            while (j > 0) {
+                double nj = 0.0;
+                for (int l = 0; l < LLL_DIM; l++) nj += (double)B[j-1][l]*(double)B[j-1][l];
+                if (nj <= ni) break;
+                memcpy(B[j], B[j-1], LLL_DIM * sizeof(long long));
+                j--;
+            }
+            memcpy(B[j], tmp_row, LLL_DIM * sizeof(long long));
+        }
+
+        for (int i = 0; i < LLL_DIM && !found; i++) {
+            long long v = B[i][LLL_K];
+            if (v < 0) v = -v;
+            if (v < 2 || v >= W) continue;   /* skip trivial or out-of-range */
+            BigInt r_cand; bigint_set_u64(&r_cand, (uint64_t)v);
+            if (bigint_cmp(&r_cand, N) >= 0) continue;
+            printf("  [S4 row %d] r candidate = %lld\n", i, v);
+            if (try_period(&r_cand, a_val, N, factor_p, factor_q)) { found = 1; break; }
+            for (int m = 2; m <= 8 && !found; m++) {
+                BigInt km, rk; bigint_set_u64(&km, (uint64_t)m);
+                bigint_mul(&rk, &r_cand, &km);
+                if (bigint_cmp(&rk, N) < 0)
+                    if (try_period(&rk, a_val, N, factor_p, factor_q)) found = 1;
+            }
+        }
+        if (!found) printf("  [S4] No viable candidates (r likely > W)\n");
+    }
+
+    for (int i = 0; i < LLL_K; i++) bigint_clear(&freqs[i]);
+    return found;
+}
+
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * HPC CONSTRAINT SATISFACTION FACTORING — Base-6 Hensel Lift
@@ -927,92 +1296,84 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
         bigint_copy(&reg_sz, &tmp);
     }
 
-    printf("\n  ═══ QUANTUM MONTE CARLO PERIOD EXTRACTION ═══\n");
-    int success = 0;
-    int num_shots = 1000000;
+    /* ── Phase 4: LLL lattice period recovery ─────────────────────────────── */
+    int success = lll_recover_period(n_sites_raw, marginals, &b6, &reg_sz,
+                                     N, a_val, factor_p, factor_q);
+    if (success) {
+        printf("\n  ★ LLL PERIOD RECOVERY SUCCEEDED ★\n");
+        return 1;
+    }
 
-    /* MCMC state: one digit per scale position, persisted across shots.
-     * Shot 1 seeds from argmax of marginals. Subsequent shots flip exactly
-     * one randomly chosen scale position to a new random digit (≠ current),
-     * ensuring the walk always explores fresh frequency strings. */
+    /* ── Phase 5: MCMC fallback (50 000 shots, marginal-biased flip) ────────
+     * Only reached if LLL found nothing — e.g. the noisy marginals give
+     * frequencies too uniformly distributed for the short-vector heuristic.  */
+    printf("\n  ═══ MCMC FALLBACK (50 000 shots) ═══\n");
+    const int num_shots = 50000;
     int mcmc_state[1600] = {0};
-
-    /* LCM accumulator: the true period r divides every valid R/F convergent.
-     * Collecting their LCM incrementally recovers r without hitting it directly. */
     BigInt global_lcm; bigint_set_u64(&global_lcm, 1);
 
-    for (int shot = 1; shot <= num_shots; shot++) {
-        BigInt freq;
-        bigint_set_u64(&freq, 0);
-        BigInt power_of_6;
-        bigint_set_u64(&power_of_6, 1);
+    for (int shot = 1; shot <= num_shots && !success; shot++) {
+        BigInt freq;      bigint_set_u64(&freq, 0);
+        BigInt power_of_6; bigint_set_u64(&power_of_6, 1);
 
         if (shot == 1) {
-            /* Seed: argmax of marginal distribution */
+            /* Seed: argmax of marginal at every position */
             for (int scale = 0; scale < n_sites_raw; scale++) {
-                double max_p = -1.0;
-                int best = 0;
-                for (int d = 0; d < 6; d++) {
-                    if (marginals[scale][d] > max_p) { max_p = marginals[scale][d]; best = d; }
-                }
+                double mp = -1.0; int best = 0;
+                for (int d = 0; d < 6; d++)
+                    if (marginals[scale][d] > mp) { mp = marginals[scale][d]; best = d; }
                 mcmc_state[scale] = best;
             }
         } else {
-            /* Flip exactly one position to a uniformly random different digit */
-            int flip = rand() % n_sites_raw;
-            mcmc_state[flip] = (mcmc_state[flip] + 1 + rand() % 5) % 6;
+            /* Flip one position, sample new digit from marginal distribution */
+            int flip  = rand() % n_sites_raw;
+            double rr = (double)rand() / RAND_MAX;
+            double cdf = 0.0;
+            int new_d = (mcmc_state[flip] + 1) % 6;  /* fallback */
+            for (int d = 0; d < 6; d++) {
+                cdf += marginals[flip][d];
+                if (rr <= cdf && d != mcmc_state[flip]) { new_d = d; break; }
+            }
+            mcmc_state[flip] = new_d;
         }
 
-        /* Build frequency from current MCMC state */
         for (int scale = 0; scale < n_sites_raw; scale++) {
             BigInt d_bi, term, tmp;
-            bigint_set_u64(&d_bi, mcmc_state[scale]);
+            bigint_set_u64(&d_bi, (uint64_t)mcmc_state[scale]);
             bigint_mul(&term, &d_bi, &power_of_6);
             bigint_add(&tmp, &freq, &term);
             bigint_copy(&freq, &tmp);
-
-            BigInt new_pow;
-            bigint_mul(&new_pow, &power_of_6, &b6);
-            bigint_copy(&power_of_6, &new_pow);
+            BigInt np; bigint_mul(&np, &power_of_6, &b6);
+            bigint_copy(&power_of_6, &np);
         }
 
         if (shot % 10000 == 0) {
-            printf("  [Shot %7d] Sweeping the multiversal timeline...\n", shot);
+            printf("  [Fallback shot %d]\n", shot);
             fflush(stdout);
         }
 
         success = generate_and_try_periods(&freq, &reg_sz, a_val, N, factor_p, factor_q);
-        if (success) {
-            printf("\n  [Shot %d] ★ THE OUROBOROS BITES ITS TAIL. FACTORS DISCOVERED! ★\n", shot);
-            break;
-        }
+        if (success) { printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★\n", shot); break; }
 
-        /* LCM cross-period correlator: accumulate R/F denominators.
-         * Every 50 shots, test whether global_lcm itself is the true period. */
+        /* Running-LCM correlator every 50 shots */
         if (!bigint_is_zero(&freq)) {
             BigInt r_cand, rem;
             bigint_div_mod(&reg_sz, &freq, &r_cand, &rem);
-            if (!bigint_is_zero(&r_cand) && bigint_cmp(&r_cand, N) < 0 &&
-                !bigint_is_zero(&r_cand)) {
+            BigInt one_fb; bigint_set_u64(&one_fb, 1);
+            if (!bigint_is_zero(&r_cand) && bigint_cmp(&r_cand, N) < 0
+                && bigint_cmp(&r_cand, &one_fb) > 0) {
                 BigInt gcd_v, prod;
                 bigint_gcd(&gcd_v, &global_lcm, &r_cand);
                 bigint_mul(&prod, &global_lcm, &r_cand);
                 BigInt new_lcm, lcm_rem;
                 bigint_div_mod(&prod, &gcd_v, &new_lcm, &lcm_rem);
-                /* Only keep if it hasn't grown past N (prevents runaway LCM) */
-                if (bigint_cmp(&new_lcm, N) < 0) {
-                    bigint_copy(&global_lcm, &new_lcm);
-                } else {
-                    bigint_set_u64(&global_lcm, 1); /* reset */
-                }
-
-                if (shot % 50 == 0) {
+                if (bigint_cmp(&new_lcm, N) < 0) bigint_copy(&global_lcm, &new_lcm);
+                else                              bigint_set_u64(&global_lcm, 1);
+                if (shot % 50 == 0)
                     if (try_period(&global_lcm, a_val, N, factor_p, factor_q)) {
                         success = 1;
-                        printf("\n  [Shot %d] ★ LCM CORRELATOR FOUND THE PERIOD! ★\n", shot);
-                        break;
+                        printf("\n  [Shot %d] ★ LCM CORRELATOR HIT ★\n", shot);
                     }
-                }
             }
         }
     }
