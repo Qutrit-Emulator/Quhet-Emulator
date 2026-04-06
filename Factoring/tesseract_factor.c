@@ -1411,8 +1411,8 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     int mcmc_state[1600] = {0};
     BigInt global_lcm; bigint_set_u64(&global_lcm, 1);
 
-    /* Precompute powers of 6 for O(1) MCMC delta updates */
-    BigInt p6_cache[n_sites_raw];
+    /* Heap-allocate p6_cache to prevent VLA BigInt leak */
+    BigInt *p6_cache = (BigInt*)calloc(n_sites_raw, sizeof(BigInt));
     BigInt current_p6; bigint_set_u64(&current_p6, 1);
     for (int i = 0; i < n_sites_raw; i++) {
         bigint_copy(&p6_cache[i], &current_p6);
@@ -1421,6 +1421,29 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     }
 
     BigInt freq; bigint_set_u64(&freq, 0);
+
+    /* Pre-allocate ALL temporaries used in the inner loop to avoid
+     * 300,000+ mpz_init/leak cycles that cause segfaults on re-entry */
+    BigInt mc_d_bi, mc_term, mc_tmp, mc_old_val, mc_new_val;
+    BigInt mc_old_d_bi, mc_new_d_bi, mc_tmp_freq, mc_diff;
+    BigInt mc_r_cand, mc_rem, mc_one_fb, mc_gcd_v, mc_prod;
+    BigInt mc_new_lcm, mc_lcm_rem;
+    bigint_set_u64(&mc_d_bi, 0);
+    bigint_set_u64(&mc_term, 0);
+    bigint_set_u64(&mc_tmp, 0);
+    bigint_set_u64(&mc_old_val, 0);
+    bigint_set_u64(&mc_new_val, 0);
+    bigint_set_u64(&mc_old_d_bi, 0);
+    bigint_set_u64(&mc_new_d_bi, 0);
+    bigint_set_u64(&mc_tmp_freq, 0);
+    bigint_set_u64(&mc_diff, 0);
+    bigint_set_u64(&mc_r_cand, 0);
+    bigint_set_u64(&mc_rem, 0);
+    bigint_set_u64(&mc_one_fb, 1);
+    bigint_set_u64(&mc_gcd_v, 0);
+    bigint_set_u64(&mc_prod, 0);
+    bigint_set_u64(&mc_new_lcm, 0);
+    bigint_set_u64(&mc_lcm_rem, 0);
 
     for (int shot = 1; shot <= num_shots && !success; shot++) {
         if (shot == 1) {
@@ -1431,11 +1454,10 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                     if (marginals[scale][d] > mp) { mp = marginals[scale][d]; best = d; }
                 mcmc_state[scale] = best;
                 
-                BigInt d_bi, term, tmp;
-                bigint_set_u64(&d_bi, (uint64_t)best);
-                bigint_mul(&term, &d_bi, &p6_cache[scale]);
-                bigint_add(&tmp, &freq, &term);
-                bigint_copy(&freq, &tmp);
+                bigint_set_u64(&mc_d_bi, (uint64_t)best);
+                bigint_mul(&mc_term, &mc_d_bi, &p6_cache[scale]);
+                bigint_add(&mc_tmp, &freq, &mc_term);
+                bigint_copy(&freq, &mc_tmp);
             }
         } else {
             /* Flip one position, sample new digit from marginal distribution */
@@ -1451,16 +1473,14 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             int old_d = mcmc_state[flip];
             if (old_d != new_d) {
                 /* O(1) delta update for frequency calculation */
-                BigInt diff, old_val, new_val;
-                BigInt old_d_bi; bigint_set_u64(&old_d_bi, (uint64_t)old_d);
-                BigInt new_d_bi; bigint_set_u64(&new_d_bi, (uint64_t)new_d);
+                bigint_set_u64(&mc_old_d_bi, (uint64_t)old_d);
+                bigint_set_u64(&mc_new_d_bi, (uint64_t)new_d);
                 
-                bigint_mul(&old_val, &old_d_bi, &p6_cache[flip]);
-                bigint_mul(&new_val, &new_d_bi, &p6_cache[flip]);
+                bigint_mul(&mc_old_val, &mc_old_d_bi, &p6_cache[flip]);
+                bigint_mul(&mc_new_val, &mc_new_d_bi, &p6_cache[flip]);
                 
-                BigInt tmp_freq;
-                bigint_sub(&tmp_freq, &freq, &old_val);
-                bigint_add(&freq, &tmp_freq, &new_val);
+                bigint_sub(&mc_tmp_freq, &freq, &mc_old_val);
+                bigint_add(&freq, &mc_tmp_freq, &mc_new_val);
                 
                 mcmc_state[flip] = new_d;
             }
@@ -1476,17 +1496,13 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
         /* Running-LCM correlator every 50 shots */
         if (!bigint_is_zero(&freq)) {
-            BigInt r_cand, rem;
-            bigint_div_mod(&reg_sz, &freq, &r_cand, &rem);
-            BigInt one_fb; bigint_set_u64(&one_fb, 1);
-            if (!bigint_is_zero(&r_cand) && bigint_cmp(&r_cand, N) < 0
-                && bigint_cmp(&r_cand, &one_fb) > 0) {
-                BigInt gcd_v, prod;
-                bigint_gcd(&gcd_v, &global_lcm, &r_cand);
-                bigint_mul(&prod, &global_lcm, &r_cand);
-                BigInt new_lcm, lcm_rem;
-                bigint_div_mod(&prod, &gcd_v, &new_lcm, &lcm_rem);
-                if (bigint_cmp(&new_lcm, N) < 0) bigint_copy(&global_lcm, &new_lcm);
+            bigint_div_mod(&reg_sz, &freq, &mc_r_cand, &mc_rem);
+            if (!bigint_is_zero(&mc_r_cand) && bigint_cmp(&mc_r_cand, N) < 0
+                && bigint_cmp(&mc_r_cand, &mc_one_fb) > 0) {
+                bigint_gcd(&mc_gcd_v, &global_lcm, &mc_r_cand);
+                bigint_mul(&mc_prod, &global_lcm, &mc_r_cand);
+                bigint_div_mod(&mc_prod, &mc_gcd_v, &mc_new_lcm, &mc_lcm_rem);
+                if (bigint_cmp(&mc_new_lcm, N) < 0) bigint_copy(&global_lcm, &mc_new_lcm);
                 else                              bigint_set_u64(&global_lcm, 1);
                 if (shot % 50 == 0)
                     if (try_period(&global_lcm, a_val, N, factor_p, factor_q)) {
@@ -1497,6 +1513,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
         }
     }
 
+    free(p6_cache);
     return success;
 }
 
