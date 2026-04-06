@@ -31,7 +31,7 @@ public:
 
 extern "C" {
 #else
-typedef struct BigInt BigInt;
+typedef struct BigInt { mpz_t z; } BigInt;
 #endif
 
 void bigint_clear(BigInt *a);
