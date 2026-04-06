@@ -350,13 +350,13 @@ static void lll_reduce_basis(long long B[LLL_DIM][LLL_DIM])
 
 /* Collect LLL_K frequency BigInts from the BP marginal distribution.
  *
- *   sample 0        : argmax at every position (most-likely string)
- *   samples 1..K-1  : independently sample each position from its marginal
- *                     CDF, using a different random seed per sample so each
- *                     explores a different harmonic bin.
+ *   Uses a Deterministic Beam Search (Viterbi-style extraction) to find
+ *   the exact Top-K most mathematically probable globally-optimal frequency
+ *   strings across the entire N-site configuration.
  *
- * Having diverse samples is critical: single-digit-flip perturbations all
- * produce near-identical frequencies whose GCD / CF give nothing new.      */
+ * This dramatically enhances composite frequency accuracy over CDF sampling
+ * by ensuring the globally most-likely candidate signals (even 2nd/3rd best
+ * over multi-digit correlations) are the exact ones swept by the fan.      */
 static void lll_collect_freqs(int n, double (*marg)[6],
                                const BigInt *b6, BigInt out[LLL_K])
 {
@@ -369,47 +369,97 @@ static void lll_collect_freqs(int n, double (*marg)[6],
     }
     printf("\n");
 
-    /* argmax digit at every position */
-    int best1[1600];
+    /* Precompute log-probabilities to avoid underflow */
+    double log_marg[1600][6];
     for (int s = 0; s < n; s++) {
-        double m1 = -1.0; int d1 = 0;
-        for (int d = 0; d < 6; d++)
-            if (marg[s][d] > m1) { m1 = marg[s][d]; d1 = d; }
-        best1[s] = d1;
+        for (int d = 0; d < 6; d++) {
+            double p = marg[s][d];
+            log_marg[s][d] = (p > 1e-15) ? log(p) : -100.0;
+        }
     }
 
-    /* Simple deterministic hash for reproducible per-sample randomness */
-    /* seed_k gives a different sequence for each sample index k */
-    for (int k = 0; k < LLL_K; k++) {
-        int digits[1600];
-        if (k == 0) {
-            /* Sample 0: pure argmax */
-            for (int s = 0; s < n; s++) digits[s] = best1[s];
-        } else {
-            /* Samples 1..K-1: independently sample each position from CDF.
-             * Use a linear-congruential hash of (k, s) as the "random" draw. */
-            unsigned int state = (unsigned int)(k * 2654435761u);
-            for (int s = 0; s < n; s++) {
-                state = state * 1664525u + 1013904223u;
-                double r = (state >> 8) / (double)(1u << 24); /* [0,1) */
-                double cdf = 0.0;
-                int chosen = 0;
-                for (int d = 0; d < 6; d++) {
-                    cdf += marg[s][d];
-                    if (r < cdf) { chosen = d; break; }
-                    chosen = d;
-                }
-                digits[s] = chosen;
+    int num_beams = 1;
+    double beam_log_probs[LLL_K] = {0.0};
+    
+    /* Backtracking tree to completely eliminate array memcpy thrashing */
+    int beam_history_parent[1600][LLL_K] = {0};
+    int beam_history_digit[1600][LLL_K] = {0};
+
+    for (int s = 0; s < n; s++) {
+        double next_log_probs[LLL_K * 6];
+        int next_parent[LLL_K * 6];
+        int next_digit[LLL_K * 6];
+        int next_count = 0;
+
+        for (int b = 0; b < num_beams; b++) {
+            for (int d = 0; d < 6; d++) {
+                next_log_probs[next_count] = beam_log_probs[b] + log_marg[s][d];
+                next_parent[next_count] = b;
+                next_digit[next_count] = d;
+                next_count++;
             }
         }
 
-        /* Build BigInt from digits (LSB first) */
+        /* Select exact top-K */
+        int top_indices[LLL_K];
+        int top_count = (next_count < LLL_K) ? next_count : LLL_K;
+
+        for (int k = 0; k < top_count; k++) {
+            int best_idx = -1;
+            double best_lp = -1e9;
+            for (int i = 0; i < next_count; i++) {
+                if (next_log_probs[i] > best_lp) {
+                    best_lp = next_log_probs[i];
+                    best_idx = i;
+                }
+            }
+            top_indices[k] = best_idx;
+            next_log_probs[best_idx] = -2e9; /* poison */
+        }
+
+        double new_beam_log_probs[LLL_K];
+
+        for (int k = 0; k < top_count; k++) {
+            int idx = top_indices[k];
+            int p = next_parent[idx];
+            new_beam_log_probs[k] = beam_log_probs[p] + log_marg[s][next_digit[idx]];
+            beam_history_parent[s][k] = p;
+            beam_history_digit[s][k] = next_digit[idx];
+        }
+
+        num_beams = top_count;
+        for (int k = 0; k < num_beams; k++) {
+            beam_log_probs[k] = new_beam_log_probs[k];
+        }
+    }
+
+    printf("  [freq] top K relative log-probs:");
+    for (int k = 0; k < num_beams; k++) {
+        printf(" %.2f", beam_log_probs[k] - beam_log_probs[0]);
+    }
+    printf("\n");
+
+    /* Build BigInt from digits (LSB first) via backtracking */
+    for (int k = 0; k < LLL_K; k++) {
+        if (k >= num_beams) {
+            bigint_copy(&out[k], &out[0]);
+            continue;
+        }
+
+        /* Reconstruct digit sequence from backtracking tree */
+        int seq[1600];
+        int curr_beam = k;
+        for (int s = n - 1; s >= 0; s--) {
+            seq[s] = beam_history_digit[s][curr_beam];
+            curr_beam = beam_history_parent[s][curr_beam];
+        }
+
         BigInt freq, p6;
         bigint_set_u64(&freq, 0);
         bigint_set_u64(&p6, 1);
         for (int s = 0; s < n; s++) {
             BigInt d_bi, term, tmp_bi;
-            bigint_set_u64(&d_bi, (uint64_t)digits[s]);
+            bigint_set_u64(&d_bi, (uint64_t)seq[s]);
             bigint_mul(&term, &d_bi, &p6);
             bigint_add(&tmp_bi, &freq, &term);
             bigint_copy(&freq, &tmp_bi);
@@ -824,9 +874,9 @@ static int factor_hensel_base6(const BigInt *N, BigInt *factor_p, BigInt *factor
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * ARBITRARY-PRECISION MÖBIUS BELIEF PROPAGATION (2000-bit Fixed Point)
+ * ARBITRARY-PRECISION MÖBIUS BELIEF PROPAGATION (50k-bit Fixed Point)
  * ═══════════════════════════════════════════════════════════════════════════ */
-#define BFP_BITS 4500
+#define BFP_BITS 50000
 
 static inline void bfp_from_double(BigInt *out, double p) {
     bigint_clear(out);
@@ -1032,7 +1082,8 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     #define PHASE_CHUNKS 11
     #define CHUNK_BITS   48
 
-    BigInt val_k_A, val_k_B;
+    BigInt val_k_A, val_k_B, div_6_blk;
+    bigint_set_u64(&div_6_blk, 1);
     for (int blk = 0; blk < n_blocks; blk++) {
         int scale_A = 2 * blk;
         int scale_B = 2 * blk + 1;
@@ -1040,14 +1091,17 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
         if (blk == 0) {
             bigint_copy(&val_k_A, a_val);
             bigint_pow_mod(&val_k_B, &val_k_A, &b6, N);
+            bigint_set_u64(&div_6_blk, 1);
         } else {
             BigInt b36; bigint_set_u64(&b36, 36);
             BigInt next_A; bigint_pow_mod(&next_A, &val_k_A, &b36, N);
             bigint_copy(&val_k_A, &next_A);
             BigInt next_B; bigint_pow_mod(&next_B, &val_k_B, &b36, N);
             bigint_copy(&val_k_B, &next_B);
-        }
 
+            BigInt next_div; bigint_mul(&next_div, &div_6_blk, &b6);
+            bigint_copy(&div_6_blk, &next_div);
+        }
 
         /* ── GCD Cascade check ── */
         BigInt gcd_check, val_minus_1;
@@ -1096,15 +1150,10 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             /* Nested phase resolution: shift into the blk-th base-6 digit of the value.
              * This extracts (val / 6^blk) % 6, giving a unique phase per depth level
              * rather than all blocks collapsing to the same modulo-6 bucket. */
-            BigInt shift_div_A; bigint_copy(&shift_div_A, &powersA[d]);
-            BigInt shift_div_B; bigint_copy(&shift_div_B, &powersB[d]);
-            for (int si = 0; si < blk; si++) {
-                BigInt qt, rm;
-                bigint_div_mod(&shift_div_A, &b6_mod, &qt, &rm);
-                bigint_copy(&shift_div_A, &qt);
-                bigint_div_mod(&shift_div_B, &b6_mod, &qt, &rm);
-                bigint_copy(&shift_div_B, &qt);
-            }
+            BigInt shift_div_A, shift_div_B, dummy_rm;
+            bigint_div_mod(&powersA[d], &div_6_blk, &shift_div_A, &dummy_rm);
+            bigint_div_mod(&powersB[d], &div_6_blk, &shift_div_B, &dummy_rm);
+
             BigInt qA, qB, rA_mod, rB_mod;
             bigint_div_mod(&shift_div_A, &b6_mod, &qA, &rA_mod);
             bigint_div_mod(&shift_div_B, &b6_mod, &qB, &rB_mod);
@@ -1312,17 +1361,31 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     int mcmc_state[1600] = {0};
     BigInt global_lcm; bigint_set_u64(&global_lcm, 1);
 
-    for (int shot = 1; shot <= num_shots && !success; shot++) {
-        BigInt freq;      bigint_set_u64(&freq, 0);
-        BigInt power_of_6; bigint_set_u64(&power_of_6, 1);
+    /* Precompute powers of 6 for O(1) MCMC delta updates */
+    BigInt p6_cache[n_sites_raw];
+    BigInt current_p6; bigint_set_u64(&current_p6, 1);
+    for (int i = 0; i < n_sites_raw; i++) {
+        bigint_copy(&p6_cache[i], &current_p6);
+        BigInt next_p6; bigint_mul(&next_p6, &current_p6, &b6);
+        bigint_copy(&current_p6, &next_p6);
+    }
 
+    BigInt freq; bigint_set_u64(&freq, 0);
+
+    for (int shot = 1; shot <= num_shots && !success; shot++) {
         if (shot == 1) {
-            /* Seed: argmax of marginal at every position */
+            /* Seed: argmax of marginal at every position, initially build full freq */
             for (int scale = 0; scale < n_sites_raw; scale++) {
                 double mp = -1.0; int best = 0;
                 for (int d = 0; d < 6; d++)
                     if (marginals[scale][d] > mp) { mp = marginals[scale][d]; best = d; }
                 mcmc_state[scale] = best;
+                
+                BigInt d_bi, term, tmp;
+                bigint_set_u64(&d_bi, (uint64_t)best);
+                bigint_mul(&term, &d_bi, &p6_cache[scale]);
+                bigint_add(&tmp, &freq, &term);
+                bigint_copy(&freq, &tmp);
             }
         } else {
             /* Flip one position, sample new digit from marginal distribution */
@@ -1334,17 +1397,23 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 cdf += marginals[flip][d];
                 if (rr <= cdf && d != mcmc_state[flip]) { new_d = d; break; }
             }
-            mcmc_state[flip] = new_d;
-        }
-
-        for (int scale = 0; scale < n_sites_raw; scale++) {
-            BigInt d_bi, term, tmp;
-            bigint_set_u64(&d_bi, (uint64_t)mcmc_state[scale]);
-            bigint_mul(&term, &d_bi, &power_of_6);
-            bigint_add(&tmp, &freq, &term);
-            bigint_copy(&freq, &tmp);
-            BigInt np; bigint_mul(&np, &power_of_6, &b6);
-            bigint_copy(&power_of_6, &np);
+            
+            int old_d = mcmc_state[flip];
+            if (old_d != new_d) {
+                /* O(1) delta update for frequency calculation */
+                BigInt diff, old_val, new_val;
+                BigInt old_d_bi; bigint_set_u64(&old_d_bi, (uint64_t)old_d);
+                BigInt new_d_bi; bigint_set_u64(&new_d_bi, (uint64_t)new_d);
+                
+                bigint_mul(&old_val, &old_d_bi, &p6_cache[flip]);
+                bigint_mul(&new_val, &new_d_bi, &p6_cache[flip]);
+                
+                BigInt tmp_freq;
+                bigint_sub(&tmp_freq, &freq, &old_val);
+                bigint_add(&freq, &tmp_freq, &new_val);
+                
+                mcmc_state[flip] = new_d;
+            }
         }
 
         if (shot % 10000 == 0) {
