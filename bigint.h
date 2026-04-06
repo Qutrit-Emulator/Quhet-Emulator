@@ -8,9 +8,11 @@
 class BigInt {
 public:
     mpz_t z;
+    int _initialized;
     
     BigInt() {
         mpz_init(z);
+        _initialized = 0x600DB00B;
     }
     
     ~BigInt() {
@@ -19,6 +21,7 @@ public:
     
     BigInt(const BigInt& other) {
         mpz_init_set(z, other.z);
+        _initialized = 0x600DB00B;
     }
     
     BigInt& operator=(const BigInt& other) {
@@ -31,7 +34,7 @@ public:
 
 extern "C" {
 #else
-typedef struct BigInt { mpz_t z; } BigInt;
+typedef struct BigInt { mpz_t z; int _initialized; } BigInt;
 #endif
 
 void bigint_clear(BigInt *a);
