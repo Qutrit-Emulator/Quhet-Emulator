@@ -380,11 +380,12 @@ static void lll_collect_freqs(int n, double (*marg)[6],
     }
 
     int num_beams = 1;
-    double beam_log_probs[LLL_K] = {0.0};
+    double beam_log_probs[LLL_K];
+    memset(beam_log_probs, 0, sizeof(beam_log_probs));
     
-    /* Backtracking tree to completely eliminate array memcpy thrashing */
-    int beam_history_parent[1600][LLL_K] = {0};
-    int beam_history_digit[1600][LLL_K] = {0};
+    /* Heap-allocate beam history to prevent stack overflow at LLL_K=32 */
+    int (*beam_history_parent)[LLL_K] = (int(*)[LLL_K])calloc(1600, sizeof(int[LLL_K]));
+    int (*beam_history_digit)[LLL_K]  = (int(*)[LLL_K])calloc(1600, sizeof(int[LLL_K]));
 
     for (int s = 0; s < n; s++) {
         double next_log_probs[LLL_K * 6];
@@ -496,6 +497,8 @@ static void lll_collect_freqs(int n, double (*marg)[6],
         }
         bigint_copy(&out[k], &freq);
     }
+    free(beam_history_parent);
+    free(beam_history_digit);
 }
 
 
@@ -525,7 +528,7 @@ static int lll_recover_period(int n_sites_raw, double (*marg)[6],
 {
     printf("\n  ═══ MULTI-STRATEGY PERIOD RECOVERY ═══\n");
 
-    BigInt freqs[LLL_K];
+    BigInt *freqs = (BigInt*)calloc(LLL_K, sizeof(BigInt));
     for (int i = 0; i < LLL_K; i++) bigint_clear(&freqs[i]);
     lll_collect_freqs(n_sites_raw, marg, b6, freqs);
 
@@ -668,6 +671,7 @@ static int lll_recover_period(int n_sites_raw, double (*marg)[6],
     }
 
     for (int i = 0; i < LLL_K; i++) bigint_clear(&freqs[i]);
+    free(freqs);
     return found;
 }
 
