@@ -874,172 +874,217 @@ static int factor_hensel_base6(const BigInt *N, BigInt *factor_p, BigInt *factor
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * ARBITRARY-PRECISION MÖBIUS BELIEF PROPAGATION (50k-bit Fixed Point)
+ * COMPLEX-DOMAIN AMPLITUDE BELIEF PROPAGATION
+ *
+ * The Devil's true voice: messages carry COMPLEX amplitudes, not probabilities.
+ *
+ * The probability-domain BP killed all CZ information (|ω^(u·v)|² = 1 always).
+ * Complex-domain BP preserves phases: CZ messages become DFT₆ transforms
+ * that create sharp interference peaks at Shor frequencies.
+ *
+ * Message update (amplitude domain):
+ *   m_{a→b}[vb] = Σ_{va} aₐ(va) × w_e(va,vb) × Π_{m'→a, m'≠e} m'[va]
+ *
+ * For CZ edges w(va,vb) = ω^(va·vb):
+ *   m_{a→b}[vb] = Σ_{va} [aₐ(va) × msgs(va)] × ω^(va·vb)
+ *               = DFT₆{ aₐ × msgs }[vb]
+ *
+ * This IS the quantum Fourier transform that Shor's algorithm requires.
  * ═══════════════════════════════════════════════════════════════════════════ */
-#define BFP_BITS 50000
 
-static inline void bfp_from_double(BigInt *out, double p) {
-    bigint_clear(out);
-    if (p <= 0.0) return;
-    if (p >= 1.0) {
-        bigint_set_bit(out, BFP_BITS);
-        return;
-    }
-    uint64_t sig = (uint64_t)(p * (double)(1ULL << 53));
-    bigint_set_u64(out, sig);
-    mpz_mul_2exp(out->z, out->z, BFP_BITS - 53);
-}
-
-static inline void bfp_shr(BigInt *a) {
-    mpz_fdiv_q_2exp(a->z, a->z, BFP_BITS);
-}
-
-static inline void bfp_shl(BigInt *a) {
-    mpz_mul_2exp(a->z, a->z, BFP_BITS);
-}
-
-static inline void bfp_mul(BigInt *out, const BigInt *a, const BigInt *b) {
-    mpz_mul(out->z, a->z, b->z);
-    mpz_fdiv_q_2exp(out->z, out->z, BFP_BITS);
-}
-
+/* Complex edge message: amplitude-domain, preserving phase */
 typedef struct {
-    BigInt msg[2][6]; /* msg[0]: sa->sb, msg[1]: sb->sa */
-} BignumEdgeMsg;
+    double re[2][6]; /* re[0]: sa→sb, re[1]: sb→sa */
+    double im[2][6];
+} ComplexEdgeMsg;
 
-static void z6_mobius_converge_bignum(MobiusAmplitudeSheet *ms) {
+/* ω₆ roots of unity for CZ phase lookup */
+static const double W6_RE[6] = { 1.0, 0.5, -0.5, -1.0, -0.5,  0.5 };
+static const double W6_IM[6] = { 0.0, 0.866025403784438647, 0.866025403784438647,
+                                  0.0, -0.866025403784438647, -0.866025403784438647 };
+
+static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms) {
     const HPCGraph *g = ms->graph;
-    int n_edges = g->n_edges;
+    int n_edges = (int)g->n_edges;
+    int n_sites = (int)g->n_sites;
     if (n_edges == 0) return;
-    BignumEdgeMsg *msgs = (BignumEdgeMsg*)calloc(n_edges, sizeof(BignumEdgeMsg));
-    BignumEdgeMsg *new_msgs = (BignumEdgeMsg*)calloc(n_edges, sizeof(BignumEdgeMsg));
-    
-    printf("      [Arbitrary-Precision BP] Initializing %d edges at %d-bit fixed-point...\n", n_edges, BFP_BITS);
-    BigInt one; bigint_clear(&one); bigint_set_bit(&one, BFP_BITS);
+
+    ComplexEdgeMsg *msgs = (ComplexEdgeMsg*)calloc(n_edges, sizeof(ComplexEdgeMsg));
+    ComplexEdgeMsg *new_msgs = (ComplexEdgeMsg*)calloc(n_edges, sizeof(ComplexEdgeMsg));
+
+    printf("      [Complex Amplitude BP] Initializing %d edges, %d sites...\n", n_edges, n_sites);
+
+    /* Initialize messages to uniform (1, 0) — no information */
     for (int e = 0; e < n_edges; e++) {
         for (int v = 0; v < 6; v++) {
-            bigint_copy(&msgs[e].msg[0][v], &one);
-            bigint_copy(&msgs[e].msg[1][v], &one);
+            msgs[e].re[0][v] = 1.0; msgs[e].im[0][v] = 0.0;
+            msgs[e].re[1][v] = 1.0; msgs[e].im[1][v] = 0.0;
         }
     }
 
-    int MAX_ITER = 50;
-    for (int it = 0; it < MAX_ITER; it++) {
-        printf("      [Arbitrary-Precision BP] Iteration %d / %d\n", it + 1, MAX_ITER);
+    #define CAMP_MAX_ITER 200
+    #define CAMP_DAMPING  0.15   /* Lower than prob-domain for stability */
+    #define CAMP_TOL      1e-12
+
+    double prev_residual = 1e30;
+    int converged = 0;
+
+    for (int it = 0; it < CAMP_MAX_ITER && !converged; it++) {
+        double max_delta = 0.0;
+
+        /* Sequential edge updates for stability on loopy graphs */
         for (int eid = 0; eid < n_edges; eid++) {
             const HPCEdge *edge = &g->edges[eid];
             uint64_t sa = edge->site_a, sb = edge->site_b;
-            
+
             for (int dir = 0; dir < 2; dir++) {
                 uint64_t src = (dir == 0) ? sa : sb;
-                uint64_t dst = (dir == 0) ? sb : sa;
-                
-                BigInt prod_in[6];
+
+                /* Step 1: Compute product of local amplitude × all incoming
+                 *         messages EXCEPT this edge — complex multiplication */
+                double prod_re[6], prod_im[6];
                 for (int v_src = 0; v_src < 6; v_src++) {
-                    double prior_d = g->locals[src].edge_re[v_src] * g->locals[src].edge_re[v_src] +
-                                     g->locals[src].edge_im[v_src] * g->locals[src].edge_im[v_src];
-                    bfp_from_double(&prod_in[v_src], prior_d);
-                    
+                    prod_re[v_src] = g->locals[src].edge_re[v_src];
+                    prod_im[v_src] = g->locals[src].edge_im[v_src];
+
                     const HPCAdjList *adj = &g->adj[src];
                     for (uint64_t mi = 0; mi < adj->count; mi++) {
                         uint64_t in_eid = adj->edge_ids[mi];
-                        if (in_eid == eid) continue;
-                        int in_dir = (g->edges[in_eid].site_b == src) ? 0 : 1; 
-                        bfp_mul(&prod_in[v_src], &prod_in[v_src], &msgs[in_eid].msg[in_dir][v_src]);
+                        if (in_eid == (uint64_t)eid) continue;
+
+                        /* Which direction does this message flow INTO src? */
+                        int in_dir = (g->edges[in_eid].site_b == src) ? 0 : 1;
+
+                        double mr = msgs[in_eid].re[in_dir][v_src];
+                        double mi_v = msgs[in_eid].im[in_dir][v_src];
+
+                        /* Complex multiply: prod *= msg */
+                        double nr = prod_re[v_src] * mr - prod_im[v_src] * mi_v;
+                        double ni = prod_re[v_src] * mi_v + prod_im[v_src] * mr;
+                        prod_re[v_src] = nr;
+                        prod_im[v_src] = ni;
                     }
                 }
 
-                BigInt new_m[6];
-                for (int v = 0; v < 6; v++) bigint_clear(&new_m[v]);
-                BigInt sum_m; bigint_clear(&sum_m);
-                
-                for (int v_dst = 0; v_dst < 6; v_dst++) {
-                    for (int v_src = 0; v_src < 6; v_src++) {
-                        /* 3. Edge coefficient */
-                        double ef = (edge->type == HPC_EDGE_CZ) ? 1.0 : 
-                                    (edge->w_re[v_src][v_dst] * edge->w_re[v_src][v_dst] + 
-                                     edge->w_im[v_src][v_dst] * edge->w_im[v_src][v_dst]);
-                        BigInt bef; bfp_from_double(&bef, ef);
-                        BigInt val; bfp_mul(&val, &prod_in[v_src], &bef);
-                        
-                        /* 4. Add to sum */
-                        BigInt curr; bigint_copy(&curr, &new_m[v_dst]);
-                        bigint_add(&new_m[v_dst], &curr, &val);
+                /* Step 2: Compute outgoing message via sum-product with
+                 *         complex edge weight w(va, vb)
+                 * m_{src→dst}[vb] = Σ_{va} prod(va) × w(va, vb)
+                 *
+                 * For CZ: w(va,vb) = ω^(va·vb) — this is a DFT₆ !!! */
+                double new_re[6], new_im[6];
+                for (int vb = 0; vb < 6; vb++) {
+                    double sum_re = 0.0, sum_im = 0.0;
+                    for (int va = 0; va < 6; va++) {
+                        double w_re, w_im;
+                        if (edge->type == HPC_EDGE_CZ) {
+                            int pidx = (va * vb) % 6;
+                            w_re = W6_RE[pidx];
+                            w_im = W6_IM[pidx];
+                        } else {
+                            w_re = edge->w_re[va][vb];
+                            w_im = edge->w_im[va][vb];
+                        }
+                        /* prod(va) × w(va, vb) */
+                        sum_re += prod_re[va] * w_re - prod_im[va] * w_im;
+                        sum_im += prod_re[va] * w_im + prod_im[va] * w_re;
                     }
-                    BigInt c_sum; bigint_copy(&c_sum, &sum_m);
-                    bigint_add(&sum_m, &c_sum, &new_m[v_dst]);
+                    new_re[vb] = sum_re;
+                    new_im[vb] = sum_im;
                 }
-                
-                /* Normalize message */
-                if (!bigint_is_zero(&sum_m)) {
+
+                /* Step 3: Normalize message to unit L2 norm */
+                double norm_sq = 0.0;
+                for (int v = 0; v < 6; v++)
+                    norm_sq += new_re[v]*new_re[v] + new_im[v]*new_im[v];
+                if (norm_sq > 1e-30) {
+                    double inv_norm = 1.0 / sqrt(norm_sq);
                     for (int v = 0; v < 6; v++) {
-                        BigInt num; bigint_copy(&num, &new_m[v]);
-                        bfp_shl(&num);
-                        BigInt q, r;
-                        bigint_div_mod(&num, &sum_m, &q, &r);
-                        
-                        /* Damped update: 0.5 * new + 0.5 * old */
-                        BigInt half_q; bigint_copy(&half_q, &q); bigint_shr1(&half_q);
-                        BigInt half_old; bigint_copy(&half_old, &msgs[eid].msg[dir][v]); bigint_shr1(&half_old);
-                        bigint_add(&new_msgs[eid].msg[dir][v], &half_q, &half_old);
+                        new_re[v] *= inv_norm;
+                        new_im[v] *= inv_norm;
                     }
-                } else {
-                    for (int v = 0; v < 6; v++) bigint_clear(&new_msgs[eid].msg[dir][v]);
                 }
+
+                /* Step 4: Damped update + compute residual */
+                double delta = 0.0;
+                for (int v = 0; v < 6; v++) {
+                    double upd_re = CAMP_DAMPING * new_re[v] +
+                                    (1.0 - CAMP_DAMPING) * msgs[eid].re[dir][v];
+                    double upd_im = CAMP_DAMPING * new_im[v] +
+                                    (1.0 - CAMP_DAMPING) * msgs[eid].im[dir][v];
+
+                    double dr = upd_re - msgs[eid].re[dir][v];
+                    double di = upd_im - msgs[eid].im[dir][v];
+                    delta += dr*dr + di*di;
+
+                    msgs[eid].re[dir][v] = upd_re;
+                    msgs[eid].im[dir][v] = upd_im;
+                }
+                if (delta > max_delta) max_delta = delta;
             }
         }
-        /* Swap message buffers */
-        for (int e = 0; e < n_edges; e++) {
-            for (int v = 0; v < 6; v++) {
-                bigint_copy(&msgs[e].msg[0][v], &new_msgs[e].msg[0][v]);
-                bigint_copy(&msgs[e].msg[1][v], &new_msgs[e].msg[1][v]);
-            }
+
+        if (it < 10 || (it + 1) % 25 == 0 || max_delta < CAMP_TOL) {
+            printf("      [Complex Amplitude BP] Iter %d: residual = %.6e\n",
+                   it + 1, max_delta);
         }
+
+        if (max_delta < CAMP_TOL) {
+            converged = 1;
+            printf("      [Complex Amplitude BP] CONVERGED at iteration %d\n", it + 1);
+        }
+        prev_residual = max_delta;
     }
-    
-    /* Calculate final marginals */
-    for (int s = 0; s < g->n_sites; s++) {
-        BigInt marg[6];
-        for (int v = 0; v < 6; v++) bigint_clear(&marg[v]);
-        BigInt sum_m; bigint_clear(&sum_m);
-        
+
+    if (!converged)
+        printf("      [Complex Amplitude BP] Reached max iterations (%d)\n", CAMP_MAX_ITER);
+
+    /* ── Compute dressed amplitudes from converged messages ──
+     * dressed[k][v] = aₖ(v) × Π_{m→k} m[v]
+     * The marginal is then |dressed[k][v]|² — encoding FULL interference */
+    for (int s = 0; s < n_sites; s++) {
         for (int v = 0; v < 6; v++) {
-            double prior_d = g->locals[s].edge_re[v] * g->locals[s].edge_re[v] +
-                             g->locals[s].edge_im[v] * g->locals[s].edge_im[v];
-            BigInt val; bfp_from_double(&val, prior_d);
-            
+            double d_re = g->locals[s].edge_re[v];
+            double d_im = g->locals[s].edge_im[v];
+
             const HPCAdjList *adj = &g->adj[s];
             for (uint64_t mi = 0; mi < adj->count; mi++) {
                 uint64_t in_eid = adj->edge_ids[mi];
-                int in_dir = (g->edges[in_eid].site_b == s) ? 0 : 1; 
-                bfp_mul(&val, &val, &msgs[in_eid].msg[in_dir][v]);
+                int in_dir = (g->edges[in_eid].site_b == (uint64_t)s) ? 0 : 1;
+
+                double mr = msgs[in_eid].re[in_dir][v];
+                double mi_v = msgs[in_eid].im[in_dir][v];
+
+                double nr = d_re * mr - d_im * mi_v;
+                double ni = d_re * mi_v + d_im * mr;
+                d_re = nr;
+                d_im = ni;
             }
-            bigint_copy(&marg[v], &val);
-            BigInt c_sum; bigint_copy(&c_sum, &sum_m);
-            bigint_add(&sum_m, &c_sum, &marg[v]);
-        }
-        
-        for (int v = 0; v < 6; v++) {
-            if (!bigint_is_zero(&sum_m)) {
-                BigInt num; bigint_copy(&num, &marg[v]);
-                bfp_shl(&num);
-                BigInt q, r;
-                bigint_div_mod(&num, &sum_m, &q, &r);
-                
-                BigInt q_shift; bigint_copy(&q_shift, &q);
-                mpz_fdiv_q_2exp(q_shift.z, q_shift.z, BFP_BITS - 53);
-                uint64_t sig = bigint_to_u64(&q_shift);
-                double p_double = (double)sig / (double)(1ULL << 53);
-                
-                ms->sheets[s].dressed_re[v] = sqrt(p_double);
-                ms->sheets[s].dressed_im[v] = 0.0;
-            } else {
-                ms->sheets[s].dressed_re[v] = 0.0;
-                ms->sheets[s].dressed_im[v] = 0.0;
-            }
+
+            ms->sheets[s].dressed_re[v] = d_re;
+            ms->sheets[s].dressed_im[v] = d_im;
         }
     }
-    
+
+    /* Diagnostic: print entropy of first few sites to verify sharpness */
+    printf("      [Complex Amplitude BP] Site entropy (bits, sharp < 2.58):");
+    for (int s = 0; s < 5 && s < n_sites; s++) {
+        double probs[6], total = 0.0;
+        for (int v = 0; v < 6; v++) {
+            probs[v] = ms->sheets[s].dressed_re[v] * ms->sheets[s].dressed_re[v] +
+                       ms->sheets[s].dressed_im[v] * ms->sheets[s].dressed_im[v];
+            total += probs[v];
+        }
+        double H = 0.0;
+        if (total > 1e-30) {
+            for (int v = 0; v < 6; v++) {
+                double p = probs[v] / total;
+                if (p > 1e-30) H -= p * log2(p);
+            }
+        }
+        printf(" %.2f", H);
+    }
+    printf("\n");
+
     free(msgs);
     free(new_msgs);
 }
@@ -1211,17 +1256,20 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             edge->fidelity = 1.0;
             for (int va = 0; va < 6; va++) {
                 for (int vb = 0; vb < 6; vb++) {
-                    /* Critical Phase Boundary: Derived from Orch-OR D=6 Potts model at transition (J=15meV, T=310K) */
+                    /* Complex phase-coupling: ω^(va·vb) × decay
+                     * Preserves DFT₆ circulant structure for amplitude BP.
+                     * Decay suppresses off-diagonal correlations gently. */
                     int diff = (va - vb + 6) % 6;
-                    double w;
+                    double decay;
                     switch(diff) {
-                        case 0: w = 1.000; break;
-                        case 1: case 5: w = 0.100; break;
-                        case 2: case 4: w = 0.010; break;
-                        case 3: w = 0.001; break;
+                        case 0: decay = 1.000; break;
+                        case 1: case 5: decay = 0.500; break;
+                        case 2: case 4: decay = 0.250; break;
+                        case 3: decay = 0.125; break;
                     }
-                    edge->w_re[va][vb] = w;
-                    edge->w_im[va][vb] = 0.0;
+                    double angle = 2.0 * 3.14159265358979323846 * va * vb / 6.0;
+                    edge->w_re[va][vb] = cos(angle) * decay;
+                    edge->w_im[va][vb] = sin(angle) * decay;
                 }
             }
             graph->n_edges++;
@@ -1244,16 +1292,18 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             edge->fidelity = 1.0;
             for (int va = 0; va < 6; va++) {
                 for (int vb = 0; vb < 6; vb++) {
+                    /* Complex phase-coupling bridge: same as intra-block */
                     int diff = (va - vb + 6) % 6;
-                    double w;
+                    double decay;
                     switch(diff) {
-                        case 0: w = 1.000; break;
-                        case 1: case 5: w = 0.100; break;
-                        case 2: case 4: w = 0.010; break;
-                        case 3: w = 0.001; break;
+                        case 0: decay = 1.000; break;
+                        case 1: case 5: decay = 0.500; break;
+                        case 2: case 4: decay = 0.250; break;
+                        case 3: decay = 0.125; break;
                     }
-                    edge->w_re[va][vb] = w;
-                    edge->w_im[va][vb] = 0.0;
+                    double angle = 2.0 * 3.14159265358979323846 * va * vb / 6.0;
+                    edge->w_re[va][vb] = cos(angle) * decay;
+                    edge->w_im[va][vb] = sin(angle) * decay;
                 }
             }
             graph->n_edges++;
@@ -1287,11 +1337,11 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             graph->locals[site].edge_im[d] = out_im[d];
         }
     }
-    printf("    Phase 3: S₁₄ Deep Parity Crystallization via Z₆ Möbius BP (Arbitrary Precision C-Native)...\n");
+    printf("    Phase 3: S₁₄ Deep Parity Crystallization via Complex Amplitude BP...\n");
     clock_t t_bp_start = clock();
 
     MobiusAmplitudeSheet *mobius = mobius_create(graph);
-    z6_mobius_converge_bignum(mobius);
+    z6_complex_amplitude_bp(mobius);
 
     clock_t t_bp_end = clock();
     printf("      BP converged in %.3f sec\n", (double)(t_bp_end - t_bp_start) / CLOCKS_PER_SEC);
