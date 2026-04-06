@@ -400,21 +400,46 @@ static void lll_collect_freqs(int n, double (*marg)[6],
             }
         }
 
-        /* Select exact top-K */
+        /* ── Temperature Beam Search (Boltzmann Sampling at T=0.5) ──
+         * To break degenerate convergence symmetry, we sample from the Gibbs 
+         * distribution over the beam paths rather than taking pure argmax. */
         int top_indices[LLL_K];
         int top_count = (next_count < LLL_K) ? next_count : LLL_K;
+        double TEMP = 0.5;
 
         for (int k = 0; k < top_count; k++) {
-            int best_idx = -1;
-            double best_lp = -1e9;
+            /* 1. Find max for numerical stability */
+            double max_lp = -1e9;
             for (int i = 0; i < next_count; i++) {
-                if (next_log_probs[i] > best_lp) {
-                    best_lp = next_log_probs[i];
-                    best_idx = i;
+                if (next_log_probs[i] > max_lp) max_lp = next_log_probs[i];
+            }
+            
+            /* 2. Compute partition function */
+            double Z = 0.0;
+            double weights[LLL_K * 6];
+            for (int i = 0; i < next_count; i++) {
+                if (next_log_probs[i] < -1e8) {
+                    weights[i] = 0.0; /* previously selected */
+                } else {
+                    weights[i] = exp((next_log_probs[i] - max_lp) / TEMP);
+                    Z += weights[i];
                 }
             }
-            top_indices[k] = best_idx;
-            next_log_probs[best_idx] = -2e9; /* poison */
+            
+            /* 3. Sample from distribution */
+            double r = ((double)rand() / RAND_MAX) * Z;
+            double cdf = 0.0;
+            int selected_idx = 0;
+            for (int i = 0; i < next_count; i++) {
+                cdf += weights[i];
+                if (r <= cdf) {
+                    selected_idx = i;
+                    break;
+                }
+            }
+            
+            top_indices[k] = selected_idx;
+            next_log_probs[selected_idx] = -2e9; /* poison so it can't be selected again */
         }
 
         double new_beam_log_probs[LLL_K];
@@ -903,7 +928,7 @@ static const double W6_RE[6] = { 1.0, 0.5, -0.5, -1.0, -0.5,  0.5 };
 static const double W6_IM[6] = { 0.0, 0.866025403784438647, 0.866025403784438647,
                                   0.0, -0.866025403784438647, -0.866025403784438647 };
 
-static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms) {
+static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed) {
     const HPCGraph *g = ms->graph;
     int n_edges = (int)g->n_edges;
     int n_sites = (int)g->n_sites;
@@ -912,13 +937,21 @@ static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms) {
     ComplexEdgeMsg *msgs = (ComplexEdgeMsg*)calloc(n_edges, sizeof(ComplexEdgeMsg));
     ComplexEdgeMsg *new_msgs = (ComplexEdgeMsg*)calloc(n_edges, sizeof(ComplexEdgeMsg));
 
-    printf("      [Complex Amplitude BP] Initializing %d edges, %d sites...\n", n_edges, n_sites);
+    printf("      [Complex Amplitude BP] Initializing %d edges, %d sites (seed %u)...\n", n_edges, n_sites, seed);
 
-    /* Initialize messages to uniform (1, 0) — no information */
+    /* Initialize messages: seed 0 = uniform, others = random complex to break symmetry */
+    srand(seed * 12345 + 42);
     for (int e = 0; e < n_edges; e++) {
         for (int v = 0; v < 6; v++) {
-            msgs[e].re[0][v] = 1.0; msgs[e].im[0][v] = 0.0;
-            msgs[e].re[1][v] = 1.0; msgs[e].im[1][v] = 0.0;
+            if (seed == 0) {
+                msgs[e].re[0][v] = 1.0; msgs[e].im[0][v] = 0.0;
+                msgs[e].re[1][v] = 1.0; msgs[e].im[1][v] = 0.0;
+            } else {
+                double angle0 = 2.0 * 3.14159265358979323846 * ((double)rand() / RAND_MAX);
+                double angle1 = 2.0 * 3.14159265358979323846 * ((double)rand() / RAND_MAX);
+                msgs[e].re[0][v] = cos(angle0); msgs[e].im[0][v] = sin(angle0);
+                msgs[e].re[1][v] = cos(angle1); msgs[e].im[1][v] = sin(angle1);
+            }
         }
     }
 
@@ -1254,11 +1287,10 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             edge->site_b = bypass_sites[j];
             edge->type = HPC_EDGE_PHASE;
             edge->fidelity = 1.0;
+            /* ── PHASE Attenuation: scale by 1/√n_blocks ── */
+            double phase_scale = 1.0 / sqrt((double)n_blocks);
             for (int va = 0; va < 6; va++) {
                 for (int vb = 0; vb < 6; vb++) {
-                    /* Complex phase-coupling: ω^(va·vb) × decay
-                     * Preserves DFT₆ circulant structure for amplitude BP.
-                     * Decay suppresses off-diagonal correlations gently. */
                     int diff = (va - vb + 6) % 6;
                     double decay;
                     switch(diff) {
@@ -1267,6 +1299,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                         case 2: case 4: decay = 0.250; break;
                         case 3: decay = 0.125; break;
                     }
+                    decay *= phase_scale;
                     double angle = 2.0 * 3.14159265358979323846 * va * vb / 6.0;
                     edge->w_re[va][vb] = cos(angle) * decay;
                     edge->w_im[va][vb] = sin(angle) * decay;
@@ -1276,6 +1309,32 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             graph->phase_edges++;
             hpc_adj_add(graph, bypass_sites[i], eid);
             hpc_adj_add(graph, bypass_sites[j], eid);
+        }
+
+        /* ── CZ Oracle Edges: propagate Shor signal from sites 0,1 → peers 2-5 ── */
+        for (int peer = 2; peer < 6; peer++) {
+            for (int oracle_site = 0; oracle_site < 2; oracle_site++) {
+                hpc_grow_edges(graph);
+                uint64_t cz_eid = graph->n_edges;
+                HPCEdge *cz_edge = &graph->edges[cz_eid];
+                memset(cz_edge, 0, sizeof(*cz_edge));
+                cz_edge->site_a = blk * 6 + oracle_site;
+                cz_edge->site_b = blk * 6 + peer;
+                cz_edge->type = HPC_EDGE_CZ;
+                cz_edge->fidelity = 1.0;
+                /* CZ weight: ω^(va·vb) — pure DFT₆ coupling */
+                for (int va = 0; va < 6; va++) {
+                    for (int vb = 0; vb < 6; vb++) {
+                        int pidx = (va * vb) % 6;
+                        cz_edge->w_re[va][vb] = W6_RE[pidx];
+                        cz_edge->w_im[va][vb] = W6_IM[pidx];
+                    }
+                }
+                graph->n_edges++;
+                graph->cz_edges++;
+                hpc_adj_add(graph, cz_edge->site_a, cz_eid);
+                hpc_adj_add(graph, cz_edge->site_b, cz_eid);
+            }
         }
 
         /* The Macroscopic QFT Bridge: Stitching the Multiverse */
@@ -1290,9 +1349,10 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             edge->site_b = s_head;
             edge->type = HPC_EDGE_PHASE;
             edge->fidelity = 1.0;
+            /* ── PHASE Attenuation on bridge: scale by 1/√n_blocks ── */
+            double bridge_scale = 1.0 / sqrt((double)n_blocks);
             for (int va = 0; va < 6; va++) {
                 for (int vb = 0; vb < 6; vb++) {
-                    /* Complex phase-coupling bridge: same as intra-block */
                     int diff = (va - vb + 6) % 6;
                     double decay;
                     switch(diff) {
@@ -1301,6 +1361,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                         case 2: case 4: decay = 0.250; break;
                         case 3: decay = 0.125; break;
                     }
+                    decay *= bridge_scale;
                     double angle = 2.0 * 3.14159265358979323846 * va * vb / 6.0;
                     edge->w_re[va][vb] = cos(angle) * decay;
                     edge->w_im[va][vb] = sin(angle) * decay;
@@ -1341,7 +1402,53 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     clock_t t_bp_start = clock();
 
     MobiusAmplitudeSheet *mobius = mobius_create(graph);
-    z6_complex_amplitude_bp(mobius);
+
+    /* ── Multi-Start BP: 5 random seeds, select lowest entropy basin ── */
+    #define N_STARTS 5
+    double best_entropy = 1e30;
+    double best_dressed_re[n_sites][6];
+    double best_dressed_im[n_sites][6];
+
+    for (int start = 0; start < N_STARTS; start++) {
+        z6_complex_amplitude_bp(mobius, (unsigned int)start);
+
+        /* Compute total entropy across all sites */
+        double total_entropy = 0.0;
+        for (int s = 0; s < n_sites; s++) {
+            double probs[6], total = 0.0;
+            for (int v = 0; v < 6; v++) {
+                probs[v] = mobius->sheets[s].dressed_re[v] * mobius->sheets[s].dressed_re[v] +
+                           mobius->sheets[s].dressed_im[v] * mobius->sheets[s].dressed_im[v];
+                total += probs[v];
+            }
+            if (total > 1e-30) {
+                for (int v = 0; v < 6; v++) {
+                    double p = probs[v] / total;
+                    if (p > 1e-30) total_entropy -= p * log2(p);
+                }
+            }
+        }
+        printf("      [Multi-Start] Seed %d entropy: %.3f bits total\n", start, total_entropy);
+
+        if (total_entropy < best_entropy) {
+            best_entropy = total_entropy;
+            for (int s = 0; s < n_sites; s++) {
+                for (int v = 0; v < 6; v++) {
+                    best_dressed_re[s][v] = mobius->sheets[s].dressed_re[v];
+                    best_dressed_im[s][v] = mobius->sheets[s].dressed_im[v];
+                }
+            }
+        }
+    }
+
+    /* Restore best result */
+    printf("      [Multi-Start] Selected start with entropy %.3f bits\n", best_entropy);
+    for (int s = 0; s < n_sites; s++) {
+        for (int v = 0; v < 6; v++) {
+            mobius->sheets[s].dressed_re[v] = best_dressed_re[s][v];
+            mobius->sheets[s].dressed_im[v] = best_dressed_im[s][v];
+        }
+    }
 
     clock_t t_bp_end = clock();
     printf("      BP converged in %.3f sec\n", (double)(t_bp_end - t_bp_start) / CLOCKS_PER_SEC);
