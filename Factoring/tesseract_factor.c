@@ -473,6 +473,12 @@ static void lll_collect_freqs(int n, double (*marg)[6],
     }
     printf("\n");
 
+    /* Pre-allocate reconstruction temporaries */
+    BigInt rc_freq, rc_p6, rc_d_bi, rc_term, rc_tmp_bi, rc_np;
+    bigint_set_u64(&rc_freq, 0); bigint_set_u64(&rc_p6, 0);
+    bigint_set_u64(&rc_d_bi, 0); bigint_set_u64(&rc_term, 0);
+    bigint_set_u64(&rc_tmp_bi, 0); bigint_set_u64(&rc_np, 0);
+
     /* Build BigInt from digits (LSB first) via backtracking */
     for (int k = 0; k < LLL_K; k++) {
         if (k >= num_beams) {
@@ -488,19 +494,17 @@ static void lll_collect_freqs(int n, double (*marg)[6],
             curr_beam = beam_history_parent[s][curr_beam];
         }
 
-        BigInt freq, p6;
-        bigint_set_u64(&freq, 0);
-        bigint_set_u64(&p6, 1);
+        bigint_set_u64(&rc_freq, 0);
+        bigint_set_u64(&rc_p6, 1);
         for (int s = 0; s < n; s++) {
-            BigInt d_bi, term, tmp_bi;
-            bigint_set_u64(&d_bi, (uint64_t)seq[s]);
-            bigint_mul(&term, &d_bi, &p6);
-            bigint_add(&tmp_bi, &freq, &term);
-            bigint_copy(&freq, &tmp_bi);
-            BigInt np; bigint_mul(&np, &p6, b6);
-            bigint_copy(&p6, &np);
+            bigint_set_u64(&rc_d_bi, (uint64_t)seq[s]);
+            bigint_mul(&rc_term, &rc_d_bi, &rc_p6);
+            bigint_add(&rc_tmp_bi, &rc_freq, &rc_term);
+            bigint_copy(&rc_freq, &rc_tmp_bi);
+            bigint_mul(&rc_np, &rc_p6, b6);
+            bigint_copy(&rc_p6, &rc_np);
         }
-        bigint_copy(&out[k], &freq);
+        bigint_copy(&out[k], &rc_freq);
     }
     free(beam_history_parent);
     free(beam_history_digit);
@@ -531,6 +535,28 @@ static int lll_recover_period(int n_sites_raw, double (*marg)[6],
                                const BigInt *N,  const BigInt *a_val,
                                BigInt *factor_p, BigInt *factor_q)
 {
+    /* Static temporaries — allocated once, reused forever */
+    static int lrp_init = 0;
+    static BigInt lrp_one;
+    static BigInt lrp_gcd_f, lrp_g, lrp_r_cand, lrp_rem;
+    static BigInt lrp_km, lrp_rk;
+    static BigInt lrp_lcm_acc, lrp_r_i, lrp_rem_i;
+    static BigInt lrp_g2, lrp_prod, lrp_new_lcm, lrp_nr;
+    static BigInt lrp_s4_cand, lrp_s4_km, lrp_s4_rk;
+    if (!lrp_init) {
+        bigint_set_u64(&lrp_one, 1);
+        bigint_set_u64(&lrp_gcd_f, 0); bigint_set_u64(&lrp_g, 0);
+        bigint_set_u64(&lrp_r_cand, 0); bigint_set_u64(&lrp_rem, 0);
+        bigint_set_u64(&lrp_km, 0); bigint_set_u64(&lrp_rk, 0);
+        bigint_set_u64(&lrp_lcm_acc, 0); bigint_set_u64(&lrp_r_i, 0);
+        bigint_set_u64(&lrp_rem_i, 0); bigint_set_u64(&lrp_g2, 0);
+        bigint_set_u64(&lrp_prod, 0); bigint_set_u64(&lrp_new_lcm, 0);
+        bigint_set_u64(&lrp_nr, 0);
+        bigint_set_u64(&lrp_s4_cand, 0); bigint_set_u64(&lrp_s4_km, 0);
+        bigint_set_u64(&lrp_s4_rk, 0);
+        lrp_init = 1;
+    }
+
     printf("\n  ═══ MULTI-STRATEGY PERIOD RECOVERY ═══\n");
 
     BigInt *freqs = (BigInt*)calloc(LLL_K, sizeof(BigInt));
@@ -538,11 +564,8 @@ static int lll_recover_period(int n_sites_raw, double (*marg)[6],
     lll_collect_freqs(n_sites_raw, marg, b6, freqs);
 
     int found = 0;
-    BigInt one_bi; bigint_set_u64(&one_bi, 1);
 
-    /* ── Strategy 1: CF (continued-fraction) on each targeted sample ───────
-     * Most direct: each frequency string is a candidate harmonic measurement.
-     * generate_and_try_periods() runs CF + harmonic fan on it.              */
+    /* ── Strategy 1: CF (continued-fraction) on each targeted sample ─────── */
     printf("  [S1] CF on %d targeted frequency samples...\n", LLL_K);
     for (int i = 0; i < LLL_K && !found; i++) {
         if (bigint_is_zero(&freqs[i])) continue;
@@ -551,79 +574,64 @@ static int lll_recover_period(int n_sites_raw, double (*marg)[6],
         if (found) printf("  [S1] Hit on sample %d\n", i);
     }
 
-    /* ── Strategy 2: GCD of raw frequencies → base frequency F* ────────────
-     * F_i = s_i * F*  (different harmonics)  ⟹  gcd(F_i) = F* * gcd(s_i)
-     * As gcd(s_i) → 1 across coprime pairs, gcd(F_i) → F*.
-     * Period r = R / F*.                                                    */
+    /* ── Strategy 2: GCD of raw frequencies → base frequency F* ──────────── */
     if (!found) {
         printf("  [S2] Running GCD of raw frequencies...\n");
-        BigInt gcd_f; bigint_set_u64(&gcd_f, 0);
+        bigint_set_u64(&lrp_gcd_f, 0);
         for (int i = 0; i < LLL_K; i++) {
             if (bigint_is_zero(&freqs[i])) continue;
-            if (bigint_is_zero(&gcd_f)) {
-                bigint_copy(&gcd_f, &freqs[i]);
+            if (bigint_is_zero(&lrp_gcd_f)) {
+                bigint_copy(&lrp_gcd_f, &freqs[i]);
             } else {
-                BigInt g; bigint_gcd(&g, &gcd_f, &freqs[i]);
-                if (!bigint_is_zero(&g)) bigint_copy(&gcd_f, &g);
+                bigint_gcd(&lrp_g, &lrp_gcd_f, &freqs[i]);
+                if (!bigint_is_zero(&lrp_g)) bigint_copy(&lrp_gcd_f, &lrp_g);
             }
-            /* Try r = R / gcd_f at each step as gcd narrows */
-            if (bigint_cmp(&gcd_f, &one_bi) > 0) {
-                BigInt r_cand, rem;
-                bigint_div_mod(reg_sz, &gcd_f, &r_cand, &rem);
-                if (bigint_cmp(&r_cand, &one_bi) > 0 && bigint_cmp(&r_cand, N) < 0) {
-                    if (try_period(&r_cand, a_val, N, factor_p, factor_q)) {
+            if (bigint_cmp(&lrp_gcd_f, &lrp_one) > 0) {
+                bigint_div_mod(reg_sz, &lrp_gcd_f, &lrp_r_cand, &lrp_rem);
+                if (bigint_cmp(&lrp_r_cand, &lrp_one) > 0 && bigint_cmp(&lrp_r_cand, N) < 0) {
+                    if (try_period(&lrp_r_cand, a_val, N, factor_p, factor_q)) {
                         found = 1; printf("  [S2] r = R/gcd hit\n"); break;
                     }
-                    /* Harmonic multiples */
                     for (int m = 2; m <= 8 && !found; m++) {
-                        BigInt km, rk; bigint_set_u64(&km, (uint64_t)m);
-                        bigint_mul(&rk, &r_cand, &km);
-                        if (bigint_cmp(&rk, N) < 0)
-                            if (try_period(&rk, a_val, N, factor_p, factor_q)) {
+                        bigint_set_u64(&lrp_km, (uint64_t)m);
+                        bigint_mul(&lrp_rk, &lrp_r_cand, &lrp_km);
+                        if (bigint_cmp(&lrp_rk, N) < 0)
+                            if (try_period(&lrp_rk, a_val, N, factor_p, factor_q)) {
                                 found = 1; printf("  [S2] %d*r hit\n", m);
                             }
                     }
                 }
-                /* Also try gcd_f itself as a period candidate */
-                if (!found && bigint_cmp(&gcd_f, N) < 0)
-                    if (try_period(&gcd_f, a_val, N, factor_p, factor_q)) {
+                if (!found && bigint_cmp(&lrp_gcd_f, N) < 0)
+                    if (try_period(&lrp_gcd_f, a_val, N, factor_p, factor_q)) {
                         found = 1; printf("  [S2] gcd_f direct hit\n");
                     }
             }
         }
     }
 
-    /* ── Strategy 3: LCM of R/F_i period estimates ──────────────────────────
-     * R/F_i ≈ r/s_i.  LCM accumulates toward lcm(r/s_i) → r as harmonics
-     * span different prime factors of r.                                    */
+    /* ── Strategy 3: LCM of R/F_i period estimates ────────────────────────── */
     if (!found) {
         printf("  [S3] LCM of period estimates across %d samples...\n", LLL_K);
-        BigInt lcm_acc; bigint_set_u64(&lcm_acc, 1);
+        bigint_set_u64(&lrp_lcm_acc, 1);
         for (int i = 0; i < LLL_K && !found; i++) {
             if (bigint_is_zero(&freqs[i])) continue;
-            BigInt r_i, rem_i;
-            bigint_div_mod(reg_sz, &freqs[i], &r_i, &rem_i);
-            if (bigint_is_zero(&r_i) || bigint_cmp(&r_i, &one_bi) <= 0) continue;
-            BigInt g, prod;
-            bigint_gcd(&g, &lcm_acc, &r_i);
-            bigint_mul(&prod, &lcm_acc, &r_i);
-            BigInt new_lcm, nr;
-            bigint_div_mod(&prod, &g, &new_lcm, &nr);
-            if (bigint_cmp(&new_lcm, N) < 0)
-                bigint_copy(&lcm_acc, &new_lcm);
+            bigint_div_mod(reg_sz, &freqs[i], &lrp_r_i, &lrp_rem_i);
+            if (bigint_is_zero(&lrp_r_i) || bigint_cmp(&lrp_r_i, &lrp_one) <= 0) continue;
+            bigint_gcd(&lrp_g2, &lrp_lcm_acc, &lrp_r_i);
+            bigint_mul(&lrp_prod, &lrp_lcm_acc, &lrp_r_i);
+            bigint_div_mod(&lrp_prod, &lrp_g2, &lrp_new_lcm, &lrp_nr);
+            if (bigint_cmp(&lrp_new_lcm, N) < 0)
+                bigint_copy(&lrp_lcm_acc, &lrp_new_lcm);
             else
-                bigint_set_u64(&lcm_acc, 1);
-            if (bigint_cmp(&lcm_acc, &one_bi) > 0)
-                if (try_period(&lcm_acc, a_val, N, factor_p, factor_q)) {
+                bigint_set_u64(&lrp_lcm_acc, 1);
+            if (bigint_cmp(&lrp_lcm_acc, &lrp_one) > 0)
+                if (try_period(&lrp_lcm_acc, a_val, N, factor_p, factor_q)) {
                     found = 1; printf("  [S3] LCM hit after %d samples\n", i+1);
                 }
         }
     }
 
-    /* ── Strategy 4: LLL lattice short-vector (valid for r < 2^LLL_W_BITS) ─
-     * Builds (K+1)×(K+1) integer lattice.  The short vector has last
-     * coordinate ≈ ±r when r < W.  For larger r the W-norm trivial rows
-     * dominate and this produces no useful candidates — correctly noted.    */
+    /* ── Strategy 4: LLL lattice short-vector (valid for r < 2^LLL_W_BITS) ─ */
     if (!found) {
         const long long W = 1LL << LLL_W_BITS;
         printf("  [S4] LLL lattice (valid for r < 2^%d = %lld)...\n",
@@ -660,16 +668,16 @@ static int lll_recover_period(int n_sites_raw, double (*marg)[6],
         for (int i = 0; i < LLL_DIM && !found; i++) {
             long long v = B[i][LLL_K];
             if (v < 0) v = -v;
-            if (v < 2 || v >= W) continue;   /* skip trivial or out-of-range */
-            BigInt r_cand; bigint_set_u64(&r_cand, (uint64_t)v);
-            if (bigint_cmp(&r_cand, N) >= 0) continue;
+            if (v < 2 || v >= W) continue;
+            bigint_set_u64(&lrp_s4_cand, (uint64_t)v);
+            if (bigint_cmp(&lrp_s4_cand, N) >= 0) continue;
             printf("  [S4 row %d] r candidate = %lld\n", i, v);
-            if (try_period(&r_cand, a_val, N, factor_p, factor_q)) { found = 1; break; }
+            if (try_period(&lrp_s4_cand, a_val, N, factor_p, factor_q)) { found = 1; break; }
             for (int m = 2; m <= 8 && !found; m++) {
-                BigInt km, rk; bigint_set_u64(&km, (uint64_t)m);
-                bigint_mul(&rk, &r_cand, &km);
-                if (bigint_cmp(&rk, N) < 0)
-                    if (try_period(&rk, a_val, N, factor_p, factor_q)) found = 1;
+                bigint_set_u64(&lrp_s4_km, (uint64_t)m);
+                bigint_mul(&lrp_s4_rk, &lrp_s4_cand, &lrp_s4_km);
+                if (bigint_cmp(&lrp_s4_rk, N) < 0)
+                    if (try_period(&lrp_s4_rk, a_val, N, factor_p, factor_q)) found = 1;
             }
         }
         if (!found) printf("  [S4] No viable candidates (r likely > W)\n");
@@ -679,6 +687,7 @@ static int lll_recover_period(int n_sites_raw, double (*marg)[6],
     free(freqs);
     return found;
 }
+
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1178,8 +1187,35 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     #define PHASE_CHUNKS 11
     #define CHUNK_BITS   48
 
+    /* Pre-allocate ALL BigInt temporaries used in graph construction loop.
+     * Previously these were stack-local and leaked ~80+ GMP allocations per
+     * block iteration, corrupting the heap for large block counts. */
     BigInt val_k_A, val_k_B, div_6_blk;
+    BigInt gc_b36, gc_next_A, gc_next_B, gc_next_div;
+    BigInt gc_gcd_check, gc_val_minus_1, gc_dummy_rem;
+    BigInt gc_powersA[6], gc_powersB[6];
+    BigInt gc_tmpA, gc_tmpB, gc_q_div;
+    BigInt gc_b6_mod, gc_shift_div_A, gc_shift_div_B, gc_dummy_rm2;
+    BigInt gc_qA, gc_qB, gc_rA_mod, gc_rB_mod;
+    BigInt gc_temp_N, gc_qN, gc_rN, gc_q_sh, gc_r_sh;
+
+    bigint_set_u64(&val_k_A, 0); bigint_set_u64(&val_k_B, 0);
     bigint_set_u64(&div_6_blk, 1);
+    bigint_set_u64(&gc_b36, 36); bigint_set_u64(&gc_next_A, 0);
+    bigint_set_u64(&gc_next_B, 0); bigint_set_u64(&gc_next_div, 0);
+    bigint_set_u64(&gc_gcd_check, 0); bigint_set_u64(&gc_val_minus_1, 0);
+    bigint_set_u64(&gc_dummy_rem, 0);
+    for (int i = 0; i < 6; i++) { bigint_set_u64(&gc_powersA[i], 0); bigint_set_u64(&gc_powersB[i], 0); }
+    bigint_set_u64(&gc_tmpA, 0); bigint_set_u64(&gc_tmpB, 0);
+    bigint_set_u64(&gc_q_div, 0);
+    bigint_set_u64(&gc_b6_mod, 6); bigint_set_u64(&gc_shift_div_A, 0);
+    bigint_set_u64(&gc_shift_div_B, 0); bigint_set_u64(&gc_dummy_rm2, 0);
+    bigint_set_u64(&gc_qA, 0); bigint_set_u64(&gc_qB, 0);
+    bigint_set_u64(&gc_rA_mod, 0); bigint_set_u64(&gc_rB_mod, 0);
+    bigint_set_u64(&gc_temp_N, 0); bigint_set_u64(&gc_qN, 0);
+    bigint_set_u64(&gc_rN, 0); bigint_set_u64(&gc_q_sh, 0);
+    bigint_set_u64(&gc_r_sh, 0);
+
     for (int blk = 0; blk < n_blocks; blk++) {
         int scale_A = 2 * blk;
         int scale_B = 2 * blk + 1;
@@ -1189,73 +1225,59 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             bigint_pow_mod(&val_k_B, &val_k_A, &b6, N);
             bigint_set_u64(&div_6_blk, 1);
         } else {
-            BigInt b36; bigint_set_u64(&b36, 36);
-            BigInt next_A; bigint_pow_mod(&next_A, &val_k_A, &b36, N);
-            bigint_copy(&val_k_A, &next_A);
-            BigInt next_B; bigint_pow_mod(&next_B, &val_k_B, &b36, N);
-            bigint_copy(&val_k_B, &next_B);
+            bigint_pow_mod(&gc_next_A, &val_k_A, &gc_b36, N);
+            bigint_copy(&val_k_A, &gc_next_A);
+            bigint_pow_mod(&gc_next_B, &val_k_B, &gc_b36, N);
+            bigint_copy(&val_k_B, &gc_next_B);
 
-            BigInt next_div; bigint_mul(&next_div, &div_6_blk, &b6);
-            bigint_copy(&div_6_blk, &next_div);
+            bigint_mul(&gc_next_div, &div_6_blk, &b6);
+            bigint_copy(&div_6_blk, &gc_next_div);
         }
 
         /* ── GCD Cascade check ── */
-        BigInt gcd_check, val_minus_1;
-        bigint_sub(&val_minus_1, &val_k_A, &one);
-        if (!bigint_is_zero(&val_minus_1) && bigint_cmp(&val_minus_1, N) < 0) {
-            bigint_gcd(&gcd_check, &val_minus_1, N);
-            if (bigint_cmp(&gcd_check, &one) > 0 && bigint_cmp(&gcd_check, N) < 0) {
+        bigint_sub(&gc_val_minus_1, &val_k_A, &one);
+        if (!bigint_is_zero(&gc_val_minus_1) && bigint_cmp(&gc_val_minus_1, N) < 0) {
+            bigint_gcd(&gc_gcd_check, &gc_val_minus_1, N);
+            if (bigint_cmp(&gc_gcd_check, &one) > 0 && bigint_cmp(&gc_gcd_check, N) < 0) {
                 printf("\n  ✓✓✓ GCD CASCADE HIT at block %d (scale A)! ✓✓✓\n", blk);
-                BigInt dummy_rem; bigint_clear(&dummy_rem);
-                bigint_copy(factor_p, &gcd_check);
-                bigint_div_mod(N, &gcd_check, factor_q, &dummy_rem);
+                bigint_copy(factor_p, &gc_gcd_check);
+                bigint_div_mod(N, &gc_gcd_check, factor_q, &gc_dummy_rem);
                 hpc_destroy(graph);
                 return 1;
             }
         }
-        bigint_sub(&val_minus_1, &val_k_B, &one);
-        if (!bigint_is_zero(&val_minus_1) && bigint_cmp(&val_minus_1, N) < 0) {
-            bigint_gcd(&gcd_check, &val_minus_1, N);
-            if (bigint_cmp(&gcd_check, &one) > 0 && bigint_cmp(&gcd_check, N) < 0) {
+        bigint_sub(&gc_val_minus_1, &val_k_B, &one);
+        if (!bigint_is_zero(&gc_val_minus_1) && bigint_cmp(&gc_val_minus_1, N) < 0) {
+            bigint_gcd(&gc_gcd_check, &gc_val_minus_1, N);
+            if (bigint_cmp(&gc_gcd_check, &one) > 0 && bigint_cmp(&gc_gcd_check, N) < 0) {
                 printf("\n  ✓✓✓ GCD CASCADE HIT at block %d (scale B)! ✓✓✓\n", blk);
-                BigInt dummy_rem; bigint_clear(&dummy_rem);
-                bigint_copy(factor_p, &gcd_check);
-                bigint_div_mod(N, &gcd_check, factor_q, &dummy_rem);
+                bigint_copy(factor_p, &gc_gcd_check);
+                bigint_div_mod(N, &gc_gcd_check, factor_q, &gc_dummy_rem);
                 hpc_destroy(graph);
                 return 1;
             }
         }
 
-        BigInt powersA[6], powersB[6];
-        bigint_set_u64(&powersA[0], 1);
-        bigint_set_u64(&powersB[0], 1);
-        bigint_copy(&powersA[1], &val_k_A);
-        bigint_copy(&powersB[1], &val_k_B);
+        bigint_set_u64(&gc_powersA[0], 1);
+        bigint_set_u64(&gc_powersB[0], 1);
+        bigint_copy(&gc_powersA[1], &val_k_A);
+        bigint_copy(&gc_powersB[1], &val_k_B);
         for (int d = 2; d < 6; d++) {
-            BigInt tmpA, tmpB;
-            bigint_mul(&tmpA, &powersA[d-1], &val_k_A);
-            bigint_mul(&tmpB, &powersB[d-1], &val_k_B);
-            BigInt q;
-            bigint_div_mod(&tmpA, N, &q, &powersA[d]);
-            bigint_div_mod(&tmpB, N, &q, &powersB[d]);
+            bigint_mul(&gc_tmpA, &gc_powersA[d-1], &val_k_A);
+            bigint_mul(&gc_tmpB, &gc_powersB[d-1], &val_k_B);
+            bigint_div_mod(&gc_tmpA, N, &gc_q_div, &gc_powersA[d]);
+            bigint_div_mod(&gc_tmpB, N, &gc_q_div, &gc_powersB[d]);
         }
 
         for (int d = 0; d < 6; d++) {
-            BigInt b6_mod; bigint_set_u64(&b6_mod, 6);
+            bigint_div_mod(&gc_powersA[d], &div_6_blk, &gc_shift_div_A, &gc_dummy_rm2);
+            bigint_div_mod(&gc_powersB[d], &div_6_blk, &gc_shift_div_B, &gc_dummy_rm2);
 
-            /* Nested phase resolution: shift into the blk-th base-6 digit of the value.
-             * This extracts (val / 6^blk) % 6, giving a unique phase per depth level
-             * rather than all blocks collapsing to the same modulo-6 bucket. */
-            BigInt shift_div_A, shift_div_B, dummy_rm;
-            bigint_div_mod(&powersA[d], &div_6_blk, &shift_div_A, &dummy_rm);
-            bigint_div_mod(&powersB[d], &div_6_blk, &shift_div_B, &dummy_rm);
+            bigint_div_mod(&gc_shift_div_A, &gc_b6_mod, &gc_qA, &gc_rA_mod);
+            bigint_div_mod(&gc_shift_div_B, &gc_b6_mod, &gc_qB, &gc_rB_mod);
 
-            BigInt qA, qB, rA_mod, rB_mod;
-            bigint_div_mod(&shift_div_A, &b6_mod, &qA, &rA_mod);
-            bigint_div_mod(&shift_div_B, &b6_mod, &qB, &rB_mod);
-
-            int d_A = (int)bigint_to_u64(&rA_mod);
-            int d_B = (int)bigint_to_u64(&rB_mod);
+            int d_A = (int)bigint_to_u64(&gc_rA_mod);
+            int d_B = (int)bigint_to_u64(&gc_rB_mod);
 
             double phase_A = 2.0 * 3.14159265358979323846 * d_A / 6.0;
             double phase_B = 2.0 * 3.14159265358979323846 * d_B / 6.0;
@@ -1285,13 +1307,14 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
         }
 
         /* Extract the blk-th base-6 digit of N */
-        BigInt temp_N; bigint_copy(&temp_N, N);
+        bigint_copy(&gc_temp_N, N);
         for(int sh=0; sh<blk; sh++) { 
-            BigInt q, r; bigint_div_mod(&temp_N, &b6, &q, &r); 
-            bigint_copy(&temp_N, &q); 
+            bigint_div_mod(&gc_temp_N, &b6, &gc_q_sh, &gc_r_sh); 
+            bigint_copy(&gc_temp_N, &gc_q_sh); 
         }
-        BigInt qN, rN; bigint_div_mod(&temp_N, &b6, &qN, &rN);
-        int N_digit = (int)bigint_to_u64(&rN);
+        bigint_div_mod(&gc_temp_N, &b6, &gc_qN, &gc_rN);
+        int N_digit = (int)bigint_to_u64(&gc_rN);
+
 
         /* Unfrustrated Z_6 AFFINE TRANSLATION: Anchor all 6 sites in a topological hexagram cycle */
         int bypass_sites[6] = { blk * 6 + 0, blk * 6 + 1, blk * 6 + 2, blk * 6 + 3, blk * 6 + 4, blk * 6 + 5 };
@@ -1480,9 +1503,10 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     clock_t t_bp_end = clock();
     printf("      BP converged in %.3f sec\n", (double)(t_bp_end - t_bp_start) / CLOCKS_PER_SEC);
 
-    /* Precompute marginal probabilities for all sites to serve as our quantum wave function */
-    /* Heap-allocate marginals (n_sites_raw can reach 1600) */
-    double (*marginals)[6] = (double(*)[6])calloc(n_sites_raw, sizeof(double[6]));
+    /* Heap-allocate marginals. Index goes up to scale = 2*n_blocks-1, so
+     * we need max(n_sites_raw, 2*n_blocks) elements to avoid overflow. */
+    int marginals_sz = (2 * n_blocks > n_sites_raw) ? 2 * n_blocks : n_sites_raw;
+    double (*marginals)[6] = (double(*)[6])calloc(marginals_sz, sizeof(double[6]));
     for (int blk = 0; blk < n_blocks; blk++) {
         for (int offset = 0; offset <= 1; offset++) {
             int scale = 2 * blk + offset;
@@ -1522,12 +1546,12 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
            n_blocks, PHASE_CHUNKS, CHUNK_BITS);
 
     /* Compute register size = 6^n_sites_raw */
-    BigInt reg_sz;
+    BigInt reg_sz, gc_reg_tmp;
     bigint_set_u64(&reg_sz, 1);
+    bigint_set_u64(&gc_reg_tmp, 0);
     for (int k = 0; k < n_sites_raw; k++) {
-        BigInt tmp;
-        bigint_mul(&tmp, &reg_sz, &b6);
-        bigint_copy(&reg_sz, &tmp);
+        bigint_mul(&gc_reg_tmp, &reg_sz, &b6);
+        bigint_copy(&reg_sz, &gc_reg_tmp);
     }
 
     /* ── Phase 4: LLL lattice period recovery ─────────────────────────────── */
@@ -1549,10 +1573,12 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
     /* Heap-allocate p6_cache to prevent VLA BigInt leak */
     BigInt *p6_cache = (BigInt*)calloc(n_sites_raw, sizeof(BigInt));
-    BigInt current_p6; bigint_set_u64(&current_p6, 1);
+    BigInt current_p6, next_p6;
+    bigint_set_u64(&current_p6, 1);
+    bigint_set_u64(&next_p6, 0);
     for (int i = 0; i < n_sites_raw; i++) {
         bigint_copy(&p6_cache[i], &current_p6);
-        BigInt next_p6; bigint_mul(&next_p6, &current_p6, &b6);
+        bigint_mul(&next_p6, &current_p6, &b6);
         bigint_copy(&current_p6, &next_p6);
     }
 
