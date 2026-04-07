@@ -363,23 +363,43 @@ static void zero_entropy_walk(const KyberInstance *K, unsigned seed)
         /* FULL RESOLUTION O(E) BP: Find the dominant geometry */
         lwe_bp(&L, s_out, marg, fixed, fval, seed+step*31337, 1, 200);
 
-        int best_j=-1; double best_conf=0.0; int best_val=0;
+        int fixed_this_step = 0;
+        int max_j = -1; double max_conf = 0.0; int max_val = 0;
+        
         for(int j=0;j<n;j++){
-            if(fixed[j]) continue;
-            double max_p=0; int max_v=0;
-            for(int v=0;v<dv;v++) if(marg[j][v]>max_p){max_p=marg[j][v];max_v=v;}
-            if(max_p>best_conf){best_conf=max_p;best_j=j;best_val=max_v-eta;}
+            if(fixed[j])continue;
+            for(int v=0;v<dv;v++){
+                if(marg[j][v] > max_conf){ max_conf = marg[j][v]; max_j = j; max_val = v-eta; }
+            }
         }
-        if(best_j<0) break;
-
-        fixed[best_j]=1; fval[best_j]=best_val;
-        int nf_after=0; for(int j=0;j<n;j++) if(!fixed[j]) nf_after++;
-        char check=(best_val==K->s_true[best_j])?'+':'x';
-
-        /* Print result immediately to show genuine progress */
+        
+        /* Step increase: geometrically fix ALL converging axes simultaneously */
+        for(int j=0;j<n;j++){
+            if(fixed[j])continue;
+            for(int v=0;v<dv;v++){
+                if(marg[j][v] > 0.9999) {
+                    fixed[j] = 1; fval[j] = v-eta; fixed_this_step++;
+                    int ok = (fval[j] == K->s_true[j]) ? 1 : 0;
+                    if(ok) g_best_ok++;
+                    printf("    Step FIX parallel: s[%3d] = %2d (P=%.4f) %s\n", j, fval[j], marg[j][v], ok?"[+]":"[x]");
+                }
+            }
+        }
+        
+        /* If no variable reached 0.9999 certainty, we fall back to fixing the absolute strongest boundary */
+        if(fixed_this_step == 0 && max_j != -1) {
+            fixed[max_j] = 1;
+            fval[max_j] = max_val;
+            int ok = (fval[max_j] == K->s_true[max_j]) ? 1 : 0;
+            if(ok) g_best_ok++;
+            printf("    Step FIX fallback: s[%3d] = %2d (P=%.4f) %s\n", max_j, fval[max_j], max_conf, ok?"[+]":"[x]");
+        }
+        
+        nf=0; for(int j=0;j<n;j++) if(!fixed[j]) nf++;
+        if(nf == 0) break;
+        
         if(n <= 16 || step < 8 || step > n-4 || step % 32 == 0) {
-            printf("    Step %3d/%d: FIX s[%3d] = %+d (P=%.4f) free=%d [%c]\n",
-                   step+1,n,best_j,best_val,best_conf,nf_after,check);
+            printf("    Step %3d/%d: free=%d\n", step+1, n, nf);
         } else if(step == 8) {
             printf("    ... (Computing genuine likelihood bounds) ...\n");
         }
