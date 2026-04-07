@@ -40,12 +40,12 @@
 #define MAX_D_VAR   9       /* Max variable domain = 2*MAX_ETA+1         */
 #define MAX_ETA     4       /* Max noise width                           */
 
-#define BP_MAX_ITER 500     /* Maximum BP iterations                     */
+#define BP_MAX_ITER 300     /* Maximum BP iterations per decimation round */
 #define BP_TOL      1e-8    /* Convergence tolerance                     */
 #define BP_DAMP_START 0.50  /* Initial damping (annealing)               */
 #define BP_DAMP_END   0.05  /* Final damping                             */
-#define BP_COOL_ITERS 300   /* Annealing iterations                      */
-#define BP_NUM_STARTS 5     /* Multi-start seeds                         */
+#define BP_COOL_ITERS 200   /* Annealing iterations                      */
+#define BP_NUM_STARTS 3     /* Multi-start seeds                         */
 
 #define PI 3.14159265358979323846
 
@@ -212,19 +212,23 @@ static void compute_prior(double *prior, int eta, int d_var)
  * the factoring engine — but over ℤ_q instead of ℤ_6.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/* Noise penalty: soft Gaussian-like weight centered at 0 with width η.
- * This encodes the prior belief that e[i] is small. */
-static inline double noise_weight(int residual, int q, int eta)
+/* Precompute the exact error probability table for B_η
+ * P_error[e mod q] for e ∈ {-η,...,+η} */
+static void compute_error_prior(double *error_prior, int q, int eta)
 {
-    /* Map residual to [-q/2, q/2] */
-    int r = residual;
-    if (r > q / 2) r -= q;
-    if (r < -(q / 2)) r += q;
-    double sigma = (double)eta * 0.8;  /* Slightly tighter than true distribution */
-    return exp(-(double)(r * r) / (2.0 * sigma * sigma));
+    memset(error_prior, 0, sizeof(double) * q);
+    double prior[MAX_D_VAR];
+    compute_prior(prior, eta, 2 * eta + 1);
+    for (int vi = 0; vi < 2 * eta + 1; vi++) {
+        int val = vi - eta;
+        int idx = mod_pos(val, q);
+        error_prior[idx] = prior[vi];
+    }
 }
 
 static void lwe_bp_solve(const LWEInstance *inst, int *s_recovered,
+                         double *confidence,
+                         const int *fixed, const int *fixed_vals,
                          unsigned int seed)
 {
     const int n = inst->n;
@@ -232,6 +236,11 @@ static void lwe_bp_solve(const LWEInstance *inst, int *s_recovered,
     const int q = inst->q;
     const int eta = inst->eta;
     const int d_var = inst->d_var;
+
+    /* Count free variables */
+    int n_free = 0;
+    for (int j = 0; j < n; j++) if (!fixed[j]) n_free++;
+    if (n_free == 0) return;
 
     /* Precompute ω_q tables */
     OmegaTable wt;
@@ -241,10 +250,15 @@ static void lwe_bp_solve(const LWEInstance *inst, int *s_recovered,
     double prior[MAX_D_VAR];
     compute_prior(prior, eta, d_var);
 
-    printf("\n  ── BP Solver (seed %u) ──\n", seed);
+    printf("\n  ── BP Solver (seed %u, %d free / %d total) ──\n", seed, n_free, n);
     printf("  Prior B_%d: [", eta);
     for (int vi = 0; vi < d_var; vi++)
         printf("%.3f%s", prior[vi], vi < d_var-1 ? " " : "]\n");
+
+    /* Precompute exact error distribution over ℤ_q */
+    double *error_prior = (double *)calloc(q, sizeof(double));
+    compute_error_prior(error_prior, q, eta);
+    printf("  Using exact B_%d convolution over ℤ_%d\n", eta, q);
 
     /* Allocate messages: m×n edges, each with 2 directions × d_var complex */
     /* Edge (i,j) is at index i*n + j */
@@ -258,13 +272,20 @@ static void lwe_bp_solve(const LWEInstance *inst, int *s_recovered,
         for (int j = 0; j < n; j++) {
             int eid = i * n + j;
             for (int vi = 0; vi < d_var; vi++) {
-                /* dir=0: var→check — start at prior with small random perturbation */
-                double noise = 0.001 * ((double)rand() / RAND_MAX - 0.5);
-                msgs[eid].re[0][vi] = prior[vi] + noise;
-                msgs[eid].im[0][vi] = 0.001 * ((double)rand() / RAND_MAX - 0.5);
-                /* dir=1: check→var — start uniform */
-                msgs[eid].re[1][vi] = 1.0 / d_var;
-                msgs[eid].im[1][vi] = 0.0;
+                if (fixed[j]) {
+                    /* Fixed variable: delta at known value */
+                    int fvi = fixed_vals[j] + eta;
+                    msgs[eid].re[0][vi] = (vi == fvi) ? 1.0 : 0.0;
+                    msgs[eid].im[0][vi] = 0.0;
+                    msgs[eid].re[1][vi] = (vi == fvi) ? 1.0 : 0.0;
+                    msgs[eid].im[1][vi] = 0.0;
+                } else {
+                    double noise = 0.001 * ((double)rand() / RAND_MAX - 0.5);
+                    msgs[eid].re[0][vi] = prior[vi] + noise;
+                    msgs[eid].im[0][vi] = 0.001 * ((double)rand() / RAND_MAX - 0.5);
+                    msgs[eid].re[1][vi] = 1.0 / d_var;
+                    msgs[eid].im[1][vi] = 0.0;
+                }
             }
         }
     }
@@ -281,41 +302,47 @@ static void lwe_bp_solve(const LWEInstance *inst, int *s_recovered,
             : BP_DAMP_END;
 
         /* ── Variable → Check messages ──
-         * μ_{j→i}[v] = prior[v] × Π_{i' ≠ i} ν_{i'→j}[v] */
+         * μ_{j→i}[v] = prior[v] × Π_{i' ≠ i} ν_{i'→j}[v]
+         * Uses INCREMENTAL RENORMALIZATION to prevent underflow:
+         * normalize the running product vector after each multiplication.
+         * SKIP fixed variables — their messages never change. */
         for (int j = 0; j < n; j++) {
+            if (fixed[j]) continue;  /* Fixed vars keep delta messages */
             for (int i = 0; i < m; i++) {
                 int eid = i * n + j;
 
+                /* Start with prior as initial product */
                 for (int vi = 0; vi < d_var; vi++) {
-                    double prod_re = prior[vi];
-                    double prod_im = 0.0;
-
-                    /* Multiply incoming check→var messages from all checks except i */
-                    for (int ip = 0; ip < m; ip++) {
-                        if (ip == i) continue;
-                        int eid_in = ip * n + j;
-                        double mr = msgs[eid_in].re[1][vi];
-                        double mi = msgs[eid_in].im[1][vi];
-                        double nr = prod_re * mr - prod_im * mi;
-                        double ni = prod_re * mi + prod_im * mr;
-                        prod_re = nr;
-                        prod_im = ni;
-                    }
-
-                    new_msgs[eid].re[0][vi] = prod_re;
-                    new_msgs[eid].im[0][vi] = prod_im;
+                    new_msgs[eid].re[0][vi] = prior[vi];
+                    new_msgs[eid].im[0][vi] = 0.0;
                 }
 
-                /* Normalize to unit L2 */
-                double norm_sq = 0.0;
-                for (int vi = 0; vi < d_var; vi++)
-                    norm_sq += new_msgs[eid].re[0][vi] * new_msgs[eid].re[0][vi] +
-                               new_msgs[eid].im[0][vi] * new_msgs[eid].im[0][vi];
-                if (norm_sq > 1e-30) {
-                    double inv = 1.0 / sqrt(norm_sq);
+                /* Multiply incoming check→var messages one at a time,
+                 * renormalizing after EACH multiplication */
+                for (int ip = 0; ip < m; ip++) {
+                    if (ip == i) continue;
+                    int eid_in = ip * n + j;
+
                     for (int vi = 0; vi < d_var; vi++) {
-                        new_msgs[eid].re[0][vi] *= inv;
-                        new_msgs[eid].im[0][vi] *= inv;
+                        double pr = new_msgs[eid].re[0][vi];
+                        double pi_ = new_msgs[eid].im[0][vi];
+                        double mr = msgs[eid_in].re[1][vi];
+                        double mi = msgs[eid_in].im[1][vi];
+                        new_msgs[eid].re[0][vi] = pr * mr - pi_ * mi;
+                        new_msgs[eid].im[0][vi] = pr * mi + pi_ * mr;
+                    }
+
+                    /* Incremental L2 renormalization — prevents underflow */
+                    double norm_sq = 0.0;
+                    for (int vi = 0; vi < d_var; vi++)
+                        norm_sq += new_msgs[eid].re[0][vi] * new_msgs[eid].re[0][vi] +
+                                   new_msgs[eid].im[0][vi] * new_msgs[eid].im[0][vi];
+                    if (norm_sq > 1e-300) {
+                        double inv = 1.0 / sqrt(norm_sq);
+                        for (int vi = 0; vi < d_var; vi++) {
+                            new_msgs[eid].re[0][vi] *= inv;
+                            new_msgs[eid].im[0][vi] *= inv;
+                        }
                     }
                 }
             }
@@ -331,83 +358,78 @@ static void lwe_bp_solve(const LWEInstance *inst, int *s_recovered,
             for (int j = 0; j < n; j++) {
                 int eid = i * n + j;
 
-                /* Step 1: For each Fourier mode c, compute the product of
-                 * transformed incoming var→check messages from all j' ≠ j */
-                double fourier_prod_re[MAX_Q];
-                double fourier_prod_im[MAX_Q];
+                /* ── DIRECT CONVOLUTION over ℤ_q ──
+                 * Maintain running distribution P_sum[x] over ℤ_q.
+                 * Convolve with each incoming variable message.
+                 * This is EXACT — no Fourier approximation.
+                 *
+                 * P_sum starts as δ(0), then for each j'≠j:
+                 * P_sum_new[x] = Σ_v μ_{j'→i}[v] × P_sum[x - A·val(v) mod q]
+                 *
+                 * Final: ν_{i→j}[v_j] = Σ_x P_sum[x] × P_error[b - A·v_j - x mod q]
+                 */
+                double *psum_cur = (double *)calloc(q, sizeof(double));
+                double *psum_new = (double *)calloc(q, sizeof(double));
+                psum_cur[0] = 1.0;  /* δ(0) */
 
-                for (int c = 0; c < q; c++) {
-                    fourier_prod_re[c] = 1.0;
-                    fourier_prod_im[c] = 0.0;
+                for (int jp = 0; jp < n; jp++) {
+                    if (jp == j) continue;
+                    int eid_in = i * n + jp;
 
-                    for (int jp = 0; jp < n; jp++) {
-                        if (jp == j) continue;
-                        int eid_in = i * n + jp;
-
-                        /* F_c[μ_{jp→i}] = Σ_v μ[v] · ω_q^{-A[i][jp]·val(v)·c} */
-                        double fc_re = 0.0, fc_im = 0.0;
+                    memset(psum_new, 0, sizeof(double) * q);
+                    for (int x = 0; x < q; x++) {
+                        if (psum_cur[x] < 1e-30) continue; /* Skip zeros */
                         for (int vi = 0; vi < d_var; vi++) {
-                            int val = vi - eta;  /* Map to {-η..+η} */
-                            int phase_idx = mod_pos(-inst->A[i][jp] * val * c, q);
-                            double wr = wt.re[phase_idx];
-                            double wi = wt.im[phase_idx];
-
+                            int val = vi - eta;
+                            /* Use magnitude of complex message as probability */
                             double mr = msgs[eid_in].re[0][vi];
-                            double mi_v = msgs[eid_in].im[0][vi];
-
-                            fc_re += mr * wr - mi_v * wi;
-                            fc_im += mr * wi + mi_v * wr;
+                            double mi_ = msgs[eid_in].im[0][vi];
+                            double prob = mr * mr + mi_ * mi_;
+                            if (prob < 1e-30) continue;
+                            int new_x = mod_pos(x + inst->A[i][jp] * val, q);
+                            psum_new[new_x] += psum_cur[x] * prob;
                         }
-
-                        /* Multiply into product */
-                        double nr = fourier_prod_re[c] * fc_re -
-                                    fourier_prod_im[c] * fc_im;
-                        double ni = fourier_prod_re[c] * fc_im +
-                                    fourier_prod_im[c] * fc_re;
-                        fourier_prod_re[c] = nr;
-                        fourier_prod_im[c] = ni;
                     }
 
-                    /* Apply noise envelope: soft penalty on deviation from b[i] */
-                    double nw = noise_weight(c, q, eta);
-                    fourier_prod_re[c] *= nw;
-                    fourier_prod_im[c] *= nw;
+                    /* Normalize to prevent underflow/overflow */
+                    double psum_max = 0.0;
+                    for (int x = 0; x < q; x++)
+                        if (psum_new[x] > psum_max) psum_max = psum_new[x];
+                    if (psum_max > 1e-30) {
+                        double inv = 1.0 / psum_max;
+                        for (int x = 0; x < q; x++) psum_new[x] *= inv;
+                    }
+
+                    /* Swap buffers */
+                    double *tmp = psum_cur;
+                    psum_cur = psum_new;
+                    psum_new = tmp;
                 }
 
-                /* Step 2: Inverse Fourier to get check→var message
-                 * ν_{i→j}[v_j] = (1/q) Σ_c ω_q^{c·(b_i - A[i][j]·v_j)}
-                 *                × fourier_prod[c] */
+                /* Read out check→var message using exact error prior */
                 for (int vi = 0; vi < d_var; vi++) {
                     int val = vi - eta;
-                    double sum_re = 0.0, sum_im = 0.0;
-
-                    for (int c = 0; c < q; c++) {
-                        int phase_idx = mod_pos(c * (inst->b[i] -
-                                        inst->A[i][j] * val), q);
-                        double wr = wt.re[phase_idx];
-                        double wi = wt.im[phase_idx];
-
-                        sum_re += fourier_prod_re[c] * wr -
-                                  fourier_prod_im[c] * wi;
-                        sum_im += fourier_prod_re[c] * wi +
-                                  fourier_prod_im[c] * wr;
+                    double sum = 0.0;
+                    for (int x = 0; x < q; x++) {
+                        /* error = b - A·v_j - x mod q */
+                        int err_idx = mod_pos(inst->b[i] - inst->A[i][j] * val - x, q);
+                        sum += psum_cur[x] * error_prior[err_idx];
                     }
-
-                    new_msgs[eid].re[1][vi] = sum_re / q;
-                    new_msgs[eid].im[1][vi] = sum_im / q;
+                    new_msgs[eid].re[1][vi] = sum;
+                    new_msgs[eid].im[1][vi] = 0.0;
                 }
+
+                free(psum_cur);
+                free(psum_new);
 
                 /* Normalize check→var to unit L2 */
                 double norm_sq = 0.0;
                 for (int vi = 0; vi < d_var; vi++)
-                    norm_sq += new_msgs[eid].re[1][vi] * new_msgs[eid].re[1][vi] +
-                               new_msgs[eid].im[1][vi] * new_msgs[eid].im[1][vi];
+                    norm_sq += new_msgs[eid].re[1][vi] * new_msgs[eid].re[1][vi];
                 if (norm_sq > 1e-30) {
                     double inv = 1.0 / sqrt(norm_sq);
-                    for (int vi = 0; vi < d_var; vi++) {
+                    for (int vi = 0; vi < d_var; vi++)
                         new_msgs[eid].re[1][vi] *= inv;
-                        new_msgs[eid].im[1][vi] *= inv;
-                    }
                 }
             }
         }
@@ -447,23 +469,44 @@ static void lwe_bp_solve(const LWEInstance *inst, int *s_recovered,
     if (!converged)
         printf("    [BP] Reached max iterations (%d)\n", BP_MAX_ITER);
 
-    /* ── Extract marginals from converged messages ── */
+    /* ── Extract marginals from converged messages ──
+     * Uses INCREMENTAL RENORMALIZATION: normalize the belief vector
+     * after each message multiplication to prevent underflow. */
     printf("\n  ── Marginal beliefs ──\n");
     for (int j = 0; j < n; j++) {
+        if (fixed[j]) {
+            s_recovered[j] = fixed_vals[j];
+            continue;
+        }
         /* Belief[v] = prior[v] × Π_i ν_{i→j}[v] */
         double belief_re[MAX_D_VAR], belief_im[MAX_D_VAR];
         for (int vi = 0; vi < d_var; vi++) {
             belief_re[vi] = prior[vi];
             belief_im[vi] = 0.0;
+        }
 
-            for (int i = 0; i < m; i++) {
-                int eid = i * n + j;
+        for (int i = 0; i < m; i++) {
+            int eid = i * n + j;
+            for (int vi = 0; vi < d_var; vi++) {
                 double mr = msgs[eid].re[1][vi];
                 double mi = msgs[eid].im[1][vi];
                 double nr = belief_re[vi] * mr - belief_im[vi] * mi;
                 double ni = belief_re[vi] * mi + belief_im[vi] * mr;
                 belief_re[vi] = nr;
                 belief_im[vi] = ni;
+            }
+
+            /* Incremental renormalization after each message */
+            double ns = 0.0;
+            for (int vi = 0; vi < d_var; vi++)
+                ns += belief_re[vi] * belief_re[vi] +
+                      belief_im[vi] * belief_im[vi];
+            if (ns > 1e-300) {
+                double inv = 1.0 / sqrt(ns);
+                for (int vi = 0; vi < d_var; vi++) {
+                    belief_re[vi] *= inv;
+                    belief_im[vi] *= inv;
+                }
             }
         }
 
@@ -489,6 +532,7 @@ static void lwe_bp_solve(const LWEInstance *inst, int *s_recovered,
             }
         }
         s_recovered[j] = best_vi - eta;
+        confidence[j] = best_p;
 
         /* Print marginal */
         if (j < 20 || j == n - 1) {
@@ -503,6 +547,7 @@ static void lwe_bp_solve(const LWEInstance *inst, int *s_recovered,
 
     free(msgs);
     free(new_msgs);
+    free(error_prior);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -587,43 +632,94 @@ int main(int argc, char *argv[])
     LWEInstance inst;
     lwe_generate(&inst, n, q, eta, m);
 
-    clock_t t_start = clock();
+    /* ── Decimation loop: iteratively fix most confident variable ── */
+    int fixed[MAX_N];
+    int fixed_vals[MAX_N];
+    memset(fixed, 0, sizeof(fixed));
+    memset(fixed_vals, 0, sizeof(fixed_vals));
 
-    /* Multi-start BP: run BP_NUM_STARTS times with different seeds,
-     * pick the result with most coefficients matching the ground truth.
-     * (In a real attack, we'd use a self-consistency metric instead.) */
     int best_correct = 0;
     int best_recovered[MAX_N];
     memset(best_recovered, 0, sizeof(best_recovered));
 
-    for (int start = 0; start < BP_NUM_STARTS; start++) {
-        printf("\n  ════════════════════════════════════\n");
-        printf("  Multi-Start %d / %d\n", start + 1, BP_NUM_STARTS);
-        printf("  ════════════════════════════════════\n");
+    clock_t t_start = clock();
 
-        int s_recovered[MAX_N];
-        memset(s_recovered, 0, sizeof(s_recovered));
+    int n_fixed = 0;
+    while (n_fixed < n) {
+        printf("\n  ╔════════════════════════════════════════╗\n");
+        printf("  ║  Decimation Round %d / %d  (%d fixed)    ║\n",
+               n_fixed + 1, n, n_fixed);
+        printf("  ╚════════════════════════════════════════╝\n");
 
-        lwe_bp_solve(&inst, s_recovered, base_seed + start * 1337);
+        /* Run multi-start BP on the reduced system */
+        int round_best_correct = 0;
+        int round_best_recovered[MAX_N];
+        double round_best_conf[MAX_N];
+        memset(round_best_recovered, 0, sizeof(round_best_recovered));
+        memset(round_best_conf, 0, sizeof(round_best_conf));
 
-        /* Count correct */
-        int correct = 0;
-        for (int j = 0; j < n; j++)
-            if (s_recovered[j] == inst.s_true[j]) correct++;
+        int starts_this_round = (n_fixed == 0) ? BP_NUM_STARTS : 1;
+        for (int start = 0; start < starts_this_round; start++) {
+            int s_recovered[MAX_N];
+            double conf[MAX_N];
+            memset(s_recovered, 0, sizeof(s_recovered));
+            memset(conf, 0, sizeof(conf));
 
-        printf("  [Start %d] Correct: %d / %d\n", start + 1, correct, n);
+            lwe_bp_solve(&inst, s_recovered, conf, fixed, fixed_vals,
+                         base_seed + n_fixed * 7919 + start * 1337);
 
-        if (correct > best_correct) {
-            best_correct = correct;
-            memcpy(best_recovered, s_recovered, sizeof(int) * n);
+            int correct = 0;
+            for (int j = 0; j < n; j++)
+                if (s_recovered[j] == inst.s_true[j]) correct++;
+
+            printf("  [Round %d/Start %d] Correct: %d / %d\n",
+                   n_fixed + 1, start + 1, correct, n);
+
+            if (correct > round_best_correct) {
+                round_best_correct = correct;
+                memcpy(round_best_recovered, s_recovered, sizeof(int) * n);
+            }
+
+            if (correct == n) break;
         }
 
-        /* Early exit if fully recovered */
-        if (correct == n) {
-            printf("  [Start %d] ★ FULL RECOVERY — stopping early ★\n",
-                   start + 1);
+        if (round_best_correct > best_correct) {
+            best_correct = round_best_correct;
+            memcpy(best_recovered, round_best_recovered, sizeof(int) * n);
+        }
+
+        if (best_correct == n) {
+            printf("  ★ ALL VARIABLES DETERMINED ★\n");
             break;
         }
+
+        /* Find the most confident FREE variable and fix it */
+        int s_conf_run[MAX_N];
+        double conf_run[MAX_N];
+        memset(s_conf_run, 0, sizeof(s_conf_run));
+        memset(conf_run, 0, sizeof(conf_run));
+        lwe_bp_solve(&inst, s_conf_run, conf_run, fixed, fixed_vals,
+                     base_seed + n_fixed * 3571);
+
+        /* Pick the free variable with highest confidence */
+        int fix_j = -1;
+        double max_conf = -1.0;
+        for (int j = 0; j < n; j++) {
+            if (!fixed[j] && conf_run[j] > max_conf) {
+                max_conf = conf_run[j];
+                fix_j = j;
+            }
+        }
+
+        if (fix_j < 0) break;
+
+        fixed[fix_j] = 1;
+        fixed_vals[fix_j] = s_conf_run[fix_j];
+        n_fixed++;
+
+        printf("  → Fixed s[%d] = %+d  (true = %+d) %s\n",
+               fix_j, fixed_vals[fix_j], inst.s_true[fix_j],
+               (fixed_vals[fix_j] == inst.s_true[fix_j]) ? "✓" : "✗");
     }
 
     clock_t t_end = clock();
