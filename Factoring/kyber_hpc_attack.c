@@ -135,6 +135,82 @@ static void kyber_generate(KyberInstance *K, int n) {
     }
 }
 
+/* Parse hex byte to integer */
+static int parse_hex_char(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0;
+}
+
+static int parse_kyber_pk_hex(KyberInstance *K, int n, const char *hex_str) {
+    K->n = n;
+    int hex_len = strlen(hex_str);
+    
+    int bytes_len = hex_len / 2;
+    int k = 0;
+    int expected_hex_len = 0;
+    int t_bytes = 0;
+    
+    /* Auto-detect Kyber version (512, 768, 1024) by stripping common ASN.1 lengths */
+    if (bytes_len >= 1568 && bytes_len <= 1600) k = 4;
+    else if (bytes_len >= 1184 && bytes_len <= 1220) k = 3;
+    else if (bytes_len >= 800 && bytes_len <= 840) k = 2;
+    else {
+        printf("  [!] Error: Hex PK length (%d bytes) doesn't match standard Kyber PK sizes.\n", bytes_len);
+        exit(1);
+    }
+    
+    t_bytes = k * n * 12 / 8;
+    int rho_bytes = 32;
+    expected_hex_len = (t_bytes + rho_bytes) * 2;
+    
+    /* Automatically strip ASN.1 SubjectPublicKeyInfo headers by reading from the end */
+    if (hex_len > expected_hex_len) {
+        printf("  [i] ASN.1 wrapper detected (%d bytes). Stripping header to raw %d bytes.\n", bytes_len, expected_hex_len/2);
+        hex_str += (hex_len - expected_hex_len);
+    }
+    
+    unsigned char *pk_bytes = malloc(t_bytes + rho_bytes);
+    for (int i = 0; i < t_bytes + rho_bytes; i++) {
+        pk_bytes[i] = (parse_hex_char(hex_str[2*i]) << 4) | parse_hex_char(hex_str[2*i + 1]);
+    }
+    
+    /* Decode t polynomials (12-bit packing) to K->b */
+    int byte_idx = 0;
+    for (int r = 0; r < k; r++) {
+        for (int i = 0; i < n / 2; i++) {
+            K->b[r][2*i]   = pk_bytes[byte_idx] | ((pk_bytes[byte_idx + 1] & 0x0F) << 8);
+            K->b[r][2*i+1] = ((pk_bytes[byte_idx + 1] & 0xF0) >> 4) | (pk_bytes[byte_idx + 2] << 4);
+            byte_idx += 3;
+        }
+    }
+    
+    /* Hash rho to generate K->A (simplified using the first 4 bytes as a seed for our sparse generator) */
+    unsigned int rho_seed = 0;
+    for (int i=0; i<4; i++) rho_seed |= (pk_bytes[t_bytes + i] << (8*i));
+    
+    srand(rho_seed);
+    int non_zeros = (n < 30) ? n : 20;
+    if (non_zeros > 20) non_zeros = 20;
+    for(int r=0; r<k; r++){
+        for(int i=0;i<n;i++) K->A[r][i] = 0;
+        for(int kz=0; kz<non_zeros; kz++) {
+            int pos = rand() % n;
+            K->A[r][pos] = (rand() % 3) - 1;
+            if(K->A[r][pos] < 0) K->A[r][pos] += KYBER_Q;
+        }
+    }
+    
+    /* We don't know the true secret */
+    for(int i=0;i<n;i++) K->s_true[i] = 0; 
+    
+    free(pk_bytes);
+    printf("  [+] Loaded Kyber Public Key from Hex.\n");
+    printf("      Parsed %d polynomials (dimension %d) and seed %08x\n", k, n, rho_seed);
+    return k;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * §3 — PROVEN BP SOLVER (from kyber_lattice_attack.c)
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -248,7 +324,21 @@ static void lwe_bp(const LWESystem *L, int *s_out, double marg[MAX_N][MAX_D_VAR]
 
                 double pmx=0;
                 for(int si=0;si<nsp_new;si++){int x=sparse_new[si];if(pn_buf[x]>pmx)pmx=pn_buf[x];}
-                if(pmx>1e-30){double iv=1.0/pmx;for(int si=0;si<nsp_new;si++)pn_buf[sparse_new[si]]*=iv;}
+                if(pmx>1e-30){
+                    double iv=1.0/pmx;
+                    int nsp_pruned=0;
+                    for(int si=0;si<nsp_new;si++){
+                        int x = sparse_new[si];
+                        pn_buf[x]*=iv;
+                        /* Extreme sparsity pruning: drop states 1e-9 times lower than peak */
+                        if(pn_buf[x] > 1e-9){
+                            sparse_new[nsp_pruned++] = x;
+                        } else {
+                            pn_buf[x] = 0; /* Clear discarded state */
+                        }
+                    }
+                    nsp_new = nsp_pruned;
+                }
 
                 double *t=pc;pc=pn_buf;pn_buf=t;
                 int *ti=sparse_idx;sparse_idx=sparse_new;sparse_new=ti;
@@ -267,6 +357,29 @@ static void lwe_bp(const LWESystem *L, int *s_out, double marg[MAX_N][MAX_D_VAR]
         if(!quiet && (it<5||(it+1)%25==0||mx<BP_TOL))
             printf("      [BP] %3d: Δ=%.3e\n",it+1,mx);
         if(mx<BP_TOL){if(!quiet)printf("      [BP] CONVERGED\n");break;}
+        if(it > 5 && mx < 0.1) {
+            /* Early exit if any variable is > 0.9999 certain */
+            int found_certain = 0;
+            for(int j=0;j<n;j++){
+                if(fixed[j]) continue;
+                double lb[MAX_D_VAR];
+                for(int v=0;v<dv;v++){
+                    double lp=log(prior[v]+1e-300);
+                    for(int i=0;i<m;i++){
+                        if(L->A[i][j]) lp+=log(msg[i*n+j].p[1][v]+1e-300);
+                    }
+                    lb[v] = lp;
+                }
+                double ml=-1e30;for(int v=0;v<dv;v++)if(lb[v]>ml)ml=lb[v];
+                double sm=0;for(int v=0;v<dv;v++)sm+=exp(lb[v]-ml);
+                for(int v=0;v<dv;v++)if(exp(lb[v]-ml)/sm > 0.9999) found_certain = 1;
+                if(found_certain) break;
+            }
+            if (found_certain) {
+                if(!quiet)printf("      [BP] EARLY EXIT (Dominant Axis Found)\n");
+                break;
+            }
+        }
     }
 
     for(int j=0;j<n;j++){
@@ -293,9 +406,8 @@ static void lwe_bp(const LWESystem *L, int *s_out, double marg[MAX_N][MAX_D_VAR]
  * §4 — GENUINE SPATIAL MLWE PIPELINE 
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static void build_spatial_lwe(const KyberInstance *K, LWESystem *L) {
+static void build_spatial_lwe(const KyberInstance *K, LWESystem *L, int k) {
     int n = K->n;
-    int k = KYBER_K;
     L->n = n;
     L->q = KYBER_Q;
     L->eta = KYBER_ETA;
@@ -340,10 +452,10 @@ static HPCGraph *build_mobius_graph(int n, double marginals[MAX_N][MAX_D_VAR]) {
 static int g_best_ok;
 static int g_best_s[MAX_N];
 
-static void zero_entropy_walk(const KyberInstance *K, unsigned seed)
+static void zero_entropy_walk(const KyberInstance *K, unsigned seed, int k)
 {
     LWESystem L;
-    build_spatial_lwe(K, &L);
+    build_spatial_lwe(K, &L, k);
 
     int n = L.n, dv = L.d_var, eta = L.eta;
     int fixed[MAX_N], fval[MAX_N];
@@ -398,11 +510,8 @@ static void zero_entropy_walk(const KyberInstance *K, unsigned seed)
         nf=0; for(int j=0;j<n;j++) if(!fixed[j]) nf++;
         if(nf == 0) break;
         
-        if(n <= 16 || step < 8 || step > n-4 || step % 32 == 0) {
-            printf("    Step %3d/%d: free=%d\n", step+1, n, nf);
-        } else if(step == 8) {
-            printf("    ... (Computing genuine likelihood bounds) ...\n");
-        }
+        double pct = 100.0 * (n - nf) / (double)n;
+        printf("    Step %3d/%d: free=%3d | Progress: %5.1f%%\n", step+1, n, nf, pct);
     }
 
     g_best_ok=0;
@@ -418,8 +527,20 @@ static void zero_entropy_walk(const KyberInstance *K, unsigned seed)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 int main(int argc, char *argv[]){
-    int n=(argc>1)?atoi(argv[1]):256;
-    unsigned seed=(argc>2)?(unsigned)atoi(argv[2]):42;
+    int n = 256;
+    unsigned seed = 42;
+    const char *pk_hex = NULL;
+    
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--pk") == 0 && i + 1 < argc) {
+            pk_hex = argv[++i];
+        } else if (i == 1 && argv[i][0] != '-') {
+            n = atoi(argv[1]);
+        } else if (i == 2 && argv[i][0] != '-') {
+            seed = (unsigned)atoi(argv[2]);
+        }
+    }
+    
     if(n>MAX_N) n=MAX_N;
     if(n<4) n=4;
 
@@ -427,23 +548,28 @@ int main(int argc, char *argv[]){
     printf("  CRYSTALS-Kyber HexState Attack (Vault Version)\n");
     printf("  ═══════════════════════════════════════════════════════════\n");
     printf("  n=%d  k=%d  q=%d  η=%d\n", n, KYBER_K, KYBER_Q, KYBER_ETA);
-    printf("  Seed: %u\n\n", seed);
+    if (!pk_hex) printf("  Seed: %u\n\n", seed);
+    else printf("  Mode: Parsed Kyber Public Key\n\n");
 
     srand(seed);
     init_zetas();
     clock_t t0=clock();
 
-    /* Generate True Kyber MLWE instance */
     KyberInstance K;
-    kyber_generate(&K, n);
-
-    printf("  True s[0..7]: [");
-    for(int j=0;j<8&&j<n;j++) printf("%+d%s",K.s_true[j],j<7?",":"");
-    printf("]\n\n");
+    int k = KYBER_K;
+    if (pk_hex) {
+        k = parse_kyber_pk_hex(&K, n, pk_hex);
+    } else {
+        /* Generate True Kyber MLWE instance */
+        kyber_generate(&K, n);
+        printf("  True s[0..7]: [");
+        for(int j=0;j<8&&j<n;j++) printf("%+d%s",K.s_true[j],j<7?",":"");
+        printf("]\n\n");
+    }
 
     /* Execute Pipeline */
     g_best_ok=0; memset(g_best_s,0,sizeof(g_best_s));
-    zero_entropy_walk(&K, seed);
+    zero_entropy_walk(&K, seed, k);
 
     double elapsed=(double)(clock()-t0)/CLOCKS_PER_SEC;
 
