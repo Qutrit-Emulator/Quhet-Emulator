@@ -27,11 +27,11 @@
 #define MAX_D_VAR   9
 #define MAX_ETA     4
 
-#define BP_MAX_ITER 300
+#define BP_MAX_ITER 100
 #define BP_TOL      1e-9
-#define BP_DAMP_START 0.50
+#define BP_DAMP_START 0.40
 #define BP_DAMP_END   0.02
-#define BP_COOL_ITERS 200
+#define BP_COOL_ITERS 60
 #define BP_NUM_STARTS 3
 #define BP_DIRECT     8     /* BP solves perfectly at n_free ≤ this      */
 
@@ -103,6 +103,9 @@ static void lwe_bp(const LWEInstance *L, int *s_out, double *conf,
 
     double *pc=(double*)calloc(q,sizeof(double));
     double *pn_buf=(double*)calloc(q,sizeof(double));
+    int *sparse_idx=(int*)calloc(q,sizeof(int));  /* Non-zero indices in pc */
+    int *sparse_new=(int*)calloc(q,sizeof(int));
+    int *pn_touched=(int*)calloc(q,sizeof(int));  /* Flags for new non-zero */
 
     for(int it=0;it<BP_MAX_ITER;it++){
         double mx=0;
@@ -118,18 +121,40 @@ static void lwe_bp(const LWEInstance *L, int *s_out, double *conf,
             }
         }
 
-        /* Check→Var: direct convolution */
+        /* Check→Var: direct convolution (SPARSE) */
         for(int i=0;i<m;i++) for(int j=0;j<n;j++){
             int e=i*n+j;
             memset(pc,0,sizeof(double)*q); pc[0]=1.0;
+            int nsp=1; sparse_idx[0]=0;  /* Initially only index 0 is non-zero */
+
             for(int jp=0;jp<n;jp++){if(jp==j)continue;int ei=i*n+jp;
                 memset(pn_buf,0,sizeof(double)*q);
-                for(int x=0;x<q;x++){if(pc[x]<1e-30)continue;for(int v=0;v<dv;v++){double p=msg[ei].p[0][v];if(p<1e-30)continue;int nx=mod_pos(x+L->A[i][jp]*(v-eta),q);pn_buf[nx]+=pc[x]*p;}}
-                double pmx=0;for(int x=0;x<q;x++)if(pn_buf[x]>pmx)pmx=pn_buf[x];
-                if(pmx>1e-30){double iv=1.0/pmx;for(int x=0;x<q;x++)pn_buf[x]*=iv;}
+                int nsp_new=0;
+                memset(pn_touched,0,sizeof(int)*q);
+
+                for(int si=0;si<nsp;si++){
+                    int x=sparse_idx[si];
+                    if(pc[x]<1e-30)continue;
+                    for(int v=0;v<dv;v++){
+                        double p=msg[ei].p[0][v];
+                        if(p<1e-30)continue;
+                        int nx=mod_pos(x+L->A[i][jp]*(v-eta),q);
+                        pn_buf[nx]+=pc[x]*p;
+                        if(!pn_touched[nx]){pn_touched[nx]=1;sparse_new[nsp_new++]=nx;}
+                    }
+                }
+
+                double pmx=0;
+                for(int si=0;si<nsp_new;si++){int x=sparse_new[si];if(pn_buf[x]>pmx)pmx=pn_buf[x];}
+                if(pmx>1e-30){double iv=1.0/pmx;for(int si=0;si<nsp_new;si++)pn_buf[sparse_new[si]]*=iv;}
+
+                /* Swap */
                 double *t=pc;pc=pn_buf;pn_buf=t;
+                int *ti=sparse_idx;sparse_idx=sparse_new;sparse_new=ti;
+                nsp=nsp_new;
             }
-            for(int v=0;v<dv;v++){int val=v-eta;double s=0;for(int x=0;x<q;x++){int ei=mod_pos(L->b[i]-L->A[i][j]*val-x,q);s+=pc[x]*etbl[ei];}nmsg[e].p[1][v]=s;}
+
+            for(int v=0;v<dv;v++){int val=v-eta;double s=0;for(int si=0;si<nsp;si++){int x=sparse_idx[si];int ei2=mod_pos(L->b[i]-L->A[i][j]*val-x,q);s+=pc[x]*etbl[ei2];}nmsg[e].p[1][v]=s;}
             norm_p(nmsg[e].p[1],dv);
         }
 
@@ -160,7 +185,7 @@ static void lwe_bp(const LWEInstance *L, int *s_out, double *conf,
             for(int v=0;v<dv;v++)printf("%.3f%s",pr2[v],v<dv-1?" ":"");printf("]\n");
         }
     }
-    free(msg);free(nmsg);free(etbl);free(pc);free(pn_buf);
+    free(msg);free(nmsg);free(etbl);free(pc);free(pn_buf);free(sparse_idx);free(sparse_new);free(pn_touched);
 }
 
 /* ═══ §3 — Validation ═══ */
