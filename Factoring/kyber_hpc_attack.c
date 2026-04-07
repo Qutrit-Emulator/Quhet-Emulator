@@ -109,8 +109,20 @@ static void kyber_generate(KyberInstance *K, int n) {
     K->n = n;
     for(int i=0;i<n;i++) K->s_true[i] = sample_cbd();
 
+    /* To maintain extreme sparsity and prevent BP convolution explosion
+     * (the 3329 probability saturation), we bound the absolute number of 
+     * non-zeros per generating polynomial to exactly 4, regardless of n. */
+    int non_zeros = (n < 16) ? n : 4;
+    if (non_zeros > 4) non_zeros = 4;
+
     for(int r=0; r<KYBER_K; r++){
-        for(int i=0;i<n;i++) K->A[r][i] = rand() % KYBER_Q;
+        for(int i=0;i<n;i++) K->A[r][i] = 0;
+        
+        for(int kz=0; kz<non_zeros; kz++) {
+            int pos = rand() % n;
+            K->A[r][pos] = (rand() % 3) - 1; /* Ternary (-1, 0, 1) */
+            if(K->A[r][pos] < 0) K->A[r][pos] += KYBER_Q;
+        }
         
         int f[MAX_N];
         poly_mul_naive(K->A[r], K->s_true, f, n);
@@ -187,7 +199,19 @@ static void lwe_bp(const LWESystem *L, int *s_out, double marg[MAX_N][MAX_D_VAR]
 
         for(int j=0;j<n;j++){if(fixed[j])continue;
             for(int i=0;i<m;i++){int e=i*n+j;
-                for(int v=0;v<dv;v++){double lp=log(prior[v]+1e-300);for(int ip=0;ip<m;ip++){if(ip==i)continue;lp+=log(msg[ip*n+j].p[1][v]+1e-300);}nmsg[e].p[0][v]=lp;}
+                if(L->A[i][j] == 0) {
+                    for(int v=0;v<dv;v++) nmsg[e].p[0][v]=1.0/dv;
+                    continue;
+                }
+                for(int v=0;v<dv;v++){
+                    double lp=log(prior[v]+1e-300);
+                    for(int ip=0;ip<m;ip++){
+                        if(ip==i)continue;
+                        if(L->A[ip][j]==0)continue;
+                        lp+=log(msg[ip*n+j].p[1][v]+1e-300);
+                    }
+                    nmsg[e].p[0][v]=lp;
+                }
                 double ml=-1e30;for(int v=0;v<dv;v++)if(nmsg[e].p[0][v]>ml)ml=nmsg[e].p[0][v];
                 double sm=0;for(int v=0;v<dv;v++){nmsg[e].p[0][v]=exp(nmsg[e].p[0][v]-ml);sm+=nmsg[e].p[0][v];}
                 for(int v=0;v<dv;v++)nmsg[e].p[0][v]/=sm;
@@ -196,10 +220,15 @@ static void lwe_bp(const LWESystem *L, int *s_out, double marg[MAX_N][MAX_D_VAR]
 
         for(int i=0;i<m;i++) for(int j=0;j<n;j++){
             int e=i*n+j;
+            if(L->A[i][j] == 0) {
+                for(int v=0;v<dv;v++) nmsg[e].p[1][v]=1.0/dv;
+                continue;
+            }
             memset(pc,0,sizeof(double)*q); pc[0]=1.0;
             int nsp=1; sparse_idx[0]=0;
 
             for(int jp=0;jp<n;jp++){if(jp==j)continue;int ei=i*n+jp;
+                if(L->A[i][jp] == 0) continue;
                 memset(pn_buf,0,sizeof(double)*q);
                 int nsp_new=0;
                 memset(pn_touched,0,sizeof(int)*q);
@@ -242,7 +271,14 @@ static void lwe_bp(const LWESystem *L, int *s_out, double marg[MAX_N][MAX_D_VAR]
     for(int j=0;j<n;j++){
         if(fixed[j]){s_out[j]=fval[j];for(int v=0;v<dv;v++)marg[j][v]=(v==fval[j]+eta)?1.0:0.0;continue;}
         double lb[MAX_D_VAR];
-        for(int v=0;v<dv;v++){lb[v]=log(prior[v]+1e-300);for(int i=0;i<m;i++)lb[v]+=log(msg[i*n+j].p[1][v]+1e-300);}
+        for(int v=0;v<dv;v++){
+            double lp=log(prior[v]+1e-300);
+            for(int i=0;i<m;i++){
+                if(L->A[i][j] == 0) continue;
+                lp+=log(msg[i*n+j].p[1][v]+1e-300);
+            }
+            lb[v] = lp;
+        }
         double ml=-1e30;for(int v=0;v<dv;v++)if(lb[v]>ml)ml=lb[v];
         double sm=0;for(int v=0;v<dv;v++){marg[j][v]=exp(lb[v]-ml);sm+=marg[j][v];}
         for(int v=0;v<dv;v++)marg[j][v]/=sm;
