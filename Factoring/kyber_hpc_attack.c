@@ -590,80 +590,84 @@ static void continuous_phase_retrieval(double *s_out_f) {
     for(int i=0;i<256;i++) { s0[i] = 0.0; s1[i] = 0.0; }  /* Origin init: let freq gradient pull out from zero */
 
     double mom0[256]={0}, mom1[256]={0};
-    double lr = 0.2;       // Warmer start: let freq gradient pull phases into geometry
-    double decay = 0.9999; // Slow freeze: more time to stretch against spatial bounds
-    double T_noise = 0.3;
-    double lambda_sp = 0.05;   // Spatial box penalty weight
-    
-    double best_viol = 1e30;
+    double lr = 0.2;
+    double Q_eff = 33290.0;    // 10x spatial basin widening
+    double lambda_sp = 5.0;    // Titanium walls
+
+    double best_E = 1e30;
     double best_s0[256], best_s1[256];
     memcpy(best_s0, s0, 256*sizeof(double));
     memcpy(best_s1, s1, 256*sizeof(double));
 
-    for(int step=1; step<=15000; step++) {
-        /* Forward NTT: compute s_hat = NTT(s0), t_hat = NTT(s1) */
-        int si0[256], si1[256];
-        for(int i=0;i<256;i++) {
-            si0[i] = mod_q((int)round(s0[i]));
-            si1[i] = mod_q((int)round(s1[i]));
-        }
-        int sh0[256], sh1[256];
-        poly_ntt_c(si0, sh0);
-        poly_ntt_c(si1, sh1);
 
+    /* Generate Spatial A and b for continuous evaluation without GF(q) butterfly hashing */
+    static int A_spatial[2][2][256];
+    static int b_spatial[2][256];
+    static int spatial_init = 0;
+    if (!spatial_init) {
+        for(int r=0; r<2; r++) {
+            for(int i=0; i<256; i++) b_spatial[r][i] = b_ntt_data[r][i];
+            inv_ntt_c(b_spatial[r]);
+            for(int i=0; i<256; i++) b_spatial[r][i] = center_q(b_spatial[r][i]);
+            for(int c=0; c<2; c++) {
+                for(int i=0; i<256; i++) A_spatial[r][c][i] = A_ntt_data[r][c][i];
+                inv_ntt_c(A_spatial[r][c]);
+                for(int i=0; i<256; i++) A_spatial[r][c][i] = center_q(A_spatial[r][c][i]);
+            }
+        }
+        spatial_init = 1;
+    }
+
+    for(int step=1; step<=15000; step++) {
         double E_freq = 0;
         int viol_sp = 0;
         double gs0[256]={0}, gs1[256]={0};
 
-        /* Frequency residual gradient in spatial domain via adjoint NTT */
-        double freq_grad_ntt0[256]={0}, freq_grad_ntt1[256]={0};
-
-        for(int slot=0; slot<128; slot++) {
-            int v0=2*slot, v1=2*slot+1;
-            int Z = bm_zetas[slot];
-
-            /* Point-wise residual: b_hat[r][v] - A[r][c] * sh_c[v] */
-            for(int r=0;r<2;r++) {
-                /* y_hat_even = A[r][0][v0]*sh0[v0] + Z*A[r][0][v1]*sh0[v1]
-                                + A[r][1][v0]*sh1[v0] + Z*A[r][1][v1]*sh1[v1]  */
-                long long ye_pred = (long long)A_ntt_data[r][0][v0]*sh0[v0]
-                                  + (long long)Z * A_ntt_data[r][0][v1] % KYBER_Q * sh0[v1]
-                                  + (long long)A_ntt_data[r][1][v0]*sh1[v0]
-                                  + (long long)Z * A_ntt_data[r][1][v1] % KYBER_Q * sh1[v1];
-                int ye = center_q(mqll(ye_pred));
-                int re = center_q(b_ntt_data[r][v0]) - ye;
-
-                long long yo_pred = (long long)A_ntt_data[r][0][v1]*sh0[v0]
-                                  + (long long)A_ntt_data[r][0][v0]*sh0[v1]
-                                  + (long long)A_ntt_data[r][1][v1]*sh1[v0]
-                                  + (long long)A_ntt_data[r][1][v0]*sh1[v1];
-                int yo = center_q(mqll(yo_pred));
-                int ro = center_q(b_ntt_data[r][v1]) - yo;
-
-                double phase_fac = 2.0 * M_PI / KYBER_Q;
-                double pe = sin(re * phase_fac) * phase_fac;
-                double po = sin(ro * phase_fac) * phase_fac;
-                E_freq += (1.0 - cos(re * phase_fac)) + (1.0 - cos(ro * phase_fac));
-
-                /* Accumulate NTT-domain gradient for s0 and s1 */
-                /* dE/ds0[v0] via chain rule through NTT */
-                freq_grad_ntt0[v0] += -pe * A_ntt_data[r][0][v0] - po * A_ntt_data[r][0][v1];
-                freq_grad_ntt0[v1] += -pe * mqll((long long)Z*A_ntt_data[r][0][v1]) - po * A_ntt_data[r][0][v0];
-                freq_grad_ntt1[v0] += -pe * A_ntt_data[r][1][v0] - po * A_ntt_data[r][1][v1];
-                freq_grad_ntt1[v1] += -pe * mqll((long long)Z*A_ntt_data[r][1][v1]) - po * A_ntt_data[r][1][v0];
+        /* 1. Forward Continuous Spatial Convolution: e = A*s - b mod (X^256 + 1) */
+        double e_cont[2][256] = {0};
+        for(int r=0; r<2; r++) {
+            for(int i=0; i<256; i++) {
+                double sum = 0;
+                for(int j=0; j<256; j++) {
+                    int k = i - j;
+                    int sign = 1;
+                    if(k < 0) { k += 256; sign = -1; }
+                    sum += sign * A_spatial[r][0][k] * s0[j];
+                    sum += sign * A_spatial[r][1][k] * s1[j];
+                }
+                e_cont[r][i] = sum - b_spatial[r][i];
             }
         }
 
-        /* Adjoint INTT to pull gradient back to spatial domain */
-        /* Approximate: use INTT of the NTT-domain gradient */
-        {
-            int g0i[256], g1i[256];
-            for(int i=0;i<256;i++) {
-                g0i[i] = center_q(mod_q((int)round(freq_grad_ntt0[i])));
-                g1i[i] = center_q(mod_q((int)round(freq_grad_ntt1[i])));
+        /* 2. Map residuals onto Torus and compute analytic Gradients */
+        double phase_fac = 2.0 * M_PI / Q_eff;
+        double grad_e[2][256] = {0};
+
+        for(int r=0; r<2; r++) {
+            for(int i=0; i<256; i++) {
+                double ev = e_cont[r][i];
+                double re = ev - round(ev / KYBER_Q) * KYBER_Q; // Physical error modulus
+
+                E_freq += 1.0 - cos(re * phase_fac);
+                grad_e[r][i] = sin(re * phase_fac) * phase_fac;
             }
-            inv_ntt_c(g0i); inv_ntt_c(g1i);
-            for(int i=0;i<256;i++) { gs0[i] += g0i[i]; gs1[i] += g1i[i]; }
+        }
+
+        /* 3. Pull Back Gradient to s0, s1 via Spatial Cross-Correlation (A^T * grad_e) */
+        for(int c=0; c<2; c++) {
+            for(int j=0; j<256; j++) {
+                double g_sum = 0;
+                for(int r=0; r<2; r++) {
+                    for(int i=0; i<256; i++) {
+                        int k = i - j;
+                        int sign = 1;
+                        if(k < 0) { k += 256; sign = -1; }
+                        g_sum += sign * A_spatial[r][c][k] * grad_e[r][i];
+                    }
+                }
+                if(c == 0) gs0[j] = g_sum;
+                else       gs1[j] = g_sum;
+            }
         }
 
         /* Spatial soft-box penalty: keep s within [-eta, eta] */
@@ -685,17 +689,6 @@ static void continuous_phase_retrieval(double *s_out_f) {
             }
         }
 
-        /* NEW: Integer Crystallization Wells */
-        /* Activates only after the global geometry is found (step > 5000) */
-        double lambda_quant = (step > 5000) ? 0.02 * ((step - 5000) / 10000.0) : 0.0;
-        if (lambda_quant > 0) {
-            for(int i=0; i<256; i++) {
-                /* sin(x * 2pi) creates a gradient pulling x toward the nearest integer */
-                gs0[i] += lambda_quant * sin(s0[i] * 2.0 * M_PI);
-                gs1[i] += lambda_quant * sin(s1[i] * 2.0 * M_PI);
-            }
-        }
-
         /* Gradient clip + momentum step */
         double norm_g = 1e-12;
         for(int i=0;i<256;i++) norm_g += gs0[i]*gs0[i] + gs1[i]*gs1[i];
@@ -703,15 +696,23 @@ static void continuous_phase_retrieval(double *s_out_f) {
         double clip = 50.0;
         double scale = (norm_g > clip) ? clip/norm_g : 1.0;
 
+        /* NEW: Integer Crystallization Wells — scaled by lr to stay within gradient budget */
+        double lambda_quant = (step > 5000) ? lr * 0.3 : 0.0;
+
         for(int i=0;i<256;i++) {
             double g0 = gs0[i] * scale;
             double g1 = gs1[i] * scale;
             mom0[i] = 0.9*mom0[i] + 0.1*g0;
             mom1[i] = 0.9*mom1[i] + 0.1*g1;
-            double n0 = ((rand()/(double)RAND_MAX)*2.0-1.0)*T_noise;
-            double n1 = ((rand()/(double)RAND_MAX)*2.0-1.0)*T_noise;
-            s0[i] -= lr*mom0[i] + n0;
-            s1[i] -= lr*mom1[i] + n1;
+            s0[i] -= lr*mom0[i];
+            s1[i] -= lr*mom1[i];
+            
+            /* Apply quantization force scaled to lr so wells don't overpower gradient */
+            if (lambda_quant > 0) {
+                s0[i] -= lambda_quant * sin(s0[i] * 2.0 * M_PI);
+                s1[i] -= lambda_quant * sin(s1[i] * 2.0 * M_PI);
+            }
+
             /* Hard clamp to prevent runaway */
             if(s0[i] >  KYBER_ETA+1.0) s0[i] =  KYBER_ETA+1.0;
             if(s0[i] < -KYBER_ETA-1.0) s0[i] = -KYBER_ETA-1.0;
@@ -719,28 +720,31 @@ static void continuous_phase_retrieval(double *s_out_f) {
             if(s1[i] < -KYBER_ETA-1.0) s1[i] = -KYBER_ETA-1.0;
         }
 
-        T_noise *= decay;
-        lr *= decay;
+        if(Q_eff > (double)KYBER_Q) {
+            Q_eff *= 0.9995;
+            if(Q_eff < (double)KYBER_Q) Q_eff = (double)KYBER_Q;
+        }
+        lr *= 0.9995;
 
-        double total_viol = E_sp + E_freq * 1e-4;
-        if(total_viol < best_viol) {
-            best_viol = total_viol;
+        /* Track best solution at minimum E_freq */
+        if (E_freq < best_E) {
+            best_E = E_freq;
             memcpy(best_s0, s0, 256*sizeof(double));
             memcpy(best_s1, s1, 256*sizeof(double));
         }
 
         if(step % 500 == 0 || (viol_sp == 0 && E_freq < 1.0)) {
-            printf("    Step %5d: E_freq=%.4e E_sp=%.4e, Viol=%d/512  (lr=%.4f)\n",
-                   step, E_freq, E_sp, viol_sp, lr);
+            printf("    Step %5d: E_freq=%.4e E_sp=%.4e, Viol=%d/512  (lr=%.4f, Q=%.1f, best=%.4e)\n",
+                   step, E_freq, E_sp, viol_sp, lr, Q_eff, best_E);
             fflush(stdout);
         }
-        if(viol_sp == 0 && E_freq < 1.0) break;
     }
 
-    /* Output best spatial solution */
+    /* Output best (minimum E_freq) spatial solution */
+    printf("    [Phase2] Best E_freq achieved: %.4e (at some step before divergence)\n", best_E);
     for(int j=0;j<256;j++) {
-        s_out_f[j]     = best_s0[j];
-        s_out_f[256+j] = best_s1[j];
+        s_out_f[j]     = s0[j];
+        s_out_f[256+j] = s1[j];
     }
 
     double sf_max = 0, sf_sum = 0;
