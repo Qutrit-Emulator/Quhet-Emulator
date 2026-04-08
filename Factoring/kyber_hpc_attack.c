@@ -731,8 +731,8 @@ static void continuous_phase_retrieval(double *s_out_f) {
         }
         lr *= 0.9995;
 
-        /* Track best solution at minimum E_freq */
-        if (E_freq < best_E) {
+        /* Track best solution at minimum E_freq — ONLY after Q_eff has converged */
+        if (Q_eff <= (double)KYBER_Q && E_freq < best_E) {
             best_E = E_freq;
             memcpy(best_s0, s0, 256*sizeof(double));
             memcpy(best_s1, s1, 256*sizeof(double));
