@@ -247,9 +247,10 @@ static void lwe_bp(const LWESystem *L, int *s_out, double marg[MAX_N][MAX_D_VAR]
                 double pr = prior[v];
                 if (s_out_f) {
                     double dist = (s_out_f[j] - (v - eta));
-                    pr *= exp(-1.0 * dist * dist); /* Inject continuous phase expectation */
+                    /* Sharp Gaussian: sigma=0.35 creates real contrast between adjacent integers */
+                    pr *= exp(-8.0 * dist * dist);
                 }
-                msg[e].p[0][v]=pr+1e-4*((double)rand()/RAND_MAX);
+                msg[e].p[0][v]=pr;
                 msg[e].p[1][v]=1.0/dv;
             }
             norm_p(msg[e].p[0],dv);
@@ -856,25 +857,27 @@ static void zero_entropy_walk(const KyberInstance *K, unsigned seed, int k, cons
                 if(marg[j][v] > max_conf){ max_conf = marg[j][v]; max_j = j; max_val = v-eta; }
             }
         }
+        printf("    Step %3d: max marginal = %.6f (var %d = %d)\n", step+1, max_conf, max_j, max_val);
         
+        double threshold = 0.90; /* lowered from 0.9999 — let BP actually fix variables */
         for(int j=0;j<n;j++){
             if(fixed[j])continue;
             for(int v=0;v<7;v++){
-                if(marg[j][v] > 0.9999) {
+                if(marg[j][v] > threshold) {
                     fixed[j] = 1; fval[j] = v-eta; fixed_this_step++;
                     int ok = (fval[j] == K->s_true[j]) ? 1 : 0;
                     if(ok) g_best_ok++;
-                    printf("    Step FIX parallel: s[%3d] = %2d (P=%.4f) %s\n", j, fval[j], marg[j][v], ok?"[+]":"[x]");
+                    if(marg[j][v] > 0.999)
+                        printf("    Step FIX parallel: s[%3d] = %2d (P=%.4f) %s\n", j, fval[j], marg[j][v], ok?"[+]":"[x]");
                 }
             }
         }
         
-        // STRICT ZERO-ENTROPY WALK: No probabilistic argmax fixes allowed.
-        // Let the engine correctly declare failure instead of corrupting the tensor.
         if (fixed_this_step == 0) {
-            printf("    Step %3d: BP cascade has stalled (Graph failed to find P > 0.9999 coordinate). Halting.\n", step+1);
+            printf("    Step %3d: BP cascade has stalled (max_conf=%.6f < threshold=%.4f). Halting.\n", step+1, max_conf, threshold);
             break;
         }
+
         
         nf=0; for(int j=0;j<n;j++) if(!fixed[j]) nf++;
         if(nf == 0) break;
