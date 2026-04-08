@@ -685,6 +685,17 @@ static void continuous_phase_retrieval(double *s_out_f) {
             }
         }
 
+        /* NEW: Integer Crystallization Wells */
+        /* Activates only after the global geometry is found (step > 5000) */
+        double lambda_quant = (step > 5000) ? 0.02 * ((step - 5000) / 10000.0) : 0.0;
+        if (lambda_quant > 0) {
+            for(int i=0; i<256; i++) {
+                /* sin(x * 2pi) creates a gradient pulling x toward the nearest integer */
+                gs0[i] += lambda_quant * sin(s0[i] * 2.0 * M_PI);
+                gs1[i] += lambda_quant * sin(s1[i] * 2.0 * M_PI);
+            }
+        }
+
         /* Gradient clip + momentum step */
         double norm_g = 1e-12;
         for(int i=0;i<256;i++) norm_g += gs0[i]*gs0[i] + gs1[i]*gs1[i];
