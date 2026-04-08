@@ -587,7 +587,12 @@ static void continuous_phase_retrieval(double *s_out_f) {
 
     /* Optimization variables: s0[256], s1[256] in continuous spatial domain */
     double s0[256], s1[256];
-    for(int i=0;i<256;i++) { s0[i] = 0.0; s1[i] = 0.0; }  /* Origin init: let freq gradient pull out from zero */
+
+    /* Thermal Initialization: Scatter the phases inside the Titanium Walls */
+    for(int i=0;i<256;i++) { 
+        s0[i] = ((rand()/(double)RAND_MAX) * 4.0) - 2.0; /* Random between -2.0 and 2.0 */
+        s1[i] = ((rand()/(double)RAND_MAX) * 4.0) - 2.0;
+    }
 
     double mom0[256]={0}, mom1[256]={0};
     double lr = 0.2;
