@@ -1478,8 +1478,8 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
     MobiusAmplitudeSheet *mobius = mobius_create(graph);
 
-    /* ── Multi-Start BP: 30 random seeds, select lowest entropy basin ── */
-    #define N_STARTS 30
+    /* ── Multi-Start BP: 10 random seeds, select lowest entropy basin ── */
+    #define N_STARTS 10
     double best_entropy = 1e30;
     /* Heap-allocate to prevent stack overflow with large N (n_sites can reach ~4800) */
     double (*best_dressed_re)[6] = (double(*)[6])calloc(n_sites, sizeof(double[6]));
@@ -1631,7 +1631,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
      *  3. Cross-shot GCD/LCM refinement as primary mechanism
      *  4. Deep CF only on candidates with ≥3 votes                         */
     printf("\n  ═══ INTELLIGENT MCMC PERIOD RECOVERY ═══\n");
-    const int num_shots = 50000;
+    const int num_shots = 5000;
     int *mcmc_state = (int*)calloc(n_sites_raw, sizeof(int));
     int sweep_pos = 0;
 
@@ -1991,8 +1991,14 @@ int main(int argc, char **argv)
     printf("╚══════════════════════════════════════════════════════════════════╝\n\n");
 
     /* Try different bases if auto */
-    int max_bases = auto_a ? 20 : 1;
-    uint64_t base_list[] = {2,3,4,5,6,7,8,10,11,13,14,17,19,23,29,31,37,41,43,47};
+    int max_bases = auto_a ? 100 : 1;
+    uint64_t base_list[] = {
+        2,3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59,61,67,71,
+        73,79,83,89,97,101,103,107,109,113,127,131,137,139,149,151,157,163,167,173,
+        179,181,191,193,197,199,211,223,227,229,233,239,241,251,257,263,269,271,277,281,
+        283,293,307,311,313,317,331,337,347,349,353,359,367,373,379,383,389,397,401,409,
+        419,421,431,433,439,443,449,457,461,463,467,479,487,491,499,503,509,521,523,541
+    };
 
     BigInt factor_p, factor_q;
     int success = 0;
