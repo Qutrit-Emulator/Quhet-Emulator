@@ -185,7 +185,7 @@ static int generate_and_try_periods(const BigInt *freq, const BigInt *reg_size,
     bigint_copy(&gtp_p0, &gtp_a0);
     bigint_set_u64(&gtp_q0, 1);
 
-    for (int step = 0; step < 3000; step++) {
+    for (int step = 0; step < 500; step++) {
         if (bigint_cmp(&gtp_q0, N) >= 0) break;
 
         if (bigint_cmp(&gtp_q0, &gtp_one) > 0) {
@@ -407,48 +407,23 @@ static void lll_collect_freqs(int n, double (*marg)[6],
             }
         }
 
-        /* ── Dynamic Temperature Beam Search (Boltzmann Sampling) ──
-         * T cools linearly from 0.8 at the LSBs to 0.1 at the MSBs.
-         * High T at low digits explores branching harmonics;
-         * low T at high digits locks in the dominant prefix greedily. */
+        /* ── Deterministic Top-K Selection (argmax) ──
+         * Replaces stochastic Boltzmann sampling for reproducibility.
+         * Always selects the K highest-scoring beams at each position. */
         int top_indices[LLL_K];
         int top_count = (next_count < LLL_K) ? next_count : LLL_K;
-        double TEMP = 0.8 - 0.7 * ((double)s / (double)(n > 1 ? n - 1 : 1));
-        if (TEMP < 0.1) TEMP = 0.1;
 
         for (int k = 0; k < top_count; k++) {
-            /* 1. Find max for numerical stability */
-            double max_lp = -1e9;
+            int best_idx = -1;
+            double best_lp = -1e30;
             for (int i = 0; i < next_count; i++) {
-                if (next_log_probs[i] > max_lp) max_lp = next_log_probs[i];
-            }
-            
-            /* 2. Compute partition function */
-            double Z = 0.0;
-            double weights[LLL_K * 6];
-            for (int i = 0; i < next_count; i++) {
-                if (next_log_probs[i] < -1e8) {
-                    weights[i] = 0.0; /* previously selected */
-                } else {
-                    weights[i] = exp((next_log_probs[i] - max_lp) / TEMP);
-                    Z += weights[i];
+                if (next_log_probs[i] > best_lp) {
+                    best_lp = next_log_probs[i];
+                    best_idx = i;
                 }
             }
-            
-            /* 3. Sample from distribution */
-            double r = ((double)rand() / RAND_MAX) * Z;
-            double cdf = 0.0;
-            int selected_idx = 0;
-            for (int i = 0; i < next_count; i++) {
-                cdf += weights[i];
-                if (r <= cdf) {
-                    selected_idx = i;
-                    break;
-                }
-            }
-            
-            top_indices[k] = selected_idx;
-            next_log_probs[selected_idx] = -2e9; /* poison so it can't be selected again */
+            top_indices[k] = best_idx;
+            next_log_probs[best_idx] = -2e9; /* poison so it can't be selected again */
         }
 
         double new_beam_log_probs[LLL_K];
@@ -976,15 +951,16 @@ static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed)
         }
     }
 
-    #define CAMP_MAX_ITER 200
+    #define CAMP_MAX_ITER 120
     /* Simulated Annealing: damping starts high (0.5) and cools to 0.05 */
     #define CAMP_DAMPING_START 0.50
     #define CAMP_DAMPING_END   0.05
-    #define CAMP_COOL_ITERS   150  /* iterations over which cooling occurs */
-    #define CAMP_TOL      1e-12
+    #define CAMP_COOL_ITERS   100  /* iterations over which cooling occurs */
+    #define CAMP_TOL      1e-8
 
     double prev_residual = 1e30;
     int converged = 0;
+    int plateau_count = 0;
 
     for (int it = 0; it < CAMP_MAX_ITER && !converged; it++) {
         double max_delta = 0.0;
@@ -1091,6 +1067,16 @@ static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed)
         if (max_delta < CAMP_TOL) {
             converged = 1;
             printf("      [Complex Amplitude BP] CONVERGED at iteration %d\n", it + 1);
+        }
+        /* Early-plateau detection: break if residual barely changes for 5 iters */
+        if (prev_residual > 1e-30 && fabs(max_delta - prev_residual) / prev_residual < 0.01) {
+            plateau_count++;
+            if (plateau_count >= 5) {
+                converged = 1;
+                printf("      [Complex Amplitude BP] PLATEAU at iteration %d (residual ~%.2e)\n", it + 1, max_delta);
+            }
+        } else {
+            plateau_count = 0;
         }
         prev_residual = max_delta;
     }
@@ -1306,14 +1292,13 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             graph->locals[site1].edge_im[d] = iB;
         }
 
-        /* Extract the blk-th base-6 digit of N */
-        bigint_copy(&gc_temp_N, N);
-        for(int sh=0; sh<blk; sh++) { 
-            bigint_div_mod(&gc_temp_N, &b6, &gc_q_sh, &gc_r_sh); 
-            bigint_copy(&gc_temp_N, &gc_q_sh); 
+        /* Extract the blk-th base-6 digit of N via running quotient (O(1) per block) */
+        if (blk == 0) {
+            bigint_copy(&gc_temp_N, N);
         }
         bigint_div_mod(&gc_temp_N, &b6, &gc_qN, &gc_rN);
         int N_digit = (int)bigint_to_u64(&gc_rN);
+        bigint_copy(&gc_temp_N, &gc_qN);  /* advance running quotient for next block */
 
 
         /* Unfrustrated Z_6 AFFINE TRANSLATION: Anchor all 6 sites in a topological hexagram cycle */
@@ -1328,12 +1313,13 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             edge->site_b = bypass_sites[j];
             edge->type = HPC_EDGE_PHASE;
             edge->fidelity = 1.0;
-            /* ── Spectral Windowed PHASE Attenuation (Hann window) ──
-             * Hann(blk) = 0.5 * (1 - cos(2π * blk / (n_blocks - 1)))
-             * Tapers boundaries smoothly to zero, eliminating Gibbs ringing. */
+            /* ── Spectral Windowed PHASE Attenuation (Hann² window) ──
+             * Hann²(blk) = [0.5 * (1 - cos(2π * blk / (n_blocks - 1)))]²
+             * Squared Hann tapers boundaries more steeply, suppressing sidelobes. */
             double hann_w = (n_blocks > 1)
                 ? 0.5 * (1.0 - cos(2.0 * 3.14159265358979323846 * blk / (n_blocks - 1)))
                 : 1.0;
+            hann_w *= hann_w;  /* Hann² */
             double phase_scale = hann_w / sqrt((double)n_blocks);
             for (int va = 0; va < 6; va++) {
                 for (int vb = 0; vb < 6; vb++) {
@@ -1395,10 +1381,11 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             edge->site_b = s_head;
             edge->type = HPC_EDGE_PHASE;
             edge->fidelity = 1.0;
-            /* ── Spectral Windowed PHASE Attenuation on bridge (Hann) ── */
+            /* ── Spectral Windowed PHASE Attenuation on bridge (Hann²) ── */
             double hann_bridge = (n_blocks > 1)
                 ? 0.5 * (1.0 - cos(2.0 * 3.14159265358979323846 * blk / (n_blocks - 1)))
                 : 1.0;
+            hann_bridge *= hann_bridge;  /* Hann² */
             double bridge_scale = hann_bridge / sqrt((double)n_blocks);
             for (int va = 0; va < 6; va++) {
                 for (int vb = 0; vb < 6; vb++) {
@@ -1453,7 +1440,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     MobiusAmplitudeSheet *mobius = mobius_create(graph);
 
     /* ── Multi-Start BP: 5 random seeds, select lowest entropy basin ── */
-    #define N_STARTS 5
+    #define N_STARTS 3
     double best_entropy = 1e30;
     /* Heap-allocate to prevent stack overflow with large N (n_sites can reach ~4800) */
     double (*best_dressed_re)[6] = (double(*)[6])calloc(n_sites, sizeof(double[6]));
@@ -1570,6 +1557,8 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     const int num_shots = 50000;
     int mcmc_state[1600] = {0};
     BigInt global_lcm; bigint_set_u64(&global_lcm, 1);
+    BigInt running_gcd; bigint_set_u64(&running_gcd, 0);  /* Running-GCD accumulator */
+    int sweep_pos = 0;  /* Systematic sweep position */
 
     /* Heap-allocate p6_cache to prevent VLA BigInt leak */
     BigInt *p6_cache = (BigInt*)calloc(n_sites_raw, sizeof(BigInt));
@@ -1622,8 +1611,9 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 bigint_copy(&freq, &mc_tmp);
             }
         } else {
-            /* Flip one position, sample new digit from marginal distribution */
-            int flip  = rand() % n_sites_raw;
+            /* Systematic sweep: scan positions sequentially for thorough coverage */
+            int flip = sweep_pos % n_sites_raw;
+            sweep_pos++;
             double rr = (double)rand() / RAND_MAX;
             double cdf = 0.0;
             int new_d = (mcmc_state[flip] + 1) % 6;  /* fallback */
@@ -1671,6 +1661,26 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                         success = 1;
                         printf("\n  [Shot %d] ★ LCM CORRELATOR HIT ★\n", shot);
                     }
+            }
+        }
+
+        /* Running-GCD accumulator: gcd of all raw frequencies converges to F* */
+        if (!bigint_is_zero(&freq) && bigint_cmp(&freq, &mc_one_fb) > 0) {
+            if (bigint_is_zero(&running_gcd)) {
+                bigint_copy(&running_gcd, &freq);
+            } else {
+                bigint_gcd(&mc_gcd_v, &running_gcd, &freq);
+                if (!bigint_is_zero(&mc_gcd_v)) bigint_copy(&running_gcd, &mc_gcd_v);
+            }
+            if (shot % 200 == 0 && bigint_cmp(&running_gcd, &mc_one_fb) > 0) {
+                BigInt rgcd_r;
+                bigint_div_mod(&reg_sz, &running_gcd, &mc_r_cand, &rgcd_r);
+                if (bigint_cmp(&mc_r_cand, &mc_one_fb) > 0 && bigint_cmp(&mc_r_cand, N) < 0) {
+                    if (try_period(&mc_r_cand, a_val, N, factor_p, factor_q)) {
+                        success = 1;
+                        printf("\n  [Shot %d] ★ RUNNING-GCD ACCUMULATOR HIT ★\n", shot);
+                    }
+                }
             }
         }
     }
