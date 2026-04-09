@@ -1714,62 +1714,87 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                             }
                         }
                     }
-                    /* ── LCM Extrapolation Pass ──
-                     * Each pairwise gcd is a DIVISOR of r.
-                     * LCM of all divisors reconstructs r from below.
-                     * Collect all viable GCDs, then fold LCM across them. */
-                    BigInt extrap_lcm;
-                    bigint_set_u64(&extrap_lcm, 1);
-                    int n_divisors = 0;
+                    /* ── Rational Ratio Extrapolation ──
+                     * Since r_i ≈ r/s_i, the ratio r_i/r_j ≈ s_j/s_i.
+                     * The true period r CANCELS in the ratio, leaving
+                     * a small rational number that continued fractions can extract.
+                     * Then r_cand = r_i × s_i = r_j × s_j reconstructs r.
+                     *
+                     * This is noise-robust: even if r_i has large absolute error,
+                     * the RATIO is stable because both share the same scale. */
+                    int n_extrap = 0;
+                    uint32_t best_extrap_bits = 0;
                     for (int i = 0; i < bank_filled && !success; i++) {
                         for (int j = i + 1; j < bank_filled && !success; j++) {
-                            BigInt pw_gcd2;
-                            bigint_gcd(&pw_gcd2, &r_bank[i], &r_bank[j]);
-                            if (bigint_cmp(&pw_gcd2, &mc_one_fb) > 0 && bigint_cmp(&pw_gcd2, N) < 0) {
-                                /* LCM(a, b) = a * b / gcd(a, b) */
-                                BigInt g2, prod2, new_lcm, lcm_rem2;
-                                bigint_gcd(&g2, &extrap_lcm, &pw_gcd2);
-                                bigint_mul(&prod2, &extrap_lcm, &pw_gcd2);
-                                bigint_div_mod(&prod2, &g2, &new_lcm, &lcm_rem2);
-                                if (bigint_cmp(&new_lcm, N) < 0) {
-                                    bigint_copy(&extrap_lcm, &new_lcm);
-                                    n_divisors++;
-                                } else {
-                                    /* LCM overflowed past N — reset to just this GCD */
-                                    bigint_copy(&extrap_lcm, &pw_gcd2);
-                                    n_divisors = 1;
-                                }
-                            }
-                        }
-                    }
+                            /* Compute ratio as double */
+                            double ri = mpz_get_d(r_bank[i].z);
+                            double rj = mpz_get_d(r_bank[j].z);
+                            if (rj < 1.0 || ri < 1.0) continue;
+                            double ratio = ri / rj;
+                            if (ratio < 0.001 || ratio > 1000.0) continue;
 
-                    if (!success && n_divisors > 0 && bigint_cmp(&extrap_lcm, &mc_one_fb) > 0) {
-                        uint32_t lcm_bits = bigint_bitlen(&extrap_lcm);
-                        uint32_t n_bits2 = bigint_bitlen(N);
-                        printf("  [Shot %5d] LCM extrapolation: %u bits from %d divisors  (target < %u bits)\n",
-                               shot, lcm_bits, n_divisors, n_bits2);
+                            /* Continued fraction expansion of ratio → p/q */
+                            double num = ratio, den = 1.0;
+                            int cf_p_prev = 1, cf_q_prev = 0;
+                            int cf_p = (int)floor(ratio), cf_q = 1;
+                            double rem = ratio - floor(ratio);
 
-                        if (try_period(&extrap_lcm, a_val, N, factor_p, factor_q)) {
-                            success = 1;
-                            printf("\n  [Shot %d] ★ LCM EXTRAPOLATION HIT ★\n", shot);
-                        }
-                        /* Try small multiples of the extrapolated period */
-                        for (int k = 2; k <= 12 && !success; k++) {
-                            BigInt km2, rk2;
-                            bigint_set_u64(&km2, (uint64_t)k);
-                            bigint_mul(&rk2, &extrap_lcm, &km2);
-                            if (bigint_cmp(&rk2, N) < 0) {
-                                if (try_period(&rk2, a_val, N, factor_p, factor_q)) {
-                                    success = 1;
-                                    printf("\n  [Shot %d] ★ LCM EXTRAPOLATION ×%d HIT ★\n", shot, k);
+                            for (int step = 0; step < 20 && !success; step++) {
+                                /* Test this convergent p/q */
+                                if (cf_q > 0 && cf_q <= 500 && cf_p > 0 && cf_p <= 500) {
+                                    /* r_cand = r_j × cf_p (= r_i × cf_q ideally) */
+                                    BigInt s_bi, r_cand_a, r_cand_b;
+                                    bigint_set_u64(&s_bi, (uint64_t)cf_p);
+                                    bigint_mul(&r_cand_a, &r_bank[j], &s_bi);
+
+                                    if (bigint_cmp(&r_cand_a, &mc_one_fb) > 0
+                                        && bigint_cmp(&r_cand_a, N) < 0) {
+                                        uint32_t rc_bits = bigint_bitlen(&r_cand_a);
+                                        if (rc_bits > best_extrap_bits) best_extrap_bits = rc_bits;
+                                        n_extrap++;
+                                        if (try_period(&r_cand_a, a_val, N, factor_p, factor_q)) {
+                                            success = 1;
+                                            printf("\n  [Shot %d] ★ RATIO EXTRAPOLATION HIT (p/q=%d/%d) ★\n",
+                                                   shot, cf_p, cf_q);
+                                            break;
+                                        }
+                                    }
+
+                                    /* Also try r_i × cf_q */
+                                    bigint_set_u64(&s_bi, (uint64_t)cf_q);
+                                    bigint_mul(&r_cand_b, &r_bank[i], &s_bi);
+                                    if (bigint_cmp(&r_cand_b, &mc_one_fb) > 0
+                                        && bigint_cmp(&r_cand_b, N) < 0) {
+                                        uint32_t rc_bits = bigint_bitlen(&r_cand_b);
+                                        if (rc_bits > best_extrap_bits) best_extrap_bits = rc_bits;
+                                        n_extrap++;
+                                        if (try_period(&r_cand_b, a_val, N, factor_p, factor_q)) {
+                                            success = 1;
+                                            printf("\n  [Shot %d] ★ RATIO EXTRAPOLATION HIT (q/p=%d/%d) ★\n",
+                                                   shot, cf_q, cf_p);
+                                            break;
+                                        }
+                                    }
                                 }
+
+                                /* Next continued fraction step */
+                                if (rem < 1e-10) break;
+                                double inv = 1.0 / rem;
+                                int a_next = (int)floor(inv);
+                                rem = inv - a_next;
+
+                                int new_p = a_next * cf_p + cf_p_prev;
+                                int new_q = a_next * cf_q + cf_q_prev;
+                                cf_p_prev = cf_p; cf_q_prev = cf_q;
+                                cf_p = new_p; cf_q = new_q;
+                                if (cf_p > 500 || cf_q > 500) break;
                             }
                         }
                     }
 
                     uint32_t n_bits = bigint_bitlen(N);
-                    printf("  [Shot %5d] Period bank: %d entries, %d pairwise GCDs, %d divisors in LCM  (N ~%u bits)\n",
-                           shot, bank_filled, tested, n_divisors, n_bits);
+                    printf("  [Shot %5d] Period bank: %d entries, %d pairwise GCDs | Ratio extrap: %d candidates (best %u bits, target <%u)\n",
+                           shot, bank_filled, tested, n_extrap, best_extrap_bits, n_bits);
                     fflush(stdout);
                 }
             }
