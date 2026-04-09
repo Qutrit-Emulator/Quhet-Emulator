@@ -33,7 +33,6 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#include <mpfr.h>
 #include "quhit_triality.h"
 #include "hpc_graph.h"
 #include "hpc_mobius.h"
@@ -107,7 +106,8 @@ static int try_period(const BigInt *r, const BigInt *a_val, const BigInt *N,
         BigInt full_pow;
         bigint_pow_mod(&full_pow, a_val, r, N);
         if (bigint_cmp(&full_pow, &tp_one) == 0) {
-            return -1; /* DUD BASE — caller must check == 1, not bare truthiness */
+            printf("\n  [!] MATHEMATICALLY STERILE BASE DETECTED. Base yields trivial roots. Aborting.\n");
+            exit(1); /* DUD BASE */
         }
     }
 
@@ -163,17 +163,17 @@ static int generate_and_try_periods(const BigInt *freq, const BigInt *reg_size,
         char r_str[1300];
         bigint_to_decimal(r_str, sizeof(r_str), &gtp_r_cand);
         printf("  Trying r = R/F = %s\n", r_str);
-        if (try_period(&gtp_r_cand, a_val, N, factor_p, factor_q) == 1) return 1;
+        if (try_period(&gtp_r_cand, a_val, N, factor_p, factor_q)) return 1;
         bigint_add(&gtp_r_plus, &gtp_r_cand, &gtp_one);
         bigint_sub(&gtp_r_minus, &gtp_r_cand, &gtp_one);
-        if (try_period(&gtp_r_plus, a_val, N, factor_p, factor_q) == 1) return 1;
-        if (try_period(&gtp_r_minus, a_val, N, factor_p, factor_q) == 1) return 1;
+        if (try_period(&gtp_r_plus, a_val, N, factor_p, factor_q)) return 1;
+        if (try_period(&gtp_r_minus, a_val, N, factor_p, factor_q)) return 1;
         /* Harmonic search: true period could be k * R/F */
         for (int k = 2; k <= 6; k++) {
             bigint_set_u64(&gtp_k_bi, k);
             bigint_mul(&gtp_rk, &gtp_r_cand, &gtp_k_bi);
             if (bigint_cmp(&gtp_rk, N) < 0) {
-                if (try_period(&gtp_rk, a_val, N, factor_p, factor_q) == 1) return 1;
+                if (try_period(&gtp_rk, a_val, N, factor_p, factor_q)) return 1;
             }
         }
     }
@@ -182,8 +182,8 @@ static int generate_and_try_periods(const BigInt *freq, const BigInt *reg_size,
     bigint_gcd(&gtp_g, freq, reg_size);
     if (bigint_cmp(&gtp_g, &gtp_one) > 0) {
         bigint_div_mod(reg_size, &gtp_g, &gtp_r_cand, &gtp_rem);
-        if (try_period(&gtp_r_cand, a_val, N, factor_p, factor_q) == 1) return 1;
-        if (try_period(&gtp_g, a_val, N, factor_p, factor_q) == 1) return 1;
+        if (try_period(&gtp_r_cand, a_val, N, factor_p, factor_q)) return 1;
+        if (try_period(&gtp_g, a_val, N, factor_p, factor_q)) return 1;
     }
 
     /* Continued fraction convergents of F/R */
@@ -201,15 +201,15 @@ static int generate_and_try_periods(const BigInt *freq, const BigInt *reg_size,
         if (bigint_cmp(&gtp_q0, N) >= 0 || bigint_bitlen(&gtp_q0) > 2000) break;
 
         if (bigint_cmp(&gtp_q0, &gtp_one) > 0) {
-            if (try_period(&gtp_q0, a_val, N, factor_p, factor_q) == 1) return 1;
+            if (try_period(&gtp_q0, a_val, N, factor_p, factor_q)) return 1;
 
             /* Try multiples */
             bigint_mul(&gtp_two_q, &gtp_q0, &gtp_m2);
             bigint_mul(&gtp_three_q, &gtp_q0, &gtp_m3);
             bigint_mul(&gtp_six_q, &gtp_q0, &gtp_m6);
-            if (try_period(&gtp_two_q, a_val, N, factor_p, factor_q) == 1) return 1;
-            if (try_period(&gtp_three_q, a_val, N, factor_p, factor_q) == 1) return 1;
-            if (try_period(&gtp_six_q, a_val, N, factor_p, factor_q) == 1) return 1;
+            if (try_period(&gtp_two_q, a_val, N, factor_p, factor_q)) return 1;
+            if (try_period(&gtp_three_q, a_val, N, factor_p, factor_q)) return 1;
+            if (try_period(&gtp_six_q, a_val, N, factor_p, factor_q)) return 1;
         }
 
         if (bigint_is_zero(&gtp_cf_rem)) break;
@@ -232,9 +232,9 @@ static int generate_and_try_periods(const BigInt *freq, const BigInt *reg_size,
     /* Try F itself and small multiples */
     bigint_mul(&gtp_f2, freq, &gtp_m2);
     bigint_mul(&gtp_f3, freq, &gtp_m3);
-    if (try_period(freq, a_val, N, factor_p, factor_q) == 1) return 1;
-    if (try_period(&gtp_f2, a_val, N, factor_p, factor_q) == 1) return 1;
-    if (try_period(&gtp_f3, a_val, N, factor_p, factor_q) == 1) return 1;
+    if (try_period(freq, a_val, N, factor_p, factor_q)) return 1;
+    if (try_period(&gtp_f2, a_val, N, factor_p, factor_q)) return 1;
+    if (try_period(&gtp_f3, a_val, N, factor_p, factor_q)) return 1;
 
     return 0;
 }
@@ -578,20 +578,20 @@ static int lll_recover_period(int n_sites_raw, double (*marg)[6],
             if (bigint_cmp(&lrp_gcd_f, &lrp_one) > 0) {
                 bigint_div_mod(reg_sz, &lrp_gcd_f, &lrp_r_cand, &lrp_rem);
                 if (bigint_cmp(&lrp_r_cand, &lrp_one) > 0 && bigint_cmp(&lrp_r_cand, N) < 0) {
-                    if (try_period(&lrp_r_cand, a_val, N, factor_p, factor_q) == 1) {
+                    if (try_period(&lrp_r_cand, a_val, N, factor_p, factor_q)) {
                         found = 1; printf("  [S2] r = R/gcd hit\n"); break;
                     }
                     for (int m = 2; m <= 8 && !found; m++) {
                         bigint_set_u64(&lrp_km, (uint64_t)m);
                         bigint_mul(&lrp_rk, &lrp_r_cand, &lrp_km);
                         if (bigint_cmp(&lrp_rk, N) < 0)
-                            if (try_period(&lrp_rk, a_val, N, factor_p, factor_q) == 1) {
+                            if (try_period(&lrp_rk, a_val, N, factor_p, factor_q)) {
                                 found = 1; printf("  [S2] %d*r hit\n", m);
                             }
                     }
                 }
                 if (!found && bigint_cmp(&lrp_gcd_f, N) < 0)
-                    if (try_period(&lrp_gcd_f, a_val, N, factor_p, factor_q) == 1) {
+                    if (try_period(&lrp_gcd_f, a_val, N, factor_p, factor_q)) {
                         found = 1; printf("  [S2] gcd_f direct hit\n");
                     }
             }
@@ -609,41 +609,14 @@ static int lll_recover_period(int n_sites_raw, double (*marg)[6],
             bigint_gcd(&lrp_g2, &lrp_lcm_acc, &lrp_r_i);
             bigint_mul(&lrp_prod, &lrp_lcm_acc, &lrp_r_i);
             bigint_div_mod(&lrp_prod, &lrp_g2, &lrp_new_lcm, &lrp_nr);
-            if (bigint_cmp(&lrp_new_lcm, N) < 0) {
+            if (bigint_cmp(&lrp_new_lcm, N) < 0)
                 bigint_copy(&lrp_lcm_acc, &lrp_new_lcm);
-            } else {
-                /* LCM exceeded N - test it before resetting! */
-                if (try_period(&lrp_new_lcm, a_val, N, factor_p, factor_q) == 1) {
-                    found = 1; printf("  [S3] Oversized LCM hit after %d samples\n", i+1);
-                } else {
-                    /* Try LCM mod N */
-                    BigInt mod_lcm, q_div;
-                    bigint_div_mod(&lrp_new_lcm, N, &q_div, &mod_lcm);
-                    if (try_period(&mod_lcm, a_val, N, factor_p, factor_q) == 1) {
-                        found = 1; printf("  [S3] LCM mod N hit!\n");
-                    } else {
-                        /* Try gcd(LCM, N) */
-                        BigInt poss_gcd;
-                        bigint_gcd(&poss_gcd, &lrp_new_lcm, N);
-                        if (bigint_cmp(&poss_gcd, &lrp_one) > 0 && bigint_cmp(&poss_gcd, N) < 0) {
-                            if (try_period(&poss_gcd, a_val, N, factor_p, factor_q) == 1) {
-                                found = 1; printf("  [S3] gcd(LCM, N) hit!\n");
-                            }
-                        }
-                    }
-                }
-                
-                /* Reset to 1 after testing */
-                if (!found) {
-                    bigint_set_u64(&lrp_lcm_acc, 1);
-                }
-            }
-            
-            if (!found && bigint_cmp(&lrp_lcm_acc, &lrp_one) > 0) {
-                if (try_period(&lrp_lcm_acc, a_val, N, factor_p, factor_q) == 1) {
+            else
+                bigint_set_u64(&lrp_lcm_acc, 1);
+            if (bigint_cmp(&lrp_lcm_acc, &lrp_one) > 0)
+                if (try_period(&lrp_lcm_acc, a_val, N, factor_p, factor_q)) {
                     found = 1; printf("  [S3] LCM hit after %d samples\n", i+1);
                 }
-            }
         }
     }
 
@@ -688,12 +661,12 @@ static int lll_recover_period(int n_sites_raw, double (*marg)[6],
             bigint_set_u64(&lrp_s4_cand, (uint64_t)v);
             if (bigint_cmp(&lrp_s4_cand, N) >= 0) continue;
             printf("  [S4 row %d] r candidate = %lld\n", i, v);
-            if (try_period(&lrp_s4_cand, a_val, N, factor_p, factor_q) == 1) { found = 1; break; }
+            if (try_period(&lrp_s4_cand, a_val, N, factor_p, factor_q)) { found = 1; break; }
             for (int m = 2; m <= 8 && !found; m++) {
                 bigint_set_u64(&lrp_s4_km, (uint64_t)m);
                 bigint_mul(&lrp_s4_rk, &lrp_s4_cand, &lrp_s4_km);
                 if (bigint_cmp(&lrp_s4_rk, N) < 0)
-                    if (try_period(&lrp_s4_rk, a_val, N, factor_p, factor_q) == 1) found = 1;
+                    if (try_period(&lrp_s4_rk, a_val, N, factor_p, factor_q)) found = 1;
             }
         }
         if (!found) printf("  [S4] No viable candidates (r likely > W)\n");
@@ -1110,10 +1083,6 @@ static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed)
                         new_im[v] *= inv_norm;
                     }
                 } else {
-                    /* HOLOGRAPHIC CATASTROPHE PREVENTION:
-                     * If destructive interference perfectly killed the amplitude,
-                     * passing a zero vector will multiply all downstream nodes to zero.
-                     * We resuscitate the message to uniformly decoupled noise instead. */
                     for (int v = 0; v < 6; v++) {
                         new_re[v] = 1.0 / sqrt(6.0);
                         new_im[v] = 0.0;
@@ -1330,39 +1299,16 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
              * onto the microscopic quantum phase circle: θ = 2π * y / N.
              * This explicitly enforces the global periodicity r of Shor's
              * sequence directly into the BP message correlation geometry. */
-            /* ── MPFR Full-Precision Phase Injection ──
-             * Compute θ = 2π · y/N at nbits+64 precision, then extract
-             * cos/sin as doubles. The division y/N is the precision bottleneck;
-             * cos/sin output [-1,1] so double storage is fine. */
-            mpfr_t mp_y, mp_N_f, mp_ratio, mp_phase, mp_2pi, mp_cos, mp_sin;
-            mpfr_prec_t prec = nbits + 64;
-            mpfr_init2(mp_y, prec);      mpfr_init2(mp_N_f, prec);
-            mpfr_init2(mp_ratio, prec);   mpfr_init2(mp_phase, prec);
-            mpfr_init2(mp_2pi, prec);     mpfr_init2(mp_cos, prec);
-            mpfr_init2(mp_sin, prec);
-            mpfr_const_pi(mp_2pi, MPFR_RNDN);
-            mpfr_mul_ui(mp_2pi, mp_2pi, 2, MPFR_RNDN);
-            mpfr_set_z(mp_N_f, N->z, MPFR_RNDN);
-
-            /* Phase A */
-            mpfr_set_z(mp_y, gc_powersA[d].z, MPFR_RNDN);
-            mpfr_div(mp_ratio, mp_y, mp_N_f, MPFR_RNDN);
-            mpfr_mul(mp_phase, mp_ratio, mp_2pi, MPFR_RNDN);
-            mpfr_cos(mp_cos, mp_phase, MPFR_RNDN);
-            mpfr_sin(mp_sin, mp_phase, MPFR_RNDN);
-            double cosA = mpfr_get_d(mp_cos, MPFR_RNDN);
-            double sinA = mpfr_get_d(mp_sin, MPFR_RNDN);
-
-            /* Phase B */
-            mpfr_set_z(mp_y, gc_powersB[d].z, MPFR_RNDN);
-            mpfr_div(mp_ratio, mp_y, mp_N_f, MPFR_RNDN);
-            mpfr_mul(mp_phase, mp_ratio, mp_2pi, MPFR_RNDN);
-            mpfr_cos(mp_cos, mp_phase, MPFR_RNDN);
-            mpfr_sin(mp_sin, mp_phase, MPFR_RNDN);
-            double cosB = mpfr_get_d(mp_cos, MPFR_RNDN);
-            double sinB = mpfr_get_d(mp_sin, MPFR_RNDN);
-
-            mpfr_clears(mp_y, mp_N_f, mp_ratio, mp_phase, mp_2pi, mp_cos, mp_sin, (mpfr_ptr)0);
+            long exp_yA=0, exp_yB=0, exp_N=0;
+            double d_yA = mpz_get_d_2exp(&exp_yA, gc_powersA[d].z);
+            double d_yB = mpz_get_d_2exp(&exp_yB, gc_powersB[d].z);
+            double d_N  = mpz_get_d_2exp(&exp_N, N->z);
+            
+            double ratio_A = (d_yA / d_N) * pow(2.0, (double)(exp_yA - exp_N));
+            double ratio_B = (d_yB / d_N) * pow(2.0, (double)(exp_yB - exp_N));
+            
+            double phase_A = 2.0 * 3.14159265358979323846 * ratio_A;
+            double phase_B = 2.0 * 3.14159265358979323846 * ratio_B;
 
             int site0 = blk * 6 + 0;
             int site1 = blk * 6 + 1;
@@ -1372,10 +1318,12 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             double rB = graph->locals[site1].edge_re[d];
             double iB = graph->locals[site1].edge_im[d];
             
+            double cosA = cos(phase_A), sinA = sin(phase_A);
             double old_rA = rA;
             rA = old_rA * cosA - iA * sinA;
             iA = old_rA * sinA + iA * cosA;
 
+            double cosB = cos(phase_B), sinB = sin(phase_B);
             double old_rB = rB;
             rB = old_rB * cosB - iB * sinB;
             iB = old_rB * sinB + iB * cosB;
@@ -1510,12 +1458,8 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     }
 
 
-    /* Convert Phase to Amplitude (IDFT) BEFORE BP 
-     * ONLY applied to Oracles (offset 0, 1). Parity peers (2..5) must remain 
-     * uniform in the amplitude domain to act as unconstrained messengers! */
+    /* Convert Phase to Amplitude (IDFT) BEFORE BP */
     for (int site = 0; site < n_sites; site++) {
-        if (site % 6 >= 2) continue;  /* Skip Parity nodes */
-
         double out_re[6], out_im[6];
         for (int k_dft = 0; k_dft < 6; k_dft++) {
             double sr = 0, si = 0;
@@ -1534,7 +1478,6 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             graph->locals[site].edge_im[d] = out_im[d];
         }
     }
-    
     printf("    Phase 3: S₁₄ Deep Parity Crystallization via Complex Amplitude BP...\n");
     clock_t t_bp_start = clock();
 
@@ -1564,12 +1507,6 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                     double p = probs[v] / total;
                     if (p > 1e-30) total_entropy -= p * log2(p);
                 }
-            } else {
-                /* PENALTY: An underflowing site has NO information, so its entropy
-                 * is the maximal uniform entropy of a 6-state system: log2(6).
-                 * Without this, underflows evaluate to 0.0 entropy and trick the
-                 * minimizer into selecting the most destructively interfering seed! */
-                total_entropy += 2.58496250072;
             }
         }
         printf("      [Multi-Start] Seed %d entropy: %.3f bits total\n", start, total_entropy);
@@ -1601,7 +1538,6 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
      * we need max(n_sites_raw, 2*n_blocks) elements to avoid overflow. */
     int marginals_sz = (2 * n_blocks > n_sites_raw) ? 2 * n_blocks : n_sites_raw;
     double (*marginals)[6] = (double(*)[6])calloc(marginals_sz, sizeof(double[6]));
-    int underflow_count = 0;
     /* We extract the most confident node per block (usually site 0) */
     for (int blk = 0; blk < n_blocks; blk++) {
         for (int offset = 0; offset <= 1; offset++) {
@@ -1611,13 +1547,12 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             for (int d = 0; d < 6; d++) {
                 double re = mobius->sheets[site].dressed_re[d];
                 double im = mobius->sheets[site].dressed_im[d];
-                double prob = re * re + im * im; /* Full Coupled Born probability |ψ|² */
+                double prob = re * re + im * im; /* Full Born probability |ψ|² */
                 marginals[scale][d] = prob;
                 sum_prob += prob;
             }
             double sum_prob2 = 0.0;
             if (sum_prob < 1e-30) {
-                underflow_count++;
                 /* BP has NO information about this digit — all Born probs underflowed.
                  * The mathematically correct Bayesian prior is UNIFORM 1/6.
                  * This gives the MCMC genuine stochastic diversity on these positions
@@ -1649,11 +1584,6 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             }
         }
     }
-    
-    if (underflow_count > 0) {
-        printf("      [WARNING] %d / %d extracted sites hit sum_prob < 1e-30 underflow fallback!\n", 
-               underflow_count, n_blocks * 2);
-    }
 
     /* ── Build signal mask: which positions have genuine BP information? ── */
     int *bp_has_signal = (int*)calloc(n_sites_raw, sizeof(int));
@@ -1672,6 +1602,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     printf("  [Signal mask] %d / %d positions have BP signal (%.1f%%)\n",
            n_flippable, n_sites_raw, 100.0 * n_flippable / n_sites_raw);
 
+    mobius_destroy(mobius);
     hpc_destroy(graph);
 
     clock_t t_ipe_end = clock();
@@ -2133,53 +2064,10 @@ int main(int argc, char **argv)
                 bigint_mul(&cross_base_prod, &cross_base_lcm, &best_partial);
                 bigint_div_mod(&cross_base_prod, &cross_base_gcd, &cross_base_lcm, &cross_base_rem);
 
-                /* If LCM exceeds N, the accumulated value is likely a MULTIPLE
-                 * of the true period. Try it before resetting. */
+                /* Clamp: if LCM exceeds N, it's blown past the period */
                 if (bigint_cmp(&cross_base_lcm, &N) >= 0) {
-                    printf("  [Cross-base] LCM exceeded N (%u bits). Testing before reset...\n",
-                           bigint_bitlen(&cross_base_lcm));
-
-                    /* Try the oversized LCM directly — a^LCM mod N might still yield gcd */
-                    for (int bj = 0; bj <= bi && !success; bj++) {
-                        BigInt test_a;
-                        bigint_set_u64(&test_a, base_list[bj]);
-                        if (try_period(&cross_base_lcm, &test_a, &N, &factor_p, &factor_q) == 1) {
-                            success = 1;
-                            printf("\n  ★★★ OVERSIZED LCM FACTORED N! (base a=%llu) ★★★\n",
-                                   (unsigned long long)base_list[bj]);
-                        }
-                    }
-
-                    /* Try LCM mod N */
-                    if (!success) {
-                        BigInt lcm_mod_n, lcm_q;
-                        bigint_div_mod(&cross_base_lcm, &N, &lcm_q, &lcm_mod_n);
-                        if (!bigint_is_zero(&lcm_mod_n) && bigint_cmp(&lcm_mod_n, &bi_one) > 0) {
-                            for (int bj = 0; bj <= bi && !success; bj++) {
-                                BigInt test_a;
-                                bigint_set_u64(&test_a, base_list[bj]);
-                                if (try_period(&lcm_mod_n, &test_a, &N, &factor_p, &factor_q) == 1) {
-                                    success = 1;
-                                    printf("\n  ★★★ LCM mod N FACTORED N! ★★★\n");
-                                }
-                            }
-                        }
-                    }
-
-                    /* Reset: keep the previous LCM (before this base blew it up)
-                     * by recomputing from gcd of the oversized LCM and N */
-                    if (!success) {
-                        BigInt saved;
-                        bigint_gcd(&saved, &cross_base_lcm, &N);
-                        if (bigint_cmp(&saved, &bi_one) > 0 && bigint_cmp(&saved, &N) < 0) {
-                            printf("  [Cross-base] gcd(LCM, N) is nontrivial!\n");
-                            bigint_copy(&factor_p, &saved);
-                            bigint_div_mod(&N, &saved, &factor_q, &cross_base_rem);
-                            success = 1;
-                        } else {
-                            bigint_copy(&cross_base_lcm, &best_partial);
-                        }
-                    }
+                    printf("  [Cross-base] LCM exceeded N, resetting to partial\n");
+                    bigint_copy(&cross_base_lcm, &best_partial);
                 }
 
                 uint32_t lcm_bits = bigint_bitlen(&cross_base_lcm);
