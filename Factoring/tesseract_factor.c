@@ -106,8 +106,11 @@ static int try_period(const BigInt *r, const BigInt *a_val, const BigInt *N,
         BigInt full_pow;
         bigint_pow_mod(&full_pow, a_val, r, N);
         if (bigint_cmp(&full_pow, &tp_one) == 0) {
-            printf("\n  [!] MATHEMATICALLY STERILE BASE DETECTED. Base yields trivial roots. Aborting.\n");
-            exit(1); /* DUD BASE */
+            char abort_r_str[512];
+            bigint_to_decimal(abort_r_str, sizeof(abort_r_str), r);
+            printf("\n  [!] MATHEMATICALLY STERILE BASE DETECTED (r=%s). Base yields trivial roots. Skipping...\n", abort_r_str);
+            /* Return -1 instead of `exit` so that we gracefully try the next base */
+            return -1;
         }
     }
 
