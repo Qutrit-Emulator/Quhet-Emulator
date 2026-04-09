@@ -1557,7 +1557,11 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     const int num_shots = 50000;
     int mcmc_state[1600] = {0};
     BigInt global_lcm; bigint_set_u64(&global_lcm, 1);
-    BigInt running_gcd; bigint_set_u64(&running_gcd, 0);  /* Running-GCD accumulator */
+    /* Period-estimate bank for pairwise GCD analysis */
+    #define R_BANK_SIZE 64
+    BigInt r_bank[R_BANK_SIZE];
+    for (int i = 0; i < R_BANK_SIZE; i++) bigint_set_u64(&r_bank[i], 0);
+    int r_bank_idx = 0;
     int sweep_pos = 0;  /* Systematic sweep position */
 
     /* Heap-allocate p6_cache to prevent VLA BigInt leak */
@@ -1664,22 +1668,109 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             }
         }
 
-        /* Running-GCD accumulator: gcd of all raw frequencies converges to F* */
+        /* ── Smart Period-Estimate Bank ──
+         * Instead of GCD on raw frequencies (which collapse to 1 instantly),
+         * store period estimates r_i = R/F_i and do PAIRWISE GCDs.
+         * Since r_i ≈ r/s_i for harmonic index s_i:
+         *   gcd(r/s_i, r/s_j) divides r
+         * Multiple pairwise GCDs yield divisors and multiples of the true r. */
         if (!bigint_is_zero(&freq) && bigint_cmp(&freq, &mc_one_fb) > 0) {
-            if (bigint_is_zero(&running_gcd)) {
-                bigint_copy(&running_gcd, &freq);
-            } else {
-                bigint_gcd(&mc_gcd_v, &running_gcd, &freq);
-                if (!bigint_is_zero(&mc_gcd_v)) bigint_copy(&running_gcd, &mc_gcd_v);
-            }
-            if (shot % 200 == 0 && bigint_cmp(&running_gcd, &mc_one_fb) > 0) {
-                BigInt rgcd_r;
-                bigint_div_mod(&reg_sz, &running_gcd, &mc_r_cand, &rgcd_r);
-                if (bigint_cmp(&mc_r_cand, &mc_one_fb) > 0 && bigint_cmp(&mc_r_cand, N) < 0) {
-                    if (try_period(&mc_r_cand, a_val, N, factor_p, factor_q)) {
-                        success = 1;
-                        printf("\n  [Shot %d] ★ RUNNING-GCD ACCUMULATOR HIT ★\n", shot);
+            /* r_est = R / F for this shot */
+            bigint_div_mod(&reg_sz, &freq, &mc_r_cand, &mc_rem);
+
+            if (!bigint_is_zero(&mc_r_cand) && bigint_cmp(&mc_r_cand, &mc_one_fb) > 0
+                && bigint_cmp(&mc_r_cand, N) < 0) {
+                /* Store in circular bank */
+                bigint_copy(&r_bank[r_bank_idx % R_BANK_SIZE], &mc_r_cand);
+                r_bank_idx++;
+                int bank_filled = (r_bank_idx < R_BANK_SIZE) ? r_bank_idx : R_BANK_SIZE;
+
+                /* Pairwise GCD sweep every 100 shots once bank has ≥4 entries */
+                if (shot % 100 == 0 && bank_filled >= 4) {
+                    int hits = 0, tested = 0;
+                    for (int i = 0; i < bank_filled && !success; i++) {
+                        for (int j = i + 1; j < bank_filled && !success; j++) {
+                            BigInt pw_gcd;
+                            bigint_gcd(&pw_gcd, &r_bank[i], &r_bank[j]);
+                            if (bigint_cmp(&pw_gcd, &mc_one_fb) > 0 && bigint_cmp(&pw_gcd, N) < 0) {
+                                tested++;
+                                if (try_period(&pw_gcd, a_val, N, factor_p, factor_q)) {
+                                    success = 1; hits++;
+                                    printf("\n  [Shot %d] ★ PAIRWISE GCD BANK HIT ★\n", shot);
+                                    break;
+                                }
+                                /* Try small multiples k*gcd */
+                                for (int k = 2; k <= 6 && !success; k++) {
+                                    BigInt km, rk;
+                                    bigint_set_u64(&km, (uint64_t)k);
+                                    bigint_mul(&rk, &pw_gcd, &km);
+                                    if (bigint_cmp(&rk, N) < 0) {
+                                        if (try_period(&rk, a_val, N, factor_p, factor_q)) {
+                                            success = 1; hits++;
+                                            printf("\n  [Shot %d] ★ PAIRWISE GCD×%d HIT ★\n", shot, k);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
+                    /* ── LCM Extrapolation Pass ──
+                     * Each pairwise gcd is a DIVISOR of r.
+                     * LCM of all divisors reconstructs r from below.
+                     * Collect all viable GCDs, then fold LCM across them. */
+                    BigInt extrap_lcm;
+                    bigint_set_u64(&extrap_lcm, 1);
+                    int n_divisors = 0;
+                    for (int i = 0; i < bank_filled && !success; i++) {
+                        for (int j = i + 1; j < bank_filled && !success; j++) {
+                            BigInt pw_gcd2;
+                            bigint_gcd(&pw_gcd2, &r_bank[i], &r_bank[j]);
+                            if (bigint_cmp(&pw_gcd2, &mc_one_fb) > 0 && bigint_cmp(&pw_gcd2, N) < 0) {
+                                /* LCM(a, b) = a * b / gcd(a, b) */
+                                BigInt g2, prod2, new_lcm, lcm_rem2;
+                                bigint_gcd(&g2, &extrap_lcm, &pw_gcd2);
+                                bigint_mul(&prod2, &extrap_lcm, &pw_gcd2);
+                                bigint_div_mod(&prod2, &g2, &new_lcm, &lcm_rem2);
+                                if (bigint_cmp(&new_lcm, N) < 0) {
+                                    bigint_copy(&extrap_lcm, &new_lcm);
+                                    n_divisors++;
+                                } else {
+                                    /* LCM overflowed past N — reset to just this GCD */
+                                    bigint_copy(&extrap_lcm, &pw_gcd2);
+                                    n_divisors = 1;
+                                }
+                            }
+                        }
+                    }
+
+                    if (!success && n_divisors > 0 && bigint_cmp(&extrap_lcm, &mc_one_fb) > 0) {
+                        uint32_t lcm_bits = bigint_bitlen(&extrap_lcm);
+                        uint32_t n_bits2 = bigint_bitlen(N);
+                        printf("  [Shot %5d] LCM extrapolation: %u bits from %d divisors  (target < %u bits)\n",
+                               shot, lcm_bits, n_divisors, n_bits2);
+
+                        if (try_period(&extrap_lcm, a_val, N, factor_p, factor_q)) {
+                            success = 1;
+                            printf("\n  [Shot %d] ★ LCM EXTRAPOLATION HIT ★\n", shot);
+                        }
+                        /* Try small multiples of the extrapolated period */
+                        for (int k = 2; k <= 12 && !success; k++) {
+                            BigInt km2, rk2;
+                            bigint_set_u64(&km2, (uint64_t)k);
+                            bigint_mul(&rk2, &extrap_lcm, &km2);
+                            if (bigint_cmp(&rk2, N) < 0) {
+                                if (try_period(&rk2, a_val, N, factor_p, factor_q)) {
+                                    success = 1;
+                                    printf("\n  [Shot %d] ★ LCM EXTRAPOLATION ×%d HIT ★\n", shot, k);
+                                }
+                            }
+                        }
+                    }
+
+                    uint32_t n_bits = bigint_bitlen(N);
+                    printf("  [Shot %5d] Period bank: %d entries, %d pairwise GCDs, %d divisors in LCM  (N ~%u bits)\n",
+                           shot, bank_filled, tested, n_divisors, n_bits);
+                    fflush(stdout);
                 }
             }
         }
