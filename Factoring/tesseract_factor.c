@@ -1193,7 +1193,8 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                             BigInt *best_period)
 {
     uint32_t nbits = bigint_bitlen(N);
-    int n_sites_raw = (int)((nbits * 2 * 1000) / 2585) + 30;
+    /* Register only needs R > N (not N²) — fewer blocks = shorter BP chain */
+    int n_sites_raw = (int)((nbits * 1000) / 2585) + 2;
     
     int n_blocks = (n_sites_raw + 1) / 2;
     int n_sites = n_blocks * 6;
@@ -1437,7 +1438,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 cz_edge->fidelity = 1.0;
                 /* CZ weight: ω^(va·vb) — pure DFT₆ coupling, scaled 1/sqrt(6) 
                  * to prevent message flooding and enforce unitary boundaries */
-                double norm_cz = 1.0 / sqrt(6.0);
+                double norm_cz = 1.0;  /* No attenuation — BP damping controls stability */
                 for (int va = 0; va < 6; va++) {
                     for (int vb = 0; vb < 6; vb++) {
                         int pidx = (va * vb) % 6;
