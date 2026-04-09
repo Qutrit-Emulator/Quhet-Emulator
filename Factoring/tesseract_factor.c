@@ -1546,9 +1546,20 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 sum_prob += prob;
             }
             double sum_prob2 = 0.0;
-            for (int d = 0; d < 6; d++) {
-                marginals[scale][d] /= sum_prob; /* Normalize for Monte Carlo */
-                sum_prob2 += marginals[scale][d];
+            if (sum_prob < 1e-30) {
+                /* BP has NO information about this digit — all Born probs underflowed.
+                 * The mathematically correct Bayesian prior is UNIFORM 1/6.
+                 * This gives the MCMC genuine stochastic diversity on these positions
+                 * without corrupting positions where BP actually converged. */
+                for (int d = 0; d < 6; d++) {
+                    marginals[scale][d] = 1.0 / 6.0;
+                }
+                sum_prob2 = 1.0;
+            } else {
+                for (int d = 0; d < 6; d++) {
+                    marginals[scale][d] /= sum_prob; /* Normalize for Monte Carlo */
+                    sum_prob2 += marginals[scale][d];
+                }
             }
             double max_prob = 0.0;
             int best_digit = 0;
@@ -1567,6 +1578,23 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             }
         }
     }
+
+    /* ── Build signal mask: which positions have genuine BP information? ── */
+    int *bp_has_signal = (int*)calloc(n_sites_raw, sizeof(int));
+    int *flippable = (int*)calloc(n_sites_raw, sizeof(int));
+    int n_flippable = 0;
+    for (int scale = 0; scale < n_sites_raw; scale++) {
+        double max_p = 0.0;
+        for (int d = 0; d < 6; d++)
+            if (marginals[scale][d] > max_p) max_p = marginals[scale][d];
+        /* A position has signal if its max probability is significantly above uniform (1/6 ≈ 0.167) */
+        if (max_p > 0.20) {
+            bp_has_signal[scale] = 1;
+            flippable[n_flippable++] = scale;
+        }
+    }
+    printf("  [Signal mask] %d / %d positions have BP signal (%.1f%%)\n",
+           n_flippable, n_sites_raw, 100.0 * n_flippable / n_sites_raw);
 
     mobius_destroy(mobius);
     hpc_destroy(graph);
@@ -1712,7 +1740,9 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 bigint_copy(&freq, &mc_tmp);
             }
         } else {
-            int flip = sweep_pos % n_sites_raw;
+            /* Position-aware sweep: only flip positions where BP has real signal */
+            if (n_flippable == 0) continue; /* No informed positions — skip */
+            int flip = flippable[sweep_pos % n_flippable];
             sweep_pos++;
             double rr = (double)rand() / RAND_MAX;
             double cdf = 0.0;
@@ -1883,6 +1913,8 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
     free(mcmc_state);
     free(p6_cache);
+    free(bp_has_signal);
+    free(flippable);
     free(best_dressed_re);
     free(best_dressed_im);
     free(marginals);
