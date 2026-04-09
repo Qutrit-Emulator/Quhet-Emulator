@@ -1170,7 +1170,8 @@ static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed)
 }
 
 static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
-                            BigInt *factor_p, BigInt *factor_q)
+                            BigInt *factor_p, BigInt *factor_q,
+                            BigInt *best_period)
 {
     uint32_t nbits = bigint_bitlen(N);
     int n_sites_raw = (int)((nbits * 2 * 1000) / 2585) + 30;
@@ -1911,6 +1912,23 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
         }
     }
 
+    /* Surface the best partial period estimate from the vote table */
+    if (!success && best_period) {
+        int best_votes = 0;
+        for (int vi = 0; vi < VOTE_TABLE_SIZE; vi++) {
+            if (vote_table[vi].votes > best_votes && bigint_bitlen(&vote_table[vi].r_cand) > 10) {
+                best_votes = vote_table[vi].votes;
+                bigint_copy(best_period, &vote_table[vi].r_cand);
+            }
+        }
+        if (best_votes > 0) {
+            char rp_str[1300];
+            bigint_to_decimal(rp_str, sizeof(rp_str), best_period);
+            printf("  [Partial] Best period estimate: %s (%u bits, %d votes)\n",
+                   rp_str, bigint_bitlen(best_period), best_votes);
+        }
+    }
+
     free(mcmc_state);
     free(p6_cache);
     free(bp_has_signal);
@@ -1979,8 +1997,18 @@ int main(int argc, char **argv)
     BigInt factor_p, factor_q;
     int success = 0;
 
+    /* ── Cross-base LCM period accumulator ── */
+    BigInt cross_base_lcm, cross_base_gcd, cross_base_prod, cross_base_rem;
+    BigInt best_partial;
+    bigint_set_u64(&cross_base_lcm, 1);
+    bigint_set_u64(&cross_base_gcd, 0);
+    bigint_set_u64(&cross_base_prod, 0);
+    bigint_set_u64(&cross_base_rem, 0);
+    bigint_set_u64(&best_partial, 0);
+    BigInt bi_one; bigint_set_u64(&bi_one, 1);
+
     /* ── Try constraint-satisfaction first (Hensel lift in base 6) ── */
-    success = 0; // The continuous prime-checks waste too much time, skip to BP.
+    success = 0;
 
     for (int bi = 0; bi < max_bases && !success; bi++) {
         if (auto_a) bigint_set_u64(&a_val, base_list[bi]);
@@ -1989,8 +2017,9 @@ int main(int argc, char **argv)
         bigint_to_decimal(a_str, sizeof(a_str), &a_val);
         printf("  ── Attempt %d: a = %s ──\n\n", bi + 1, a_str);
 
+        bigint_set_u64(&best_partial, 0);
         clock_t t_start = clock();
-        success = factor_with_hpc(&N, &a_val, &factor_p, &factor_q);
+        success = factor_with_hpc(&N, &a_val, &factor_p, &factor_q, &best_partial);
         clock_t t_end = clock();
 
         if (success) {
@@ -2014,9 +2043,53 @@ int main(int argc, char **argv)
             printf("  Time: %.3f seconds\n",
                    (double)(t_end - t_start) / CLOCKS_PER_SEC);
         } else {
-            printf("  ✗ Base a=%s did not yield factors (%.3f sec)\n\n",
-                   auto_a ? "auto" : TARGET_A,
-                   (double)(t_end - t_start) / CLOCKS_PER_SEC);
+            printf("  ✗ Base a=%s did not yield factors (%.3f sec)\n",
+                   a_str, (double)(t_end - t_start) / CLOCKS_PER_SEC);
+
+            /* ── Cross-base LCM accumulation ── */
+            if (!bigint_is_zero(&best_partial) && bigint_cmp(&best_partial, &bi_one) > 0) {
+                /* LCM(a, b) = a * b / gcd(a, b) */
+                bigint_gcd(&cross_base_gcd, &cross_base_lcm, &best_partial);
+                bigint_mul(&cross_base_prod, &cross_base_lcm, &best_partial);
+                bigint_div_mod(&cross_base_prod, &cross_base_gcd, &cross_base_lcm, &cross_base_rem);
+
+                /* Clamp: if LCM exceeds N, it's blown past the period */
+                if (bigint_cmp(&cross_base_lcm, &N) >= 0) {
+                    printf("  [Cross-base] LCM exceeded N, resetting to partial\n");
+                    bigint_copy(&cross_base_lcm, &best_partial);
+                }
+
+                uint32_t lcm_bits = bigint_bitlen(&cross_base_lcm);
+                uint32_t n_bits = bigint_bitlen(&N);
+                printf("  [Cross-base] Accumulated LCM: %u bits (target <%u bits)\n",
+                       lcm_bits, n_bits);
+
+                /* Try the accumulated LCM as a period candidate */
+                printf("  [Cross-base] Testing accumulated LCM as period...\n");
+                /* Test with EACH base we've tried so far */
+                for (int bj = 0; bj <= bi && !success; bj++) {
+                    BigInt test_a;
+                    bigint_set_u64(&test_a, base_list[bj]);
+                    if (try_period(&cross_base_lcm, &test_a, &N, &factor_p, &factor_q) == 1) {
+                        success = 1;
+                        printf("\n  ★★★ CROSS-BASE LCM FACTORED N! (base a=%llu) ★★★\n",
+                               (unsigned long long)base_list[bj]);
+                    }
+                    /* Also test small multiples */
+                    for (int sm = 2; sm <= 12 && !success; sm++) {
+                        BigInt r_mult, mult_c;
+                        bigint_set_u64(&mult_c, sm);
+                        bigint_mul(&r_mult, &cross_base_lcm, &mult_c);
+                        if (bigint_cmp(&r_mult, &N) >= 0) break;
+                        if (try_period(&r_mult, &test_a, &N, &factor_p, &factor_q) == 1) {
+                            success = 1;
+                            printf("\n  ★★★ CROSS-BASE LCM × %d FACTORED N! (base a=%llu) ★★★\n",
+                                   sm, (unsigned long long)base_list[bj]);
+                        }
+                    }
+                }
+            }
+            printf("\n");
         }
     }
 
