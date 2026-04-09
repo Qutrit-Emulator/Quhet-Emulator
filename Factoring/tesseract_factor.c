@@ -1554,6 +1554,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
      * we need max(n_sites_raw, 2*n_blocks) elements to avoid overflow. */
     int marginals_sz = (2 * n_blocks > n_sites_raw) ? 2 * n_blocks : n_sites_raw;
     double (*marginals)[6] = (double(*)[6])calloc(marginals_sz, sizeof(double[6]));
+    int underflow_count = 0;
     /* We extract the most confident node per block (usually site 0) */
     for (int blk = 0; blk < n_blocks; blk++) {
         for (int offset = 0; offset <= 1; offset++) {
@@ -1569,6 +1570,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             }
             double sum_prob2 = 0.0;
             if (sum_prob < 1e-30) {
+                underflow_count++;
                 /* BP has NO information about this digit — all Born probs underflowed.
                  * The mathematically correct Bayesian prior is UNIFORM 1/6.
                  * This gives the MCMC genuine stochastic diversity on these positions
@@ -1599,6 +1601,11 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 printf("]\n");
             }
         }
+    }
+    
+    if (underflow_count > 0) {
+        printf("      [WARNING] %d / %d extracted sites hit sum_prob < 1e-30 underflow fallback!\n", 
+               underflow_count, n_blocks * 2);
     }
 
     /* ── Build signal mask: which positions have genuine BP information? ── */
