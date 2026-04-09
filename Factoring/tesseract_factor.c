@@ -65,9 +65,19 @@ static int try_period(const BigInt *r, const BigInt *a_val, const BigInt *N,
         tp_init = 1;
     }
 
-    /* r must be even */
+    /* r must be even for gcd(a^(r/2)±1, N) — but odd r may still be valid λ(N) divisor */
     bigint_div_mod(r, &tp_two, &tp_q_unused, &tp_r_mod);
-    if (!bigint_is_zero(&tp_r_mod)) return 0;
+    if (!bigint_is_zero(&tp_r_mod)) {
+        BigInt odd_pow;
+        bigint_pow_mod(&odd_pow, a_val, r, N);
+        if (bigint_cmp(&odd_pow, &tp_one) == 0) {
+            char r_str[512];
+            bigint_to_decimal(r_str, sizeof(r_str), r);
+            printf("    [odd period] a^%s ≡ 1 (mod N) — valid λ(N) divisor\n", r_str);
+            return 2;
+        }
+        return 0;
+    }
 
     bigint_div_mod(r, &tp_two, &tp_r_half, &tp_r_mod);
 
@@ -167,17 +177,17 @@ static int generate_and_try_periods(const BigInt *freq, const BigInt *reg_size,
         char r_str[1300];
         bigint_to_decimal(r_str, sizeof(r_str), &gtp_r_cand);
         printf("  Trying r = R/F = %s\n", r_str);
-        if (try_period(&gtp_r_cand, a_val, N, factor_p, factor_q)) return 1;
+        if (try_period(&gtp_r_cand, a_val, N, factor_p, factor_q) == 1) return 1;
         bigint_add(&gtp_r_plus, &gtp_r_cand, &gtp_one);
         bigint_sub(&gtp_r_minus, &gtp_r_cand, &gtp_one);
-        if (try_period(&gtp_r_plus, a_val, N, factor_p, factor_q)) return 1;
-        if (try_period(&gtp_r_minus, a_val, N, factor_p, factor_q)) return 1;
+        if (try_period(&gtp_r_plus, a_val, N, factor_p, factor_q) == 1) return 1;
+        if (try_period(&gtp_r_minus, a_val, N, factor_p, factor_q) == 1) return 1;
         /* Harmonic search: true period could be k * R/F */
         for (int k = 2; k <= 6; k++) {
             bigint_set_u64(&gtp_k_bi, k);
             bigint_mul(&gtp_rk, &gtp_r_cand, &gtp_k_bi);
             if (bigint_cmp(&gtp_rk, N) < 0) {
-                if (try_period(&gtp_rk, a_val, N, factor_p, factor_q)) return 1;
+                if (try_period(&gtp_rk, a_val, N, factor_p, factor_q) == 1) return 1;
             }
         }
     }
@@ -186,8 +196,8 @@ static int generate_and_try_periods(const BigInt *freq, const BigInt *reg_size,
     bigint_gcd(&gtp_g, freq, reg_size);
     if (bigint_cmp(&gtp_g, &gtp_one) > 0) {
         bigint_div_mod(reg_size, &gtp_g, &gtp_r_cand, &gtp_rem);
-        if (try_period(&gtp_r_cand, a_val, N, factor_p, factor_q)) return 1;
-        if (try_period(&gtp_g, a_val, N, factor_p, factor_q)) return 1;
+        if (try_period(&gtp_r_cand, a_val, N, factor_p, factor_q) == 1) return 1;
+        if (try_period(&gtp_g, a_val, N, factor_p, factor_q) == 1) return 1;
     }
 
     /* Continued fraction convergents of F/R */
@@ -205,15 +215,15 @@ static int generate_and_try_periods(const BigInt *freq, const BigInt *reg_size,
         if (bigint_cmp(&gtp_q0, N) >= 0 || bigint_bitlen(&gtp_q0) > 2000) break;
 
         if (bigint_cmp(&gtp_q0, &gtp_one) > 0) {
-            if (try_period(&gtp_q0, a_val, N, factor_p, factor_q)) return 1;
+            if (try_period(&gtp_q0, a_val, N, factor_p, factor_q) == 1) return 1;
 
             /* Try multiples */
             bigint_mul(&gtp_two_q, &gtp_q0, &gtp_m2);
             bigint_mul(&gtp_three_q, &gtp_q0, &gtp_m3);
             bigint_mul(&gtp_six_q, &gtp_q0, &gtp_m6);
-            if (try_period(&gtp_two_q, a_val, N, factor_p, factor_q)) return 1;
-            if (try_period(&gtp_three_q, a_val, N, factor_p, factor_q)) return 1;
-            if (try_period(&gtp_six_q, a_val, N, factor_p, factor_q)) return 1;
+            if (try_period(&gtp_two_q, a_val, N, factor_p, factor_q) == 1) return 1;
+            if (try_period(&gtp_three_q, a_val, N, factor_p, factor_q) == 1) return 1;
+            if (try_period(&gtp_six_q, a_val, N, factor_p, factor_q) == 1) return 1;
         }
 
         if (bigint_is_zero(&gtp_cf_rem)) break;
@@ -236,9 +246,9 @@ static int generate_and_try_periods(const BigInt *freq, const BigInt *reg_size,
     /* Try F itself and small multiples */
     bigint_mul(&gtp_f2, freq, &gtp_m2);
     bigint_mul(&gtp_f3, freq, &gtp_m3);
-    if (try_period(freq, a_val, N, factor_p, factor_q)) return 1;
-    if (try_period(&gtp_f2, a_val, N, factor_p, factor_q)) return 1;
-    if (try_period(&gtp_f3, a_val, N, factor_p, factor_q)) return 1;
+    if (try_period(freq, a_val, N, factor_p, factor_q) == 1) return 1;
+    if (try_period(&gtp_f2, a_val, N, factor_p, factor_q) == 1) return 1;
+    if (try_period(&gtp_f3, a_val, N, factor_p, factor_q) == 1) return 1;
 
     return 0;
 }
@@ -582,20 +592,20 @@ static int lll_recover_period(int n_sites_raw, double (*marg)[6],
             if (bigint_cmp(&lrp_gcd_f, &lrp_one) > 0) {
                 bigint_div_mod(reg_sz, &lrp_gcd_f, &lrp_r_cand, &lrp_rem);
                 if (bigint_cmp(&lrp_r_cand, &lrp_one) > 0 && bigint_cmp(&lrp_r_cand, N) < 0) {
-                    if (try_period(&lrp_r_cand, a_val, N, factor_p, factor_q)) {
+                    if (try_period(&lrp_r_cand, a_val, N, factor_p, factor_q) == 1) {
                         found = 1; printf("  [S2] r = R/gcd hit\n"); break;
                     }
                     for (int m = 2; m <= 8 && !found; m++) {
                         bigint_set_u64(&lrp_km, (uint64_t)m);
                         bigint_mul(&lrp_rk, &lrp_r_cand, &lrp_km);
                         if (bigint_cmp(&lrp_rk, N) < 0)
-                            if (try_period(&lrp_rk, a_val, N, factor_p, factor_q)) {
+                            if (try_period(&lrp_rk, a_val, N, factor_p, factor_q) == 1) {
                                 found = 1; printf("  [S2] %d*r hit\n", m);
                             }
                     }
                 }
                 if (!found && bigint_cmp(&lrp_gcd_f, N) < 0)
-                    if (try_period(&lrp_gcd_f, a_val, N, factor_p, factor_q)) {
+                    if (try_period(&lrp_gcd_f, a_val, N, factor_p, factor_q) == 1) {
                         found = 1; printf("  [S2] gcd_f direct hit\n");
                     }
             }
@@ -618,7 +628,7 @@ static int lll_recover_period(int n_sites_raw, double (*marg)[6],
             else
                 bigint_set_u64(&lrp_lcm_acc, 1);
             if (bigint_cmp(&lrp_lcm_acc, &lrp_one) > 0)
-                if (try_period(&lrp_lcm_acc, a_val, N, factor_p, factor_q)) {
+                if (try_period(&lrp_lcm_acc, a_val, N, factor_p, factor_q) == 1) {
                     found = 1; printf("  [S3] LCM hit after %d samples\n", i+1);
                 }
         }
@@ -665,12 +675,12 @@ static int lll_recover_period(int n_sites_raw, double (*marg)[6],
             bigint_set_u64(&lrp_s4_cand, (uint64_t)v);
             if (bigint_cmp(&lrp_s4_cand, N) >= 0) continue;
             printf("  [S4 row %d] r candidate = %lld\n", i, v);
-            if (try_period(&lrp_s4_cand, a_val, N, factor_p, factor_q)) { found = 1; break; }
+            if (try_period(&lrp_s4_cand, a_val, N, factor_p, factor_q) == 1) { found = 1; break; }
             for (int m = 2; m <= 8 && !found; m++) {
                 bigint_set_u64(&lrp_s4_km, (uint64_t)m);
                 bigint_mul(&lrp_s4_rk, &lrp_s4_cand, &lrp_s4_km);
                 if (bigint_cmp(&lrp_s4_rk, N) < 0)
-                    if (try_period(&lrp_s4_rk, a_val, N, factor_p, factor_q)) found = 1;
+                    if (try_period(&lrp_s4_rk, a_val, N, factor_p, factor_q) == 1) found = 1;
             }
         }
         if (!found) printf("  [S4] No viable candidates (r likely > W)\n");
@@ -1390,8 +1400,8 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             double hann_w = (n_blocks > 1)
                 ? 0.5 * (1.0 - cos(2.0 * 3.14159265358979323846 * blk / (n_blocks - 1)))
                 : 1.0;
-            hann_w *= hann_w;  /* Hann² */
-            double phase_scale = hann_w / sqrt((double)n_blocks);
+            hann_w = 0.05 + 0.95 * hann_w;  /* Floor at 5% to prevent boundary zeroing */
+            double phase_scale = hann_w;     /* No 1/√n — BP damping controls stability */
             for (int va = 0; va < 6; va++) {
                 for (int vb = 0; vb < 6; vb++) {
                     int diff = (va - vb + 6) % 6;
@@ -1458,8 +1468,8 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             double hann_bridge = (n_blocks > 1)
                 ? 0.5 * (1.0 - cos(2.0 * 3.14159265358979323846 * blk / (n_blocks - 1)))
                 : 1.0;
-            hann_bridge *= hann_bridge;  /* Hann² */
-            double bridge_scale = hann_bridge / sqrt((double)n_blocks);
+            hann_bridge = 0.05 + 0.95 * hann_bridge;  /* Floor at 5% */
+            double bridge_scale = hann_bridge;          /* No 1/√n */
             for (int va = 0; va < 6; va++) {
                 for (int vb = 0; vb < 6; vb++) {
                     int diff = (va - vb + 6) % 6;
