@@ -609,14 +609,41 @@ static int lll_recover_period(int n_sites_raw, double (*marg)[6],
             bigint_gcd(&lrp_g2, &lrp_lcm_acc, &lrp_r_i);
             bigint_mul(&lrp_prod, &lrp_lcm_acc, &lrp_r_i);
             bigint_div_mod(&lrp_prod, &lrp_g2, &lrp_new_lcm, &lrp_nr);
-            if (bigint_cmp(&lrp_new_lcm, N) < 0)
+            if (bigint_cmp(&lrp_new_lcm, N) < 0) {
                 bigint_copy(&lrp_lcm_acc, &lrp_new_lcm);
-            else
-                bigint_set_u64(&lrp_lcm_acc, 1);
-            if (bigint_cmp(&lrp_lcm_acc, &lrp_one) > 0)
+            } else {
+                /* LCM exceeded N - test it before resetting! */
+                if (try_period(&lrp_new_lcm, a_val, N, factor_p, factor_q) == 1) {
+                    found = 1; printf("  [S3] Oversized LCM hit after %d samples\n", i+1);
+                } else {
+                    /* Try LCM mod N */
+                    BigInt mod_lcm, q_div;
+                    bigint_div_mod(&lrp_new_lcm, N, &q_div, &mod_lcm);
+                    if (try_period(&mod_lcm, a_val, N, factor_p, factor_q) == 1) {
+                        found = 1; printf("  [S3] LCM mod N hit!\n");
+                    } else {
+                        /* Try gcd(LCM, N) */
+                        BigInt poss_gcd;
+                        bigint_gcd(&poss_gcd, &lrp_new_lcm, N);
+                        if (bigint_cmp(&poss_gcd, &lrp_one) > 0 && bigint_cmp(&poss_gcd, N) < 0) {
+                            if (try_period(&poss_gcd, a_val, N, factor_p, factor_q) == 1) {
+                                found = 1; printf("  [S3] gcd(LCM, N) hit!\n");
+                            }
+                        }
+                    }
+                }
+                
+                /* Reset to 1 after testing */
+                if (!found) {
+                    bigint_set_u64(&lrp_lcm_acc, 1);
+                }
+            }
+            
+            if (!found && bigint_cmp(&lrp_lcm_acc, &lrp_one) > 0) {
                 if (try_period(&lrp_lcm_acc, a_val, N, factor_p, factor_q) == 1) {
                     found = 1; printf("  [S3] LCM hit after %d samples\n", i+1);
                 }
+            }
         }
     }
 
@@ -1082,6 +1109,15 @@ static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed)
                         new_re[v] *= inv_norm;
                         new_im[v] *= inv_norm;
                     }
+                } else {
+                    /* HOLOGRAPHIC CATASTROPHE PREVENTION:
+                     * If destructive interference perfectly killed the amplitude,
+                     * passing a zero vector will multiply all downstream nodes to zero.
+                     * We resuscitate the message to uniformly decoupled noise instead. */
+                    for (int v = 0; v < 6; v++) {
+                        new_re[v] = 1.0 / sqrt(6.0);
+                        new_im[v] = 0.0;
+                    }
                 }
 
                 /* Step 4: Damped update with annealing schedule */
@@ -1474,8 +1510,12 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     }
 
 
-    /* Convert Phase to Amplitude (IDFT) BEFORE BP */
+    /* Convert Phase to Amplitude (IDFT) BEFORE BP 
+     * ONLY applied to Oracles (offset 0, 1). Parity peers (2..5) must remain 
+     * uniform in the amplitude domain to act as unconstrained messengers! */
     for (int site = 0; site < n_sites; site++) {
+        if (site % 6 >= 2) continue;  /* Skip Parity nodes */
+
         double out_re[6], out_im[6];
         for (int k_dft = 0; k_dft < 6; k_dft++) {
             double sr = 0, si = 0;
@@ -1494,6 +1534,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             graph->locals[site].edge_im[d] = out_im[d];
         }
     }
+    
     printf("    Phase 3: S₁₄ Deep Parity Crystallization via Complex Amplitude BP...\n");
     clock_t t_bp_start = clock();
 
@@ -1523,6 +1564,12 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                     double p = probs[v] / total;
                     if (p > 1e-30) total_entropy -= p * log2(p);
                 }
+            } else {
+                /* PENALTY: An underflowing site has NO information, so its entropy
+                 * is the maximal uniform entropy of a 6-state system: log2(6).
+                 * Without this, underflows evaluate to 0.0 entropy and trick the
+                 * minimizer into selecting the most destructively interfering seed! */
+                total_entropy += 2.58496250072;
             }
         }
         printf("      [Multi-Start] Seed %d entropy: %.3f bits total\n", start, total_entropy);
@@ -1564,7 +1611,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             for (int d = 0; d < 6; d++) {
                 double re = mobius->sheets[site].dressed_re[d];
                 double im = mobius->sheets[site].dressed_im[d];
-                double prob = re * re + im * im; /* Full Born probability |ψ|² */
+                double prob = re * re + im * im; /* Full Coupled Born probability |ψ|² */
                 marginals[scale][d] = prob;
                 sum_prob += prob;
             }
@@ -1625,7 +1672,6 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     printf("  [Signal mask] %d / %d positions have BP signal (%.1f%%)\n",
            n_flippable, n_sites_raw, 100.0 * n_flippable / n_sites_raw);
 
-    mobius_destroy(mobius);
     hpc_destroy(graph);
 
     clock_t t_ipe_end = clock();
