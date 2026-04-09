@@ -1685,7 +1685,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     BigInt current_p6, next_p6;
     bigint_set_u64(&current_p6, 1);
     bigint_set_u64(&next_p6, 0);
-    for (int i = 0; i < n_sites_raw; i++) {
+    for (int i = n_sites_raw - 1; i >= 0; i--) {
         bigint_copy(&p6_cache[i], &current_p6);
         bigint_mul(&next_p6, &current_p6, &b6);
         bigint_copy(&current_p6, &next_p6);
