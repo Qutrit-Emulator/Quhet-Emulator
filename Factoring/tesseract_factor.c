@@ -33,6 +33,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <mpfr.h>
 #include "quhit_triality.h"
 #include "hpc_graph.h"
 #include "hpc_mobius.h"
@@ -1297,21 +1298,41 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
         }
 
         for (int d = 0; d < 6; d++) {
-            /* ── Holographic Phase Contraction (HPC) ──
+            /* ── Holographic Phase Contraction (HPC): MGR Protocol ──
              * Map the macroscopic integer y = a^(d * 6^scale) mod N
              * onto the microscopic quantum phase circle: θ = 2π * y / N.
              * This explicitly enforces the global periodicity r of Shor's
-             * sequence directly into the BP message correlation geometry. */
-            long exp_yA=0, exp_yB=0, exp_N=0;
-            double d_yA = mpz_get_d_2exp(&exp_yA, gc_powersA[d].z);
-            double d_yB = mpz_get_d_2exp(&exp_yB, gc_powersB[d].z);
-            double d_N  = mpz_get_d_2exp(&exp_N, N->z);
+             * sequence directly into the BP message correlation geometry. 
+             *
+             * MGR (Multi-precision Geometric Reconstruction):
+             * Since N can easily exceed the 53-bit mantissa limit of C double, 
+             * naive division y/N completely strips the fine-structure of the quantum phase.
+             * We calculate y/N * 2π out to 2048 bits iteratively using MPFR, capturing 
+             * the deepest resonance harmonics, and then drop the orthogonal continuous O(1) 
+             * spin projections (sin/cos) safely back into standard double. */
+             
+            mpfr_t mf_yA, mf_yB, mf_N, mf_pi, mf_phaseA, mf_phaseB;
+            mpfr_inits2(2048, mf_yA, mf_yB, mf_N, mf_pi, mf_phaseA, mf_phaseB, (mpfr_ptr)0);
+
+            mpfr_set_z(mf_yA, gc_powersA[d].z, MPFR_RNDN);
+            mpfr_set_z(mf_yB, gc_powersB[d].z, MPFR_RNDN);
+            mpfr_set_z(mf_N, N->z, MPFR_RNDN);
+
+            /* Compute phase_A = (yA / N) * 2π */
+            mpfr_div(mf_phaseA, mf_yA, mf_N, MPFR_RNDN);
+            mpfr_const_pi(mf_pi, MPFR_RNDN);
+            mpfr_mul_d(mf_pi, mf_pi, 2.0, MPFR_RNDN);
+            mpfr_mul(mf_phaseA, mf_phaseA, mf_pi, MPFR_RNDN);
+
+            /* Compute phase_B = (yB / N) * 2π */
+            mpfr_div(mf_phaseB, mf_yB, mf_N, MPFR_RNDN);
+            mpfr_mul(mf_phaseB, mf_phaseB, mf_pi, MPFR_RNDN);
+
+            mpfr_t mf_cosA, mf_sinA, mf_cosB, mf_sinB;
+            mpfr_inits2(2048, mf_cosA, mf_sinA, mf_cosB, mf_sinB, (mpfr_ptr)0);
             
-            double ratio_A = (d_yA / d_N) * pow(2.0, (double)(exp_yA - exp_N));
-            double ratio_B = (d_yB / d_N) * pow(2.0, (double)(exp_yB - exp_N));
-            
-            double phase_A = 2.0 * 3.14159265358979323846 * ratio_A;
-            double phase_B = 2.0 * 3.14159265358979323846 * ratio_B;
+            mpfr_sin_cos(mf_sinA, mf_cosA, mf_phaseA, MPFR_RNDN);
+            mpfr_sin_cos(mf_sinB, mf_cosB, mf_phaseB, MPFR_RNDN);
 
             int site0 = blk * 6 + 0;
             int site1 = blk * 6 + 1;
@@ -1321,15 +1342,20 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             double rB = graph->locals[site1].edge_re[d];
             double iB = graph->locals[site1].edge_im[d];
             
-            double cosA = cos(phase_A), sinA = sin(phase_A);
+            double cosA = mpfr_get_d(mf_cosA, MPFR_RNDN); 
+            double sinA = mpfr_get_d(mf_sinA, MPFR_RNDN);
             double old_rA = rA;
             rA = old_rA * cosA - iA * sinA;
             iA = old_rA * sinA + iA * cosA;
 
-            double cosB = cos(phase_B), sinB = sin(phase_B);
+            double cosB = mpfr_get_d(mf_cosB, MPFR_RNDN);
+            double sinB = mpfr_get_d(mf_sinB, MPFR_RNDN);
             double old_rB = rB;
             rB = old_rB * cosB - iB * sinB;
             iB = old_rB * sinB + iB * cosB;
+            
+            mpfr_clears(mf_yA, mf_yB, mf_N, mf_pi, mf_phaseA, mf_phaseB, 
+                        mf_cosA, mf_sinA, mf_cosB, mf_sinB, (mpfr_ptr)0);
 
             graph->locals[site0].edge_re[d] = rA;
             graph->locals[site0].edge_im[d] = iA;
