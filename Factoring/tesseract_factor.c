@@ -2123,8 +2123,13 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             bigint_gcd(&mc_lcm_g, acc_period, &local_lcm);
             bigint_mul(&mc_lcm_prod, acc_period, &local_lcm);
             bigint_div_mod(&mc_lcm_prod, &mc_lcm_g, &mc_new_lcm, &mc_lcm_rem);
-            if (bigint_cmp(&mc_new_lcm, N) < 0)
+            if (bigint_cmp(&mc_new_lcm, N) < 0) {
                 bigint_copy(acc_period, &mc_new_lcm);
+            } else {
+                /* Break permanent noise lock for cross-base accumulator */
+                printf("  [Cross-base Accumulator] LCM exceeded N! Breaking noise lock...\n");
+                bigint_copy(acc_period, &local_lcm);
+            }
         }
         (*acc_samples) += local_acc_samples;
         printf("  [Cross-base Accumulator] Folded base result: %u bits | cross-base accumulator: %u bits\n",
@@ -2299,7 +2304,7 @@ int main(int argc, char **argv)
                     bigint_to_decimal(bp_str, sizeof(bp_str), &best_partial);
                     printf("\n  ★★★ LATE FACTORIZATION: best_partial (%s) was a valid factoring period! ★★★\n", bp_str);
                     printf("  %s × %s = N\n", p_str, q_str);
-                } else if (status != 0) {
+                } else if (bigint_cmp(&best_partial, &bi_one) > 0) {
                     /* Calculate actual period contribution for this base */
                     BigInt current_period;
                     bigint_set_u64(&current_period, 0); /* Initialize the struct properly first */
