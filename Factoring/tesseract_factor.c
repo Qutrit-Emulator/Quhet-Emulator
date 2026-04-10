@@ -2139,10 +2139,21 @@ int main(int argc, char **argv)
 
             /* ── Cross-base LCM accumulation ── */
             if (!bigint_is_zero(&best_partial) && bigint_cmp(&best_partial, &bi_one) > 0) {
-                /* LCM(a, b) = a * b / gcd(a, b) */
-                bigint_gcd(&cross_base_gcd, &cross_base_lcm, &best_partial);
-                bigint_mul(&cross_base_prod, &cross_base_lcm, &best_partial);
-                bigint_div_mod(&cross_base_prod, &cross_base_gcd, &cross_base_lcm, &cross_base_rem);
+                /* Calculate actual period contribution for this base */
+                BigInt current_period;
+                bigint_copy(&current_period, &best_partial); /* Use HPC estimate as period length */
+
+                /* First base: set LCM to its period */
+                if (bigint_cmp(&cross_base_lcm, &bi_one) == 0) {
+                    bigint_copy(&cross_base_lcm, &current_period);
+                    printf("  [Cross-base] Initialized LCM to period contribution\n");
+                } else {
+                    /* Subsequent bases: accumulate LCM */
+                    /* Proper LCM update: lcm(a,b) = (a*b)/gcd(a,b) */
+                    bigint_gcd(&cross_base_gcd, &cross_base_lcm, &current_period);
+                    bigint_mul(&cross_base_prod, &cross_base_lcm, &current_period);
+                    bigint_div_mod(&cross_base_prod, &cross_base_gcd, &cross_base_lcm, &cross_base_rem);
+                }
 
                 /* Clamp: if LCM exceeds N, it's blown past the period */
                 if (bigint_cmp(&cross_base_lcm, &N) >= 0) {
