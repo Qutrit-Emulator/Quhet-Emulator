@@ -1141,7 +1141,7 @@ static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed)
                    it + 1, max_delta);
         }
 
-        /* Deep topological sequence mathematically natively forces full thermodynamic exhaustion */
+        if (max_delta < CAMP_TOL) converged = 1;
         prev_residual = max_delta;
     }
 
@@ -1201,7 +1201,8 @@ static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed)
 
 static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                             BigInt *factor_p, BigInt *factor_q,
-                            BigInt *best_period)
+                            BigInt *best_period,
+                            BigInt *running_gcd, int *gcd_samples)
 {
     uint32_t nbits = bigint_bitlen(N);
     /* Register needs R > N² for CF convergent extraction to find the true period.
@@ -1730,11 +1731,9 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     }
     int total_votes_cast = 0;
 
-    /* ── Running GCD Accumulator ── */
-    BigInt running_gcd, prev_freq;
-    bigint_set_u64(&running_gcd, 0);
+    /* ── Running GCD Accumulator (state owned by caller across bases) ── */
+    BigInt prev_freq;
     bigint_set_u64(&prev_freq, 0);
-    int gcd_samples = 0;
 
     /* ── Cross-shot period accumulator ── */
     BigInt cross_gcd, cross_lcm;
@@ -1743,6 +1742,9 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
     /* Heap-allocate p6_cache to prevent VLA BigInt leak */
     BigInt *p6_cache = (BigInt*)calloc(n_sites_raw, sizeof(BigInt));
+    /* Initialise every BigInt slot — calloc zeroes bytes but GMP's mpz_t
+     * requires mpz_init before any operation, including bigint_copy. */
+    for (int i = 0; i < n_sites_raw; i++) bigint_set_u64(&p6_cache[i], 0);
     BigInt current_p6, next_p6;
     bigint_set_u64(&current_p6, 1);
     bigint_set_u64(&next_p6, 0);
@@ -1780,6 +1782,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 _matched = _vi; break; \
             } \
             BigInt _vq, _vr; \
+            bigint_set_u64(&_vq, 0); bigint_set_u64(&_vr, 0); \
             if (bigint_cmp((r_ptr), &vote_table[_vi].r_cand) > 0) { \
                 bigint_div_mod((r_ptr), &vote_table[_vi].r_cand, &_vq, &_vr); \
             } else { \
@@ -1861,18 +1864,18 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
          * GCD of multiple harmonics F_i = s_i·F* converges to F* itself.
          * Then r = R / F*.
          * ══════════════════════════════════════════════════════════════════ */
-        if (gcd_samples == 0) {
-            bigint_copy(&running_gcd, &freq);
+        if (*gcd_samples == 0) {
+            bigint_copy(running_gcd, &freq);
         } else {
-            bigint_gcd(&mc_gcd_v, &running_gcd, &freq);
+            bigint_gcd(&mc_gcd_v, running_gcd, &freq);
             if (!bigint_is_zero(&mc_gcd_v))
-                bigint_copy(&running_gcd, &mc_gcd_v);
+                bigint_copy(running_gcd, &mc_gcd_v);
         }
-        gcd_samples++;
+        (*gcd_samples)++;
 
         /* Derive period estimate from running GCD */
-        if (!bigint_is_zero(&running_gcd) && bigint_cmp(&running_gcd, &mc_one_fb) > 0) {
-            bigint_div_mod(&reg_sz, &running_gcd, &mc_r_cand, &mc_rem);
+        if (!bigint_is_zero(running_gcd) && bigint_cmp(running_gcd, &mc_one_fb) > 0) {
+            bigint_div_mod(&reg_sz, running_gcd, &mc_r_cand, &mc_rem);
             if (bigint_cmp(&mc_r_cand, &mc_one_fb) > 0 && bigint_cmp(&mc_r_cand, N) < 0) {
                 VOTE_FOR_CANDIDATE(&mc_r_cand, shot);
 
@@ -1964,6 +1967,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
                     /* Test harmonic multiples up to 1000 */
                     BigInt r_mult, mult_const;
+                    bigint_set_u64(&r_mult, 0);
                     for (int sm = 2; sm <= 1000 && !success; sm++) {
                         bigint_set_u64(&mult_const, sm);
                         bigint_mul(&r_mult, &vote_table[vi].r_cand, &mult_const);
@@ -1976,9 +1980,10 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                     }
 
                     /* Cross-GCD voted candidate with running GCD estimate */
-                    if (!success && !bigint_is_zero(&running_gcd)) {
+                    if (!success && !bigint_is_zero(running_gcd)) {
                         BigInt cross_r, cross_rem;
-                        bigint_gcd(&mc_gcd_v, &vote_table[vi].r_cand, &running_gcd);
+                        bigint_set_u64(&cross_r, 0); bigint_set_u64(&cross_rem, 0);
+                        bigint_gcd(&mc_gcd_v, &vote_table[vi].r_cand, running_gcd);
                         if (bigint_cmp(&mc_gcd_v, &mc_one_fb) > 0) {
                             bigint_div_mod(&reg_sz, &mc_gcd_v, &cross_r, &cross_rem);
                             if (bigint_cmp(&cross_r, &mc_one_fb) > 0 && bigint_cmp(&cross_r, N) < 0) {
@@ -1993,10 +1998,10 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             }
             
             /* Running GCD status */
-            uint32_t gcd_bits = bigint_bitlen(&running_gcd);
+            uint32_t gcd_bits = bigint_bitlen(running_gcd);
             uint32_t n_bits = bigint_bitlen(N);
             printf("  [Shot %5d] GCD accumulator: %u bits (%d samples) | target <%u bits\n",
-                   shot, gcd_bits, gcd_samples, n_bits);
+                   shot, gcd_bits, *gcd_samples, n_bits);
             fflush(stdout);
         }
     }
@@ -2109,6 +2114,11 @@ int main(int argc, char **argv)
     bigint_set_u64(&best_partial, 0);
     BigInt bi_one; bigint_set_u64(&bi_one, 1);
 
+    /* ── Cross-base GCD accumulator (persists across all base attempts) ── */
+    BigInt cross_base_running_gcd;
+    int    cross_base_gcd_samples = 0;
+    bigint_set_u64(&cross_base_running_gcd, 0);
+
     /* ── Try constraint-satisfaction first (Hensel lift in base 6) ── */
     success = 0;
 
@@ -2121,7 +2131,8 @@ int main(int argc, char **argv)
 
         bigint_set_u64(&best_partial, 0);
         clock_t t_start = clock();
-        success = factor_with_hpc(&N, &a_val, &factor_p, &factor_q, &best_partial);
+        success = factor_with_hpc(&N, &a_val, &factor_p, &factor_q, &best_partial,
+                                  &cross_base_running_gcd, &cross_base_gcd_samples);
         clock_t t_end = clock();
 
         if (success) {
