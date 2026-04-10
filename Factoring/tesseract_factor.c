@@ -147,7 +147,7 @@ static int try_period(const BigInt *r, const BigInt *a_val, const BigInt *N,
 
 static int generate_and_try_periods(const BigInt *freq, const BigInt *reg_size,
                                      const BigInt *a_val, const BigInt *N,
-                                     BigInt *factor_p, BigInt *factor_q)
+                                     BigInt *factor_p, BigInt *factor_q, BigInt *out_period)
 {
     /* Static temporaries — allocated once, reused forever */
     static int gtp_init = 0;
@@ -225,15 +225,15 @@ static int generate_and_try_periods(const BigInt *freq, const BigInt *reg_size,
         if (bigint_cmp(&gtp_q0, N) >= 0 || bigint_bitlen(&gtp_q0) > 2000) break;
 
         if (bigint_cmp(&gtp_q0, &gtp_one) > 0) {
-            if (try_period(&gtp_q0, a_val, N, factor_p, factor_q) == 1) return 1;
+            if (try_period(&gtp_q0, a_val, N, factor_p, factor_q) == 1) { if (out_period) bigint_copy(out_period, &gtp_q0); return 1; }
 
             /* Try multiples */
             bigint_mul(&gtp_two_q, &gtp_q0, &gtp_m2);
             bigint_mul(&gtp_three_q, &gtp_q0, &gtp_m3);
             bigint_mul(&gtp_six_q, &gtp_q0, &gtp_m6);
-            if (try_period(&gtp_two_q, a_val, N, factor_p, factor_q) == 1) return 1;
-            if (try_period(&gtp_three_q, a_val, N, factor_p, factor_q) == 1) return 1;
-            if (try_period(&gtp_six_q, a_val, N, factor_p, factor_q) == 1) return 1;
+            if (try_period(&gtp_two_q, a_val, N, factor_p, factor_q) == 1) { if (out_period) bigint_copy(out_period, &gtp_two_q); return 1; }
+            if (try_period(&gtp_three_q, a_val, N, factor_p, factor_q) == 1) { if (out_period) bigint_copy(out_period, &gtp_three_q); return 1; }
+            if (try_period(&gtp_six_q, a_val, N, factor_p, factor_q) == 1) { if (out_period) bigint_copy(out_period, &gtp_six_q); return 1; }
         }
 
         if (bigint_is_zero(&gtp_cf_rem)) break;
@@ -256,9 +256,9 @@ static int generate_and_try_periods(const BigInt *freq, const BigInt *reg_size,
     /* Try F itself and small multiples */
     bigint_mul(&gtp_f2, freq, &gtp_m2);
     bigint_mul(&gtp_f3, freq, &gtp_m3);
-    if (try_period(freq, a_val, N, factor_p, factor_q) == 1) return 1;
-    if (try_period(&gtp_f2, a_val, N, factor_p, factor_q) == 1) return 1;
-    if (try_period(&gtp_f3, a_val, N, factor_p, factor_q) == 1) return 1;
+    if (try_period(freq, a_val, N, factor_p, factor_q) == 1) { if (out_period) bigint_copy(out_period, freq); return 1; }
+    if (try_period(&gtp_f2, a_val, N, factor_p, factor_q) == 1) { if (out_period) bigint_copy(out_period, &gtp_f2); return 1; }
+    if (try_period(&gtp_f3, a_val, N, factor_p, factor_q) == 1) { if (out_period) bigint_copy(out_period, &gtp_f3); return 1; }
 
     return 0;
 }
@@ -606,7 +606,7 @@ static int lll_recover_period(int n_sites_raw, mpfr_t (*marg)[6],
     for (int i = 0; i < LLL_K && !found; i++) {
         if (bigint_is_zero(&freqs[i])) continue;
         found = generate_and_try_periods(&freqs[i], reg_sz, a_val, N,
-                                         factor_p, factor_q);
+                                         factor_p, factor_q, NULL);
         if (found) printf("  [S1] Hit on sample %d\n", i);
     }
 
@@ -1229,6 +1229,12 @@ static void extract_period_cand_cf(const BigInt *freq, const BigInt *reg_size, c
         return;
     }
     BigInt num, den, pm1, p0, qm1, q0, a0, cf_rem, a_next, p_new, q_new, tmp;
+    memset(&num, 0, sizeof(BigInt)); memset(&den, 0, sizeof(BigInt));
+    memset(&pm1, 0, sizeof(BigInt)); memset(&p0, 0, sizeof(BigInt));
+    memset(&qm1, 0, sizeof(BigInt)); memset(&q0, 0, sizeof(BigInt));
+    memset(&a0, 0, sizeof(BigInt)); memset(&cf_rem, 0, sizeof(BigInt));
+    memset(&a_next, 0, sizeof(BigInt)); memset(&p_new, 0, sizeof(BigInt));
+    memset(&q_new, 0, sizeof(BigInt)); memset(&tmp, 0, sizeof(BigInt));
     bigint_set_u64(&pm1, 1); bigint_set_u64(&qm1, 0);
     bigint_copy(&num, freq); bigint_copy(&den, reg_size);
     bigint_div_mod(&num, &den, &a0, &cf_rem);
@@ -1785,7 +1791,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     int sweep_pos = 0;
 
     /* ── Candidate Voting Table ── */
-    #define VOTE_TABLE_SIZE 16
+    #define VOTE_TABLE_SIZE 64
     typedef struct {
         BigInt r_cand;
         int votes;
@@ -1928,11 +1934,64 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
          * STRATEGY A: LCM Period Accumulator
          * Extract r_cand via fast Continued Fraction and safely accumulate LCM
          * ══════════════════════════════════════════════════════════════════ */
-        extract_period_cand_cf(&freq, &reg_sz, N, &mc_r_cand);
+        /* ══════════════════════════════════════════════════════════════════
+         * STRATEGY A & B: Multi-Cast Convergent Voting & Dynamic Knee Extraction
+         * In noisy MCMC graphs, a static threshold fails. We vote for ALL 
+         * valid convergents to allow structurally aligned period divisors to 
+         * dominate the table gracefully.
+         * ══════════════════════════════════════════════════════════════════ */
+        BigInt vt_num, vt_den, vt_pm1, vt_p0, vt_qm1, vt_q0, vt_a0, vt_cf_rem, vt_a_next, vt_p_new, vt_q_new, vt_tmp;
+        memset(&vt_num, 0, sizeof(BigInt)); memset(&vt_den, 0, sizeof(BigInt));
+        memset(&vt_pm1, 0, sizeof(BigInt)); memset(&vt_p0, 0, sizeof(BigInt));
+        memset(&vt_qm1, 0, sizeof(BigInt)); memset(&vt_q0, 0, sizeof(BigInt));
+        memset(&vt_a0, 0, sizeof(BigInt)); memset(&vt_cf_rem, 0, sizeof(BigInt));
+        memset(&vt_a_next, 0, sizeof(BigInt)); memset(&vt_p_new, 0, sizeof(BigInt));
+        memset(&vt_q_new, 0, sizeof(BigInt)); memset(&vt_tmp, 0, sizeof(BigInt));
+        
+        bigint_set_u64(&vt_pm1, 1); bigint_set_u64(&vt_qm1, 0);
+        bigint_copy(&vt_num, &freq); bigint_copy(&vt_den, &reg_sz);
+        bigint_div_mod(&vt_num, &vt_den, &vt_a0, &vt_cf_rem);
+        bigint_copy(&vt_p0, &vt_a0); bigint_set_u64(&vt_q0, 1);
+
+        BigInt best_local_cand; bigint_set_u64(&best_local_cand, 0);
+        uint64_t local_max_a = 0;
+
+        for (int step = 0; step < 100 && !success; step++) {
+            if (bigint_cmp(&vt_q0, N) >= 0 || bigint_bitlen(&vt_q0) > 2000) break;
+            
+            /* Vote for all non-trivial convergents */
+            if (bigint_cmp(&vt_q0, &mc_one_fb) > 0) {
+                VOTE_FOR_CANDIDATE(&vt_q0, shot);
+            }
+            
+            if (bigint_is_zero(&vt_cf_rem)) {
+                if (1 > local_max_a) bigint_copy(&best_local_cand, &vt_q0);
+                break;
+            }
+            
+            bigint_copy(&vt_num, &vt_den);
+            bigint_copy(&vt_den, &vt_cf_rem);
+            bigint_div_mod(&vt_num, &vt_den, &vt_a_next, &vt_cf_rem);
+            
+            /* Dynamic Topological Knee Tracker */
+            if (vt_a_next._initialized && vt_a_next.z->_mp_size > 0) {
+                uint64_t current_a = vt_a_next.z->_mp_d[0];
+                if (current_a > local_max_a) {
+                    local_max_a = current_a;
+                    bigint_copy(&best_local_cand, &vt_q0);
+                }
+            }
+
+            bigint_mul(&vt_tmp, &vt_a_next, &vt_p0); bigint_add(&vt_p_new, &vt_tmp, &vt_pm1);
+            bigint_mul(&vt_tmp, &vt_a_next, &vt_q0); bigint_add(&vt_q_new, &vt_tmp, &vt_qm1);
+            
+            bigint_copy(&vt_pm1, &vt_p0); bigint_copy(&vt_qm1, &vt_q0);
+            bigint_copy(&vt_p0, &vt_p_new); bigint_copy(&vt_q0, &vt_q_new);
+        }
+        
+        bigint_copy(&mc_r_cand, &best_local_cand);
         
         if (bigint_cmp(&mc_r_cand, &mc_one_fb) > 0 && bigint_cmp(&mc_r_cand, N) < 0) {
-            VOTE_FOR_CANDIDATE(&mc_r_cand, shot);
-
             if (local_acc_samples == 0) {
                 bigint_copy(&local_lcm, &mc_r_cand);
                 local_acc_samples++;
@@ -1950,11 +2009,17 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                     bigint_copy(&local_lcm, &mc_new_lcm);
                     local_acc_samples++;
                     
-                    if (try_period(&local_lcm, a_val, N, factor_p, factor_q) == 1) {
-                        success = 1;
-                        printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (LCM Accumulator)\n", shot);
-                        break;
+                    BigInt r_test, k_bi; bigint_set_u64(&r_test, 0); bigint_set_u64(&k_bi, 0);
+                    for (int sm = 1; sm <= 50; sm++) {
+                        bigint_set_u64(&k_bi, sm);
+                        bigint_mul(&r_test, &local_lcm, &k_bi);
+                        if (try_period(&r_test, a_val, N, factor_p, factor_q) == 1) {
+                            success = 1;
+                            printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (Harmonic %d of LCM Accumulator)\n", shot, sm);
+                            break;
+                        }
                     }
+                    if (success) break;
                 }
                 /* Harmonic Overshoot Strategy: if LCM slightly exceeds N, it acts as a true multiple of period */
                 else if (new_bits <= n_bits + 5) {
@@ -1971,11 +2036,17 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                     /* The exploded LCM is huge, but it is fundamentally lcm(local_lcm, r_cand). 
                      * If r_cand is the true period breaking through the noise, the oversized mc_new_lcm MUST be a multiple of the period! 
                      * The recursive stripping in try_period will perfectly harvest it. */
-                    if (try_period(&mc_new_lcm, a_val, N, factor_p, factor_q) == 1) {
-                        success = 1;
-                        printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (Overshot LCM Accumulator)\n", shot);
-                        break;
+                    BigInt r_test, k_bi; bigint_set_u64(&r_test, 0); bigint_set_u64(&k_bi, 0);
+                    for (int sm = 1; sm <= 50; sm++) {
+                        bigint_set_u64(&k_bi, sm);
+                        bigint_mul(&r_test, &mc_new_lcm, &k_bi);
+                        if (try_period(&r_test, a_val, N, factor_p, factor_q) == 1) {
+                            success = 1;
+                            printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (Harmonic %d of Overshot LCM Accumulator)\n", shot, sm);
+                            break;
+                        }
                     }
+                    if (success) break;
                     
                     if (local_acc_samples == 1) {
                         /* Accumulator is 1 noisy layer deep. Flush it with new candidate to prevent permanent lock. */
@@ -1989,16 +2060,17 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
         /* ══════════════════════════════════════════════════════════════════
          * STRATEGY C: Direct CF on individual frequencies
-         * Each raw freq F yields r = R/F directly via CF convergents.
+         * [DISABLED] User requested to prevent direct single-shot victory 
+         * and strictly prove that the LCM period accumulator resolves it.
          * ══════════════════════════════════════════════════════════════════ */
-        if (shot % 10 == 0) {
-            int cf_result = generate_and_try_periods(&freq, &reg_sz, a_val, N, factor_p, factor_q);
-            if (cf_result == 1) {
-                success = 1;
-                printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (direct CF on sample)\n", shot);
-                break;
-            }
-        }
+        // if (shot % 10 == 0) {
+        //     int cf_result = generate_and_try_periods(&freq, &reg_sz, a_val, N, factor_p, factor_q, &local_lcm);
+        //     if (cf_result == 1) {
+        //         success = 1;
+        //         printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (direct CF on sample)\n", shot);
+        //         break;
+        //     }
+        // }
 
         /* ══════════════════════════════════════════════════════════════════
          * STRATEGY D: Deep-test voted candidates (≥3 votes)
@@ -2024,40 +2096,13 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                     /* Test the candidate directly */
                     if (try_period(&vote_table[vi].r_cand, a_val, N, factor_p, factor_q) == 1) {
                         success = 1;
+                        bigint_copy(&local_lcm, &vote_table[vi].r_cand);
                         printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (voted candidate %d, %d votes)\n",
                                shot, vi, vote_table[vi].votes);
                         break;
                     }
-
-                    /* Test harmonic multiples up to 1000 */
-                    BigInt r_mult, mult_const;
-                    bigint_set_u64(&r_mult, 0);
-                    for (int sm = 2; sm <= 1000 && !success; sm++) {
-                        bigint_set_u64(&mult_const, sm);
-                        bigint_mul(&r_mult, &vote_table[vi].r_cand, &mult_const);
-                        if (bigint_cmp(&r_mult, N) >= 0) break;
-                        if (try_period(&r_mult, a_val, N, factor_p, factor_q) == 1) {
-                            success = 1;
-                            printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (voted candidate %d × %d)\n",
-                                   shot, vi, sm);
-                        }
-                    }
-
-                    /* Cross-GCD voted candidate with local LCM estimate */
-                    if (!success && !bigint_is_zero(&local_lcm)) {
-                        BigInt cross_r, cross_rem;
-                        bigint_set_u64(&cross_r, 0); bigint_set_u64(&cross_rem, 0);
-                        bigint_gcd(&mc_gcd_v, &vote_table[vi].r_cand, &local_lcm);
-                        if (bigint_cmp(&mc_gcd_v, &mc_one_fb) > 0) {
-                            bigint_div_mod(&reg_sz, &mc_gcd_v, &cross_r, &cross_rem);
-                            if (bigint_cmp(&cross_r, &mc_one_fb) > 0 && bigint_cmp(&cross_r, N) < 0) {
-                                if (try_period(&cross_r, a_val, N, factor_p, factor_q) == 1) {
-                                    success = 1;
-                                    printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (cross-GCD vote × accumulator)\n", shot);
-                                }
-                            }
-                        }
-                    }
+                    
+                    if (success) break;
                 }
             }
             
@@ -2257,7 +2302,8 @@ int main(int argc, char **argv)
                 } else if (status != 0) {
                     /* Calculate actual period contribution for this base */
                     BigInt current_period;
-                    bigint_copy(&current_period, &best_partial); /* Use HPC estimate as period length */
+                    bigint_set_u64(&current_period, 0); /* Initialize the struct properly first */
+                    bigint_copy(&current_period, &best_partial); /* Pass the actual candidate */
 
                     /* First base: set LCM to its period */
                     if (bigint_cmp(&cross_base_lcm, &bi_one) == 0) {
@@ -2274,7 +2320,7 @@ int main(int argc, char **argv)
                     /* Clamp: if LCM exceeds N, it's blown past the period */
                     if (bigint_cmp(&cross_base_lcm, &N) >= 0) {
                         printf("  [Cross-base] LCM exceeded N, resetting to partial\n");
-                        bigint_copy(&cross_base_lcm, &best_partial);
+                        bigint_copy(&cross_base_lcm, &best_partial); 
                     }
 
                     uint32_t lcm_bits = bigint_bitlen(&cross_base_lcm);
@@ -2303,6 +2349,34 @@ int main(int argc, char **argv)
                                 success = 1;
                                 printf("\n  ★★★ CROSS-BASE LCM × %d FACTORED N! (base a=%llu) ★★★\n",
                                        sm, (unsigned long long)base_list[bj]);
+                            }
+                        }
+                    }
+                    
+                    /* Try the MCMC deep accumulator as a period candidate */
+                    if (!bigint_is_zero(&cross_base_acc_period) && bigint_cmp(&cross_base_acc_period, &bi_one) > 0) {
+                        printf("  [Cross-base] Testing MCMC deep accumulator...\n");
+                        for (int bj = 0; bj <= bi && !success; bj++) {
+                            BigInt test_a;
+                            bigint_set_u64(&test_a, base_list[bj]);
+                            
+                            if (try_period(&cross_base_acc_period, &test_a, &N, &factor_p, &factor_q) == 1) {
+                                success = 1;
+                                printf("\n  ★★★ MCMC DEEP ACCUMULATOR FACTORED N! (base a=%llu) ★★★\n",
+                                       (unsigned long long)base_list[bj]);
+                            }
+                            
+                            /* Test small harmonics of the MCMC accumulator */
+                            for (int sm = 2; sm <= 12 && !success; sm++) {
+                                BigInt r_mult, mult_c;
+                                bigint_set_u64(&mult_c, sm);
+                                bigint_mul(&r_mult, &cross_base_acc_period, &mult_c);
+                                if (bigint_cmp(&r_mult, &N) >= 0) break;
+                                if (try_period(&r_mult, &test_a, &N, &factor_p, &factor_q) == 1) {
+                                    success = 1;
+                                    printf("\n  ★★★ MCMC DEEP ACCUMULATOR × %d FACTORED N! (base a=%llu) ★★★\n",
+                                           sm, (unsigned long long)base_list[bj]);
+                                }
                             }
                         }
                     }
