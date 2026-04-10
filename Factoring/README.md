@@ -1,3 +1,8 @@
+## Note
+This can factor 261,980,999,226,229.
+
+I DO NOT KNOW if it will scale, if it does scale I am not responsible for how it is used; this is not intended to be used for factoring things you do not own.
+
 ## Abstract
 The **HPC Ouroboros Factoring Engine** is a world-first, natively classical framework capable of performing fully autonomous integer factorization via topological phase-space extraction. By deploying a simulated Belief Propagation (BP) execution graph, the engine effectively functionally mimics the continuous period-finding harmonic properties of **Shor's Algorithm** over consumer hardware—successfully escaping the exponential mathematical bounds that entirely plague deterministic prime-sieving techniques.
 
