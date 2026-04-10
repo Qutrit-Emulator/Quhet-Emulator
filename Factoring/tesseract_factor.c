@@ -1199,10 +1199,58 @@ static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed)
     free(new_msgs);
 }
 
+
+/* Continuously evaluates CF convergents of freq/reg_size to find the largest partial quotient 'knee' before the noise tail */
+static void extract_period_cand_cf(const BigInt *freq, const BigInt *reg_size, const BigInt *N, BigInt *r_cand_out) {
+    if (bigint_is_zero(freq)) {
+        bigint_set_u64(r_cand_out, 0);
+        return;
+    }
+    BigInt num, den, pm1, p0, qm1, q0, a0, cf_rem, a_next, p_new, q_new, tmp;
+    bigint_set_u64(&pm1, 1); bigint_set_u64(&qm1, 0);
+    bigint_copy(&num, freq); bigint_copy(&den, reg_size);
+    bigint_div_mod(&num, &den, &a0, &cf_rem);
+    bigint_copy(&p0, &a0); bigint_set_u64(&q0, 1);
+    
+    bigint_set_u64(r_cand_out, 1);
+
+    BigInt best_q; bigint_set_u64(&best_q, 1);
+    BigInt max_a;  bigint_set_u64(&max_a, 0);
+
+    for (int step = 0; ; step++) {
+        if (bigint_cmp(&q0, N) >= 0 || bigint_bitlen(&q0) > 2000) break;
+        
+        if (bigint_is_zero(&cf_rem)) {
+            bigint_copy(&best_q, &q0);
+            break;
+        }
+        
+        bigint_copy(&num, &den);
+        bigint_copy(&den, &cf_rem);
+        bigint_div_mod(&num, &den, &a_next, &cf_rem);
+        
+        /* The topological 'knee' occurs where the partial quotient spikes, 
+           meaning the preceding convergent perfectly captured the underlying rational 
+           before hitting the chaotic noise tail. */
+        if (bigint_cmp(&a_next, &max_a) > 0) {
+            bigint_copy(&max_a, &a_next);
+            bigint_copy(&best_q, &q0);
+        }
+        
+        bigint_mul(&tmp, &a_next, &p0);    bigint_add(&p_new, &tmp, &pm1);
+        bigint_mul(&tmp, &a_next, &q0);    bigint_add(&q_new, &tmp, &qm1);
+        
+        bigint_copy(&pm1, &p0); bigint_copy(&qm1, &q0);
+        bigint_copy(&p0, &p_new); bigint_copy(&q0, &q_new);
+    }
+    
+    bigint_copy(r_cand_out, &best_q);
+}
+
 static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                             BigInt *factor_p, BigInt *factor_q,
                             BigInt *best_period,
-                            BigInt *running_gcd, int *gcd_samples)
+                            BigInt *acc_period, int *acc_samples)
 {
     uint32_t nbits = bigint_bitlen(N);
     /* Register needs R > N² for CF convergent extraction to find the true period.
@@ -1731,17 +1779,11 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     }
     int total_votes_cast = 0;
 
-    /* ── Running GCD Accumulator (state owned by caller across bases) ── */
-    /* Per-base local accumulator — folds into cross-base running_gcd after MCMC */
-    BigInt local_gcd, prev_freq;
-    bigint_set_u64(&local_gcd, 0);
-    bigint_set_u64(&prev_freq, 0);
-    int local_gcd_samples = 0;
-
-    /* ── Cross-shot period accumulator ── */
-    BigInt cross_gcd, cross_lcm;
-    bigint_set_u64(&cross_gcd, 0);
-    bigint_set_u64(&cross_lcm, 1);
+    /* ── LCM Period Accumulator (state owned by caller across bases) ── */
+    /* Per-base local accumulator — folds into cross-base acc_period after MCMC */
+    BigInt local_lcm;
+    bigint_set_u64(&local_lcm, 0);
+    int local_acc_samples = 0;
 
     /* Heap-allocate p6_cache to prevent VLA BigInt leak */
     BigInt *p6_cache = (BigInt*)calloc(n_sites_raw, sizeof(BigInt));
@@ -1863,87 +1905,60 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
         if (bigint_is_zero(&freq) || bigint_cmp(&freq, &mc_one_fb) <= 0) continue;
 
         /* ══════════════════════════════════════════════════════════════════
-         * STRATEGY A: Running GCD Accumulator
-         * GCD of multiple harmonics F_i = s_i·F* converges to F* itself.
-         * Then r = R / F*.
+         * STRATEGY A: LCM Period Accumulator
+         * Extract r_cand via fast Continued Fraction and safely accumulate LCM
          * ══════════════════════════════════════════════════════════════════ */
-        if (local_gcd_samples == 0) {
-            bigint_copy(&local_gcd, &freq);
-        } else {
-            bigint_gcd(&mc_gcd_v, &local_gcd, &freq);
-            if (!bigint_is_zero(&mc_gcd_v))
-                bigint_copy(&local_gcd, &mc_gcd_v);
-        }
-        local_gcd_samples++;
+        extract_period_cand_cf(&freq, &reg_sz, N, &mc_r_cand);
+        
+        if (bigint_cmp(&mc_r_cand, &mc_one_fb) > 0 && bigint_cmp(&mc_r_cand, N) < 0) {
+            VOTE_FOR_CANDIDATE(&mc_r_cand, shot);
 
-        /* Derive period estimate from per-base local GCD */
-        if (!bigint_is_zero(&local_gcd) && bigint_cmp(&local_gcd, &mc_one_fb) > 0) {
-            bigint_div_mod(&reg_sz, &local_gcd, &mc_r_cand, &mc_rem);
-            if (bigint_cmp(&mc_r_cand, &mc_one_fb) > 0 && bigint_cmp(&mc_r_cand, N) < 0) {
-                VOTE_FOR_CANDIDATE(&mc_r_cand, shot);
+            if (local_acc_samples == 0) {
+                bigint_copy(&local_lcm, &mc_r_cand);
+                local_acc_samples++;
+            } else {
+                /* mc_new_lcm = lcm(local_lcm, mc_r_cand) */
+                bigint_gcd(&mc_lcm_g, &local_lcm, &mc_r_cand);
+                bigint_mul(&mc_lcm_prod, &local_lcm, &mc_r_cand);
+                bigint_div_mod(&mc_lcm_prod, &mc_lcm_g, &mc_new_lcm, &mc_lcm_rem);
+                
+                uint32_t n_bits = bigint_bitlen(N);
+                uint32_t new_bits = bigint_bitlen(&mc_new_lcm);
 
-                /* Direct test on every shot (cheap — just one modexp) */
-                if (try_period(&mc_r_cand, a_val, N, factor_p, factor_q) == 1) {
-                    success = 1;
-                    printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (GCD accumulator)\n", shot);
-                }
-
-                /* Test small harmonic multiples — GCD may have over-reduced by small factor */
-                for (int _km = 2; _km <= 8 && !success; _km++) {
-                    BigInt _rk, _km_bi;
-                    bigint_set_u64(&_rk, 0); bigint_set_u64(&_km_bi, (uint64_t)_km);
-                    bigint_mul(&_rk, &mc_r_cand, &_km_bi);
-                    if (bigint_cmp(&_rk, N) < 0)
-                        if (try_period(&_rk, a_val, N, factor_p, factor_q) == 1) {
+                /* Accept if cleanly under N */
+                if (bigint_cmp(&mc_new_lcm, N) < 0) {
+                    bigint_copy(&local_lcm, &mc_new_lcm);
+                    local_acc_samples++;
+                    
+                    if (shot % 100 == 0) {
+                        if (try_period(&local_lcm, a_val, N, factor_p, factor_q) == 1) {
                             success = 1;
-                            printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (GCD accumulator × %d)\n", shot, _km);
+                            printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (LCM Accumulator)\n", shot);
+                            break;
                         }
+                    }
                 }
-            }
-
-            /* Also test local_gcd directly as a period candidate */
-            if (!success && bigint_cmp(&local_gcd, N) < 0)
-                if (try_period(&local_gcd, a_val, N, factor_p, factor_q) == 1) {
-                    success = 1;
-                    printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (GCD direct)\n", shot);
-                }
-        }
-        if (success) break;
-
-        /* ══════════════════════════════════════════════════════════════════
-         * STRATEGY B: Cross-Shot GCD/LCM Refinement
-         * If consecutive shots produce r₁ and r₂:
-         *   gcd(r₁, r₂) divides the true period
-         *   lcm(r₁, r₂) may BE the true period
-         * ══════════════════════════════════════════════════════════════════ */
-        if (!bigint_is_zero(&prev_freq) && bigint_cmp(&prev_freq, &mc_one_fb) > 0) {
-            /* Pairwise GCD of consecutive raw frequencies */
-            bigint_gcd(&mc_gcd_v, &prev_freq, &freq);
-            if (!bigint_is_zero(&mc_gcd_v) && bigint_cmp(&mc_gcd_v, &mc_one_fb) > 0) {
-                bigint_div_mod(&reg_sz, &mc_gcd_v, &mc_r_cand, &mc_rem);
-                if (bigint_cmp(&mc_r_cand, &mc_one_fb) > 0 && bigint_cmp(&mc_r_cand, N) < 0) {
-                    VOTE_FOR_CANDIDATE(&mc_r_cand, shot);
-                    if (try_period(&mc_r_cand, a_val, N, factor_p, factor_q) == 1) {
+                /* Harmonic Overshoot Strategy: if LCM slightly exceeds N, it acts as a true multiple of period */
+                else if (new_bits <= n_bits + 5) {
+                    /* Test the overshot harmonic directly */
+                    int test_res = try_period(&mc_new_lcm, a_val, N, factor_p, factor_q);
+                    if (test_res == 1) {
                         success = 1;
-                        printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (cross-shot GCD)\n", shot);
+                        printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (Harmonic Overshoot: %u bits)\n", shot, new_bits);
+                        break;
                     }
                 }
-            }
-
-            /* Pairwise LCM of consecutive raw frequencies */
-            if (!success && !bigint_is_zero(&mc_gcd_v)) {
-                bigint_mul(&mc_lcm_prod, &prev_freq, &freq);
-                bigint_div_mod(&mc_lcm_prod, &mc_gcd_v, &mc_new_lcm, &mc_lcm_rem);
-                if (bigint_cmp(&mc_new_lcm, N) < 0 && bigint_cmp(&mc_new_lcm, &mc_one_fb) > 0) {
-                    bigint_div_mod(&reg_sz, &mc_new_lcm, &mc_r_cand, &mc_rem);
-                    if (bigint_cmp(&mc_r_cand, &mc_one_fb) > 0 && bigint_cmp(&mc_r_cand, N) < 0) {
-                        VOTE_FOR_CANDIDATE(&mc_r_cand, shot);
+                /* Disjoint Noise Explosion: break Initial Noise Lock */
+                else {
+                    if (local_acc_samples == 1) {
+                        /* Accumulator is 1 noisy layer deep. Flush it with new candidate to prevent permanent lock. */
+                        bigint_copy(&local_lcm, &mc_r_cand);
+                        /* Samples remains 1 */
                     }
+                    /* If acc_samples > 1, we've successfully verified internal harmony, so ignore the garbage shot. */
                 }
             }
         }
-        bigint_copy(&prev_freq, &freq);
-        if (success) break;
 
         /* ══════════════════════════════════════════════════════════════════
          * STRATEGY C: Direct CF on individual frequencies
@@ -2001,11 +2016,11 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                         }
                     }
 
-                    /* Cross-GCD voted candidate with local GCD estimate */
-                    if (!success && !bigint_is_zero(&local_gcd)) {
+                    /* Cross-GCD voted candidate with local LCM estimate */
+                    if (!success && !bigint_is_zero(&local_lcm)) {
                         BigInt cross_r, cross_rem;
                         bigint_set_u64(&cross_r, 0); bigint_set_u64(&cross_rem, 0);
-                        bigint_gcd(&mc_gcd_v, &vote_table[vi].r_cand, &local_gcd);
+                        bigint_gcd(&mc_gcd_v, &vote_table[vi].r_cand, &local_lcm);
                         if (bigint_cmp(&mc_gcd_v, &mc_one_fb) > 0) {
                             bigint_div_mod(&reg_sz, &mc_gcd_v, &cross_r, &cross_rem);
                             if (bigint_cmp(&cross_r, &mc_one_fb) > 0 && bigint_cmp(&cross_r, N) < 0) {
@@ -2019,27 +2034,29 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 }
             }
             
-            /* Running GCD status */
-            uint32_t gcd_bits = bigint_bitlen(&local_gcd);
+            /* Running LCM status */
+            uint32_t lcm_bits = bigint_bitlen(&local_lcm);
             uint32_t n_bits = bigint_bitlen(N);
-            printf("  [Shot %5d] GCD accumulator: %u bits (%d samples) | target <%u bits\n",
-                   shot, gcd_bits, local_gcd_samples, n_bits);
+            printf("  [Shot %5d] LCM accumulator: %u bits (%d updates) | target <%u bits\n",
+                   shot, lcm_bits, local_acc_samples, n_bits);
             fflush(stdout);
         }
     }
 
-    /* Fold per-base local_gcd into persistent cross-base running_gcd */
-    if (!bigint_is_zero(&local_gcd) && bigint_cmp(&local_gcd, &mc_one_fb) > 0) {
-        if (*gcd_samples == 0) {
-            bigint_copy(running_gcd, &local_gcd);
+    /* Fold per-base local_lcm into persistent cross-base acc_period */
+    if (!bigint_is_zero(&local_lcm) && bigint_cmp(&local_lcm, &mc_one_fb) > 0) {
+        if (*acc_samples == 0) {
+            bigint_copy(acc_period, &local_lcm);
         } else {
-            bigint_gcd(&mc_gcd_v, running_gcd, &local_gcd);
-            if (!bigint_is_zero(&mc_gcd_v) && bigint_cmp(&mc_gcd_v, &mc_one_fb) > 0)
-                bigint_copy(running_gcd, &mc_gcd_v);
+            bigint_gcd(&mc_lcm_g, acc_period, &local_lcm);
+            bigint_mul(&mc_lcm_prod, acc_period, &local_lcm);
+            bigint_div_mod(&mc_lcm_prod, &mc_lcm_g, &mc_new_lcm, &mc_lcm_rem);
+            if (bigint_cmp(&mc_new_lcm, N) < 0)
+                bigint_copy(acc_period, &mc_new_lcm);
         }
-        (*gcd_samples) += local_gcd_samples;
-        printf("  [Cross-base GCD] Folded base result: %u bits | cross-base accumulator: %u bits\n",
-               bigint_bitlen(&local_gcd), bigint_bitlen(running_gcd));
+        (*acc_samples) += local_acc_samples;
+        printf("  [Cross-base Accumulator] Folded base result: %u bits | cross-base accumulator: %u bits\n",
+               bigint_bitlen(&local_lcm), bigint_bitlen(acc_period));
     }
 
     /* Surface the best partial period estimate from the vote table */
@@ -2150,10 +2167,10 @@ int main(int argc, char **argv)
     bigint_set_u64(&best_partial, 0);
     BigInt bi_one; bigint_set_u64(&bi_one, 1);
 
-    /* ── Cross-base GCD accumulator (persists across all base attempts) ── */
-    BigInt cross_base_running_gcd;
-    int    cross_base_gcd_samples = 0;
-    bigint_set_u64(&cross_base_running_gcd, 0);
+    /* ── Cross-base period accumulator (persists across all base attempts) ── */
+    BigInt cross_base_acc_period;
+    int    cross_base_acc_samples = 0;
+    bigint_set_u64(&cross_base_acc_period, 0);
 
     /* ── Try constraint-satisfaction first (Hensel lift in base 6) ── */
     success = 0;
@@ -2168,7 +2185,7 @@ int main(int argc, char **argv)
         bigint_set_u64(&best_partial, 0);
         clock_t t_start = clock();
         success = factor_with_hpc(&N, &a_val, &factor_p, &factor_q, &best_partial,
-                                  &cross_base_running_gcd, &cross_base_gcd_samples);
+                                  &cross_base_acc_period, &cross_base_acc_samples);
         clock_t t_end = clock();
 
         if (success) {
