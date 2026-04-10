@@ -1,4 +1,3 @@
-
 /* ═══════════════════════════════════════════════════════════════════════════
  * tesseract_factor.c — HPC Ouroboros Factoring Engine
  *
@@ -389,7 +388,7 @@ static void lll_reduce_basis(long long B[LLL_DIM][LLL_DIM])
  * This dramatically enhances composite frequency accuracy over CDF sampling
  * by ensuring the globally most-likely candidate signals (even 2nd/3rd best
  * over multi-digit correlations) are the exact ones swept by the fan.      */
-static void lll_collect_freqs(int n, double (*marg)[6],
+static void lll_collect_freqs(int n, mpfr_t (*marg)[6],
                                const BigInt *b6, BigInt out[LLL_K])
 {
     (void)0; /* Dynamic temperature beam search: T cools from 0.8 (LSB) to 0.1 (MSB) */
@@ -397,7 +396,10 @@ static void lll_collect_freqs(int n, double (*marg)[6],
     printf("  [freq] marginal peak confidence at pos 0..4:");
     for (int s = 0; s < 5 && s < n; s++) {
         double mp = 0.0;
-        for (int d = 0; d < 6; d++) if (marg[s][d] > mp) mp = marg[s][d];
+        for (int d = 0; d < 6; d++) {
+            double p = mpfr_get_d(marg[s][d], MPFR_RNDN);
+            if (p > mp) mp = p;
+        }
         printf(" %.3f", mp);
     }
     printf("\n");
@@ -406,8 +408,16 @@ static void lll_collect_freqs(int n, double (*marg)[6],
     double (*log_marg)[6] = (double(*)[6])calloc(n, sizeof(double[6]));
     for (int s = 0; s < n; s++) {
         for (int d = 0; d < 6; d++) {
-            double p = marg[s][d];
-            log_marg[s][d] = (p > 1e-15) ? log(p) : -100.0;
+            if (mpfr_cmp_d(marg[s][d], 0.0) <= 0) {
+                log_marg[s][d] = -100.0;
+            } else {
+                mpfr_t mp_log;
+                mpfr_init2(mp_log, 2048);
+                mpfr_log(mp_log, marg[s][d], MPFR_RNDN);
+                double p_val = mpfr_get_d(mp_log, MPFR_RNDN);
+                log_marg[s][d] = (p_val < -100.0) ? -100.0 : p_val;
+                mpfr_clear(mp_log);
+            }
         }
     }
 
@@ -534,7 +544,7 @@ static void lll_collect_freqs(int n, double (*marg)[6],
  *   For larger r the short-vector is longer than the W-norm rows; skipped.
  *
  * Returns 1 and writes factor_p/q on success, 0 otherwise.                  */
-static int lll_recover_period(int n_sites_raw, double (*marg)[6],
+static int lll_recover_period(int n_sites_raw, mpfr_t (*marg)[6],
                                const BigInt *b6, const BigInt *reg_sz,
                                const BigInt *N,  const BigInt *a_val,
                                BigInt *factor_p, BigInt *factor_q)
@@ -976,78 +986,58 @@ static int factor_hensel_base6(const BigInt *N, BigInt *factor_p, BigInt *factor
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /* Complex edge message: amplitude-domain, preserving phase */
-
-/* MPFR helpers */
-mpfr_t hpc_cm_t1, hpc_cm_t2, hpc_cm_t3, hpc_cm_t4;
-int hpc_cm_init_flag=0;
-#define CMPFR_MUL(r_out, i_out, r1, i1, r2, i2) do { \
-    if (!hpc_cm_init_flag) { mpfr_inits2(2048, hpc_cm_t1, hpc_cm_t2, hpc_cm_t3, hpc_cm_t4, (mpfr_ptr)0); hpc_cm_init_flag=1; } \
-    mpfr_mul(hpc_cm_t1, r1, r2, MPFR_RNDN); \
-    mpfr_mul(hpc_cm_t2, i1, i2, MPFR_RNDN); \
-    mpfr_sub(hpc_cm_t3, hpc_cm_t1, hpc_cm_t2, MPFR_RNDN); \
-    mpfr_mul(hpc_cm_t1, r1, i2, MPFR_RNDN); \
-    mpfr_mul(hpc_cm_t2, i1, r2, MPFR_RNDN); \
-    mpfr_add(i_out, hpc_cm_t1, hpc_cm_t2, MPFR_RNDN); \
-    mpfr_set(r_out, hpc_cm_t3, MPFR_RNDN); \
-} while(0)
-
-/* Complex edge message: amplitude-domain, preserving phase (MPFR) */
 typedef struct {
-    mpfr_t re[2][6];
-    mpfr_t im[2][6];
-} ComplexEdgeMsgMPFR;
-
+    double re[2][6]; /* re[0]: sa→sb, re[1]: sb→sa */
+    double im[2][6];
+} ComplexEdgeMsg;
 
 /* ω₆ roots of unity for CZ phase lookup */
 static const double W6_RE[6] = { 1.0, 0.5, -0.5, -1.0, -0.5,  0.5 };
 static const double W6_IM[6] = { 0.0, 0.866025403784438647, 0.866025403784438647,
                                   0.0, -0.866025403784438647, -0.866025403784438647 };
 
-static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed, mpfr_t (*hp_site_re)[6], mpfr_t (*hp_site_im)[6]) {
+static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed) {
     const HPCGraph *g = ms->graph;
     int n_edges = (int)g->n_edges;
     int n_sites = (int)g->n_sites;
     if (n_edges == 0) return;
 
-    if (!hpc_cm_init_flag) { mpfr_inits2(2048, hpc_cm_t1, hpc_cm_t2, hpc_cm_t3, hpc_cm_t4, (mpfr_ptr)0); hpc_cm_init_flag=1; }
+    ComplexEdgeMsg *msgs = (ComplexEdgeMsg*)calloc(n_edges, sizeof(ComplexEdgeMsg));
+    ComplexEdgeMsg *new_msgs = (ComplexEdgeMsg*)calloc(n_edges, sizeof(ComplexEdgeMsg));
 
-    ComplexEdgeMsgMPFR *msgs = (ComplexEdgeMsgMPFR*)calloc(n_edges, sizeof(ComplexEdgeMsgMPFR));
+    printf("      [Complex Amplitude BP] Initializing %d edges, %d sites (seed %u)...\n", n_edges, n_sites, seed);
 
-    printf("      [Complex Amplitude BP] Initializing %d edges, %d sites (seed %u) in MPFR...\n", n_edges, n_sites, seed);
-
+    /* Initialize messages: seed 0 = uniform, others = random complex to break symmetry */
     srand(seed * 12345 + 42);
     for (int e = 0; e < n_edges; e++) {
         for (int v = 0; v < 6; v++) {
-            for (int dir=0; dir<2; dir++) {
-                mpfr_inits2(2048, msgs[e].re[dir][v], msgs[e].im[dir][v], (mpfr_ptr)0);
-                if (seed == 0) {
-                    mpfr_set_d(msgs[e].re[dir][v], 1.0, MPFR_RNDN);
-                    mpfr_set_d(msgs[e].im[dir][v], 0.0, MPFR_RNDN);
-                } else {
-                    double angle = 2.0 * 3.14159265358979323846 * ((double)rand() / RAND_MAX);
-                    mpfr_set_d(msgs[e].re[dir][v], cos(angle), MPFR_RNDN);
-                    mpfr_set_d(msgs[e].im[dir][v], sin(angle), MPFR_RNDN);
-                }
+            if (seed == 0) {
+                msgs[e].re[0][v] = 1.0; msgs[e].im[0][v] = 0.0;
+                msgs[e].re[1][v] = 1.0; msgs[e].im[1][v] = 0.0;
+            } else {
+                double angle0 = 2.0 * 3.14159265358979323846 * ((double)rand() / RAND_MAX);
+                double angle1 = 2.0 * 3.14159265358979323846 * ((double)rand() / RAND_MAX);
+                msgs[e].re[0][v] = cos(angle0); msgs[e].im[0][v] = sin(angle0);
+                msgs[e].re[1][v] = cos(angle1); msgs[e].im[1][v] = sin(angle1);
             }
         }
     }
 
     #define CAMP_MAX_ITER 1500
+    /* Simulated Annealing: damping starts high (0.5) and cools to 0.05 */
     #define CAMP_DAMPING_START 0.50
     #define CAMP_DAMPING_END   0.05
-    #define CAMP_COOL_ITERS   1200
+    #define CAMP_COOL_ITERS   1200  /* iterations over which cooling occurs */
     #define CAMP_TOL      1e-8
 
+    double prev_residual = 1e30;
     int converged = 0;
-
-    mpfr_t prod_re[6], prod_im[6], new_re[6], new_im[6];
-    for (int v = 0; v < 6; v++) mpfr_inits2(2048, prod_re[v], prod_im[v], new_re[v], new_im[v], (mpfr_ptr)0);
-    mpfr_t norm_sq, inv_norm, w_re, w_im;
-    mpfr_inits2(2048, norm_sq, inv_norm, w_re, w_im, (mpfr_ptr)0);
+    int plateau_count = 0;
 
     for (int it = 0; it < CAMP_MAX_ITER && !converged; it++) {
         double max_delta = 0.0;
 
+        /* Sequential edge updates for stability on loopy graphs */
         for (int eid = 0; eid < n_edges; eid++) {
             const HPCEdge *edge = &g->edges[eid];
             uint64_t sa = edge->site_a, sb = edge->site_b;
@@ -1055,117 +1045,137 @@ static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed,
             for (int dir = 0; dir < 2; dir++) {
                 uint64_t src = (dir == 0) ? sa : sb;
 
+                /* Step 1: Compute product of local amplitude × all incoming
+                 *         messages EXCEPT this edge — complex multiplication */
+                double prod_re[6], prod_im[6];
                 for (int v_src = 0; v_src < 6; v_src++) {
-                    mpfr_set(prod_re[v_src], hp_site_re[src][v_src], MPFR_RNDN);
-                    mpfr_set(prod_im[v_src], hp_site_im[src][v_src], MPFR_RNDN);
+                    prod_re[v_src] = g->locals[src].edge_re[v_src];
+                    prod_im[v_src] = g->locals[src].edge_im[v_src];
 
                     const HPCAdjList *adj = &g->adj[src];
                     for (uint64_t mi = 0; mi < adj->count; mi++) {
                         uint64_t in_eid = adj->edge_ids[mi];
                         if (in_eid == (uint64_t)eid) continue;
 
+                        /* Which direction does this message flow INTO src? */
                         int in_dir = (g->edges[in_eid].site_b == src) ? 0 : 1;
-                        CMPFR_MUL(prod_re[v_src], prod_im[v_src], prod_re[v_src], prod_im[v_src], msgs[in_eid].re[in_dir][v_src], msgs[in_eid].im[in_dir][v_src]);
+
+                        double mr = msgs[in_eid].re[in_dir][v_src];
+                        double mi_v = msgs[in_eid].im[in_dir][v_src];
+
+                        /* Complex multiply: prod *= msg */
+                        double nr = prod_re[v_src] * mr - prod_im[v_src] * mi_v;
+                        double ni = prod_re[v_src] * mi_v + prod_im[v_src] * mr;
+                        prod_re[v_src] = nr;
+                        prod_im[v_src] = ni;
                     }
                 }
 
+                /* Step 2: Compute outgoing message via sum-product with
+                 *         complex edge weight w(va, vb)
+                 * m_{src→dst}[vb] = Σ_{va} prod(va) × w(va, vb)
+                 *
+                 * For CZ: w(va,vb) = ω^(va·vb) — this is a DFT₆ !!! */
+                double new_re[6], new_im[6];
                 for (int vb = 0; vb < 6; vb++) {
-                    mpfr_set_d(new_re[vb], 0.0, MPFR_RNDN);
-                    mpfr_set_d(new_im[vb], 0.0, MPFR_RNDN);
+                    double sum_re = 0.0, sum_im = 0.0;
                     for (int va = 0; va < 6; va++) {
+                        double w_re, w_im;
                         if (edge->type == HPC_EDGE_CZ) {
                             int pidx = (va * vb) % 6;
-                            mpfr_set_d(w_re, W6_RE[pidx], MPFR_RNDN);
-                            mpfr_set_d(w_im, W6_IM[pidx], MPFR_RNDN);
+                            w_re = W6_RE[pidx];
+                            w_im = W6_IM[pidx];
                         } else {
-                            mpfr_set_d(w_re, edge->w_re[va][vb], MPFR_RNDN);
-                            mpfr_set_d(w_im, edge->w_im[va][vb], MPFR_RNDN);
+                            w_re = edge->w_re[va][vb];
+                            w_im = edge->w_im[va][vb];
                         }
-                        CMPFR_MUL(hpc_cm_t1, hpc_cm_t2, prod_re[va], prod_im[va], w_re, w_im);
-                        mpfr_add(new_re[vb], new_re[vb], hpc_cm_t1, MPFR_RNDN);
-                        mpfr_add(new_im[vb], new_im[vb], hpc_cm_t2, MPFR_RNDN);
+                        /* prod(va) × w(va, vb) */
+                        sum_re += prod_re[va] * w_re - prod_im[va] * w_im;
+                        sum_im += prod_re[va] * w_im + prod_im[va] * w_re;
                     }
+                    new_re[vb] = sum_re;
+                    new_im[vb] = sum_im;
                 }
 
-                mpfr_set_d(norm_sq, 0.0, MPFR_RNDN);
-                for (int v = 0; v < 6; v++) {
-                    mpfr_mul(hpc_cm_t1, new_re[v], new_re[v], MPFR_RNDN);
-                    mpfr_add(norm_sq, norm_sq, hpc_cm_t1, MPFR_RNDN);
-                    mpfr_mul(hpc_cm_t2, new_im[v], new_im[v], MPFR_RNDN);
-                    mpfr_add(norm_sq, norm_sq, hpc_cm_t2, MPFR_RNDN);
-                }
-
-                double d_norm_sq = mpfr_get_d(norm_sq, MPFR_RNDN);
-                if (d_norm_sq > 1e-30) {
-                    mpfr_sqrt(inv_norm, norm_sq, MPFR_RNDN);
-                    mpfr_ui_div(inv_norm, 1, inv_norm, MPFR_RNDN);
+                /* Step 3: Normalize message to unit L2 norm */
+                double norm_sq = 0.0;
+                for (int v = 0; v < 6; v++)
+                    norm_sq += new_re[v]*new_re[v] + new_im[v]*new_im[v];
+                if (norm_sq > 1e-30) {
+                    double inv_norm = 1.0 / sqrt(norm_sq);
                     for (int v = 0; v < 6; v++) {
-                        mpfr_mul(new_re[v], new_re[v], inv_norm, MPFR_RNDN);
-                        mpfr_mul(new_im[v], new_im[v], inv_norm, MPFR_RNDN);
+                        new_re[v] *= inv_norm;
+                        new_im[v] *= inv_norm;
                     }
                 } else {
                     for (int v = 0; v < 6; v++) {
-                        mpfr_set_d(new_re[v], 1.0 / sqrt(6.0), MPFR_RNDN);
-                        mpfr_set_d(new_im[v], 0.0, MPFR_RNDN);
+                        new_re[v] = 1.0 / sqrt(6.0);
+                        new_im[v] = 0.0;
                     }
                 }
 
+                /* Step 4: Damped update with annealing schedule */
                 double anneal_alpha = (it < CAMP_COOL_ITERS)
                     ? CAMP_DAMPING_START * exp(log(CAMP_DAMPING_END / CAMP_DAMPING_START) * ((double)it / CAMP_COOL_ITERS))
                     : CAMP_DAMPING_END;
-                    
                 double delta = 0.0;
                 for (int v = 0; v < 6; v++) {
-                    mpfr_mul_d(hpc_cm_t1, new_re[v], anneal_alpha, MPFR_RNDN);
-                    mpfr_mul_d(hpc_cm_t2, msgs[eid].re[dir][v], 1.0 - anneal_alpha, MPFR_RNDN);
-                    mpfr_add(hpc_cm_t1, hpc_cm_t1, hpc_cm_t2, MPFR_RNDN);
-                    
-                    mpfr_sub(hpc_cm_t3, hpc_cm_t1, msgs[eid].re[dir][v], MPFR_RNDN);
-                    double dr = mpfr_get_d(hpc_cm_t3, MPFR_RNDN);
-                    mpfr_set(msgs[eid].re[dir][v], hpc_cm_t1, MPFR_RNDN);
+                    double upd_re = anneal_alpha * new_re[v] +
+                                    (1.0 - anneal_alpha) * msgs[eid].re[dir][v];
+                    double upd_im = anneal_alpha * new_im[v] +
+                                    (1.0 - anneal_alpha) * msgs[eid].im[dir][v];
 
-                    mpfr_mul_d(hpc_cm_t1, new_im[v], anneal_alpha, MPFR_RNDN);
-                    mpfr_mul_d(hpc_cm_t2, msgs[eid].im[dir][v], 1.0 - anneal_alpha, MPFR_RNDN);
-                    mpfr_add(hpc_cm_t1, hpc_cm_t1, hpc_cm_t2, MPFR_RNDN);
-                    
-                    mpfr_sub(hpc_cm_t3, hpc_cm_t1, msgs[eid].im[dir][v], MPFR_RNDN);
-                    double di = mpfr_get_d(hpc_cm_t3, MPFR_RNDN);
-                    mpfr_set(msgs[eid].im[dir][v], hpc_cm_t1, MPFR_RNDN);
-
+                    double dr = upd_re - msgs[eid].re[dir][v];
+                    double di = upd_im - msgs[eid].im[dir][v];
                     delta += dr*dr + di*di;
+
+                    msgs[eid].re[dir][v] = upd_re;
+                    msgs[eid].im[dir][v] = upd_im;
                 }
                 if (delta > max_delta) max_delta = delta;
             }
         }
 
         if (it < 10 || (it + 1) % 25 == 0 || max_delta < CAMP_TOL) {
-            printf("      [Complex Amplitude BP] Iter %d: residual = %.6e\n", it + 1, max_delta);
+            printf("      [Complex Amplitude BP] Iter %d: residual = %.6e\n",
+                   it + 1, max_delta);
         }
 
-        if (max_delta < CAMP_TOL) converged = 1;
+        /* Deep topological sequence mathematically natively forces full thermodynamic exhaustion */
+        prev_residual = max_delta;
     }
 
     if (!converged)
         printf("      [Complex Amplitude BP] Reached max iterations (%d)\n", CAMP_MAX_ITER);
 
+    /* ── Compute dressed amplitudes from converged messages ──
+     * dressed[k][v] = aₖ(v) × Π_{m→k} m[v]
+     * The marginal is then |dressed[k][v]|² — encoding FULL interference */
     for (int s = 0; s < n_sites; s++) {
         for (int v = 0; v < 6; v++) {
-            mpfr_set(prod_re[v], hp_site_re[s][v], MPFR_RNDN);
-            mpfr_set(prod_im[v], hp_site_im[s][v], MPFR_RNDN);
+            double d_re = g->locals[s].edge_re[v];
+            double d_im = g->locals[s].edge_im[v];
 
             const HPCAdjList *adj = &g->adj[s];
             for (uint64_t mi = 0; mi < adj->count; mi++) {
                 uint64_t in_eid = adj->edge_ids[mi];
                 int in_dir = (g->edges[in_eid].site_b == (uint64_t)s) ? 0 : 1;
 
-                CMPFR_MUL(prod_re[v], prod_im[v], prod_re[v], prod_im[v], msgs[in_eid].re[in_dir][v], msgs[in_eid].im[in_dir][v]);
+                double mr = msgs[in_eid].re[in_dir][v];
+                double mi_v = msgs[in_eid].im[in_dir][v];
+
+                double nr = d_re * mr - d_im * mi_v;
+                double ni = d_re * mi_v + d_im * mr;
+                d_re = nr;
+                d_im = ni;
             }
 
-            ms->sheets[s].dressed_re[v] = mpfr_get_d(prod_re[v], MPFR_RNDN);
-            ms->sheets[s].dressed_im[v] = mpfr_get_d(prod_im[v], MPFR_RNDN);
+            ms->sheets[s].dressed_re[v] = d_re;
+            ms->sheets[s].dressed_im[v] = d_im;
         }
     }
 
+    /* Diagnostic: print entropy of first few sites to verify sharpness */
     printf("      [Complex Amplitude BP] Site entropy (bits, sharp < 2.58):");
     for (int s = 0; s < 5 && s < n_sites; s++) {
         double probs[6], total = 0.0;
@@ -1185,15 +1195,10 @@ static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed,
     }
     printf("\n");
 
-    for (int v = 0; v < 6; v++) mpfr_clears(prod_re[v], prod_im[v], new_re[v], new_im[v], (mpfr_ptr)0);
-    mpfr_clears(norm_sq, inv_norm, w_re, w_im, (mpfr_ptr)0);
-    for (int e = 0; e < n_edges; e++) {
-        for (int dir=0; dir<2; dir++) {
-            for (int v = 0; v < 6; v++) mpfr_clears(msgs[e].re[dir][v], msgs[e].im[dir][v], (mpfr_ptr)0);
-        }
-    }
     free(msgs);
+    free(new_msgs);
 }
+
 static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                             BigInt *factor_p, BigInt *factor_q,
                             BigInt *best_period)
@@ -1229,17 +1234,6 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     /* Put all sites in uniform superposition */
     for (int i = 0; i < n_sites; i++)
         triality_dft(&graph->locals[i]);
-
-    mpfr_t (*hp_site_re)[6] = (mpfr_t (*)[6])malloc(n_sites * sizeof(*hp_site_re));
-    mpfr_t (*hp_site_im)[6] = (mpfr_t (*)[6])malloc(n_sites * sizeof(*hp_site_im));
-    for (int s = 0; s < n_sites; s++) {
-        for (int v = 0; v < 6; v++) {
-            mpfr_inits2(2048, hp_site_re[s][v], hp_site_im[s][v], (mpfr_ptr)0);
-            mpfr_set_d(hp_site_re[s][v], graph->locals[s].edge_re[v], MPFR_RNDN);
-            mpfr_set_d(hp_site_im[s][v], graph->locals[s].edge_im[v], MPFR_RNDN);
-        }
-    }
-
 
     #define PHASE_CHUNKS 11
     #define CHUNK_BITS   48
@@ -1366,19 +1360,58 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             int site0 = blk * 6 + 0;
             int site1 = blk * 6 + 1;
             
-            mpfr_t m_t1, m_t2;
-            mpfr_inits2(2048, m_t1, m_t2, (mpfr_ptr)0);
+            double rA = graph->locals[site0].edge_re[d];
+            double iA = graph->locals[site0].edge_im[d];
+            double rB = graph->locals[site1].edge_re[d];
+            double iB = graph->locals[site1].edge_im[d];
+            
+            mpfr_t m_rA, m_iA, m_rB, m_iB, m_cosA, m_sinA, m_cosB, m_sinB;
+            mpfr_t m_t1, m_t2, m_t3, m_t4;
+            mpfr_inits2(2048, m_rA, m_iA, m_rB, m_iB, m_cosA, m_sinA, m_cosB, m_sinB, m_t1, m_t2, m_t3, m_t4, (mpfr_ptr)0);
+            mpfr_set_d(m_rA, rA, MPFR_RNDN);
+            mpfr_set_d(m_iA, iA, MPFR_RNDN);
+            mpfr_set_d(m_rB, rB, MPFR_RNDN);
+            mpfr_set_d(m_iB, iB, MPFR_RNDN);
+            
+            mpfr_set(m_cosA, mf_cosA, MPFR_RNDN);
+            mpfr_set(m_sinA, mf_sinA, MPFR_RNDN);
+            mpfr_set(m_cosB, mf_cosB, MPFR_RNDN);
+            mpfr_set(m_sinB, mf_sinB, MPFR_RNDN);
 
-            mpfr_set(m_t1, hp_site_re[site0][d], MPFR_RNDN);
-            mpfr_set(m_t2, hp_site_im[site0][d], MPFR_RNDN);
-            CMPFR_MUL(hp_site_re[site0][d], hp_site_im[site0][d], m_t1, m_t2, mf_cosA, mf_sinA);
+            // rA = old_rA * cosA - iA * sinA
+            mpfr_mul(m_t1, m_rA, m_cosA, MPFR_RNDN);
+            mpfr_mul(m_t2, m_iA, m_sinA, MPFR_RNDN);
+            mpfr_sub(m_t3, m_t1, m_t2, MPFR_RNDN);
             
-            mpfr_set(m_t1, hp_site_re[site1][d], MPFR_RNDN);
-            mpfr_set(m_t2, hp_site_im[site1][d], MPFR_RNDN);
-            CMPFR_MUL(hp_site_re[site1][d], hp_site_im[site1][d], m_t1, m_t2, mf_cosB, mf_sinB);
+            // iA = old_rA * sinA + iA * cosA
+            mpfr_mul(m_t1, m_rA, m_sinA, MPFR_RNDN);
+            mpfr_mul(m_t2, m_iA, m_cosA, MPFR_RNDN);
+            mpfr_add(m_t4, m_t1, m_t2, MPFR_RNDN);
+
+            rA = mpfr_get_d(m_t3, MPFR_RNDN);
+            iA = mpfr_get_d(m_t4, MPFR_RNDN);
             
-            mpfr_clears(m_t1, m_t2, mf_yA, mf_yB, mf_N, mf_pi, mf_phaseA, mf_phaseB, 
+            // rB = old_rB * cosB - iB * sinB
+            mpfr_mul(m_t1, m_rB, m_cosB, MPFR_RNDN);
+            mpfr_mul(m_t2, m_iB, m_sinB, MPFR_RNDN);
+            mpfr_sub(m_t3, m_t1, m_t2, MPFR_RNDN);
+
+            // iB = old_rB * sinB + iB * cosB
+            mpfr_mul(m_t1, m_rB, m_sinB, MPFR_RNDN);
+            mpfr_mul(m_t2, m_iB, m_cosB, MPFR_RNDN);
+            mpfr_add(m_t4, m_t1, m_t2, MPFR_RNDN);
+
+            rB = mpfr_get_d(m_t3, MPFR_RNDN);
+            iB = mpfr_get_d(m_t4, MPFR_RNDN);
+
+            mpfr_clears(m_rA, m_iA, m_rB, m_iB, m_cosA, m_sinA, m_cosB, m_sinB, m_t1, m_t2, m_t3, m_t4, (mpfr_ptr)0);
+            mpfr_clears(mf_yA, mf_yB, mf_N, mf_pi, mf_phaseA, mf_phaseB, 
                         mf_cosA, mf_sinA, mf_cosB, mf_sinB, (mpfr_ptr)0);
+
+            graph->locals[site0].edge_re[d] = rA;
+            graph->locals[site0].edge_im[d] = iA;
+            graph->locals[site1].edge_re[d] = rB;
+            graph->locals[site1].edge_im[d] = iB;
         }
 
         /* Extract the blk-th base-6 digit of N via running quotient (O(1) per block) */
@@ -1505,37 +1538,26 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     }
 
 
-    /* Convert Phase to Amplitude (IDFT) BEFORE BP (MPFR) */
-    mpfr_t idft_t1, idft_t2, idft_t3, idft_t4;
-    mpfr_inits2(2048, idft_t1, idft_t2, idft_t3, idft_t4, (mpfr_ptr)0);
-    
+    /* Convert Phase to Amplitude (IDFT) BEFORE BP */
     for (int site = 0; site < n_sites; site++) {
-        mpfr_t out_re[6], out_im[6];
+        double out_re[6], out_im[6];
         for (int k_dft = 0; k_dft < 6; k_dft++) {
-            mpfr_inits2(2048, out_re[k_dft], out_im[k_dft], (mpfr_ptr)0);
-            mpfr_set_d(out_re[k_dft], 0.0, MPFR_RNDN);
-            mpfr_set_d(out_im[k_dft], 0.0, MPFR_RNDN);
-            
+            double sr = 0, si = 0;
             for (int j = 0; j < 6; j++) {
                 double angle = 2.0 * 3.14159265358979323846 * j * k_dft / 6.0;
-                mpfr_set_d(idft_t1, cos(angle), MPFR_RNDN);
-                mpfr_set_d(idft_t2, sin(angle), MPFR_RNDN);
-                
-                CMPFR_MUL(idft_t3, idft_t4, hp_site_re[site][j], hp_site_im[site][j], idft_t1, idft_t2);
-                
-                mpfr_add(out_re[k_dft], out_re[k_dft], idft_t3, MPFR_RNDN);
-                mpfr_add(out_im[k_dft], out_im[k_dft], idft_t4, MPFR_RNDN);
+                double re = graph->locals[site].edge_re[j];
+                double im = graph->locals[site].edge_im[j];
+                sr += re*cos(angle) + im*sin(angle);
+                si += re*sin(angle) - im*cos(angle);
             }
-            mpfr_div_d(out_re[k_dft], out_re[k_dft], sqrt(6.0), MPFR_RNDN);
-            mpfr_div_d(out_im[k_dft], out_im[k_dft], sqrt(6.0), MPFR_RNDN);
+            out_re[k_dft] = sr / sqrt(6.0);
+            out_im[k_dft] = si / sqrt(6.0);
         }
         for (int d = 0; d < 6; d++) {
-            mpfr_set(hp_site_re[site][d], out_re[d], MPFR_RNDN);
-            mpfr_set(hp_site_im[site][d], out_im[d], MPFR_RNDN);
-            mpfr_clears(out_re[d], out_im[d], (mpfr_ptr)0);
+            graph->locals[site].edge_re[d] = out_re[d];
+            graph->locals[site].edge_im[d] = out_im[d];
         }
     }
-    mpfr_clears(idft_t1, idft_t2, idft_t3, idft_t4, (mpfr_ptr)0);
     printf("    Phase 3: S₁₄ Deep Parity Crystallization via Complex Amplitude BP...\n");
     clock_t t_bp_start = clock();
 
@@ -1544,7 +1566,13 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     /* Heap-allocate marginals. Index goes up to scale = 2*n_blocks-1, so
      * we need max(n_sites_raw, 2*n_blocks) elements to avoid overflow. */
     int marginals_sz = (2 * n_blocks > n_sites_raw) ? 2 * n_blocks : n_sites_raw;
-    double (*marginals)[6] = (double(*)[6])calloc(marginals_sz, sizeof(double[6]));
+    mpfr_t (*marginals)[6] = (mpfr_t (*)[6])malloc(marginals_sz * sizeof(mpfr_t[6]));
+    for (int i = 0; i < marginals_sz; i++) {
+        for (int d = 0; d < 6; d++) {
+            mpfr_inits2(2048, marginals[i][d], (mpfr_ptr)0);
+            mpfr_set_d(marginals[i][d], 0.0, MPFR_RNDN);
+        }
+    }
 
     /* ── Multi-Start BP: 10 random seeds, ensemble averaging ── 
      * MATHEMATICAL REVELATION: 
@@ -1557,7 +1585,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     #define N_STARTS 10
 
     for (int start = 0; start < N_STARTS; start++) {
-        z6_complex_amplitude_bp(mobius, (unsigned int)start, hp_site_re, hp_site_im);
+        z6_complex_amplitude_bp(mobius, (unsigned int)start);
 
         for (int blk = 0; blk < n_blocks; blk++) {
             for (int offset = 0; offset <= 1; offset++) {
@@ -1566,7 +1594,15 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 for (int d = 0; d < 6; d++) {
                     double re = mobius->sheets[site].dressed_re[d];
                     double im = mobius->sheets[site].dressed_im[d];
-                    marginals[scale][d] += (re * re + im * im);
+                    mpfr_t m_re, m_im, m_sq;
+                    mpfr_inits2(2048, m_re, m_im, m_sq, (mpfr_ptr)0);
+                    mpfr_set_d(m_re, re, MPFR_RNDN);
+                    mpfr_set_d(m_im, im, MPFR_RNDN);
+                    mpfr_mul(m_re, m_re, m_re, MPFR_RNDN);
+                    mpfr_mul(m_im, m_im, m_im, MPFR_RNDN);
+                    mpfr_add(m_sq, m_re, m_im, MPFR_RNDN);
+                    mpfr_add(marginals[scale][d], marginals[scale][d], m_sq, MPFR_RNDN);
+                    mpfr_clears(m_re, m_im, m_sq, (mpfr_ptr)0);
                 }
             }
         }
@@ -1579,52 +1615,47 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     for (int blk = 0; blk < n_blocks; blk++) {
         for (int offset = 0; offset <= 1; offset++) {
             int scale = 2 * blk + offset;
-            double sum_prob = 0.0;
+            mpfr_t sum_prob; mpfr_init2(sum_prob, 2048);
+            mpfr_set_d(sum_prob, 0.0, MPFR_RNDN);
             for (int d = 0; d < 6; d++) {
-                sum_prob += marginals[scale][d];
+                mpfr_add(sum_prob, sum_prob, marginals[scale][d], MPFR_RNDN);
             }
-            double sum_prob2 = 0.0;
-            if (sum_prob < 1e-30) {
+            mpfr_t sum_prob2; mpfr_init2(sum_prob2, 2048);
+            mpfr_set_d(sum_prob2, 0.0, MPFR_RNDN);
+            if (mpfr_get_d(sum_prob, MPFR_RNDN) < 1e-30) {
                 /* BP has NO information about this digit — all Born probs underflowed.
                  * The mathematically correct Bayesian prior is UNIFORM 1/6.
                  * This gives the MCMC genuine stochastic diversity on these positions
                  * without corrupting positions where BP actually converged. */
                 for (int d = 0; d < 6; d++) {
-                    marginals[scale][d] = 1.0 / 6.0;
+                    mpfr_set_d(marginals[scale][d], 1.0 / 6.0, MPFR_RNDN);
                 }
-                sum_prob2 = 1.0;
+                mpfr_set_d(sum_prob2, 1.0, MPFR_RNDN);
             } else {
                 for (int d = 0; d < 6; d++) {
-                    marginals[scale][d] /= sum_prob; /* Normalize for Monte Carlo */
-                    sum_prob2 += marginals[scale][d];
+                    mpfr_div(marginals[scale][d], marginals[scale][d], sum_prob, MPFR_RNDN); /* Normalize for Monte Carlo */
+                    mpfr_add(sum_prob2, sum_prob2, marginals[scale][d], MPFR_RNDN);
                 }
             }
             double max_prob = 0.0;
             int best_digit = 0;
             for (int d = 0; d < 6; d++) {
-                marginals[scale][d] /= sum_prob2; /* Re-normalize */
-                if (marginals[scale][d] > max_prob) {
-                    max_prob = marginals[scale][d];
+                mpfr_div(marginals[scale][d], marginals[scale][d], sum_prob2, MPFR_RNDN); /* Re-normalize */
+                double p = mpfr_get_d(marginals[scale][d], MPFR_RNDN);
+                if (p > max_prob) {
+                    max_prob = p;
                     best_digit = d;
                 }
             }
             if (scale < 10 || scale == n_sites_raw - 1 || (scale + 1) % 100 == 0) {
                 printf("    digit %3d: val=%d  P_möbius=%.4f  [", scale, best_digit, max_prob);
                 for (int d = 0; d < 6; d++)
-                    printf("%.3f%s", marginals[scale][d], d < 5 ? " " : "");
+                    printf("%.3f%s", mpfr_get_d(marginals[scale][d], MPFR_RNDN), d < 5 ? " " : "");
                 printf("]\n");
             }
+            mpfr_clears(sum_prob, sum_prob2, (mpfr_ptr)0);
         }
     }
-
-    /* Clean up MPFR hp_site_arrays */
-    for (int s = 0; s < n_sites; s++) {
-        for (int v = 0; v < 6; v++) {
-            mpfr_clears(hp_site_re[s][v], hp_site_im[s][v], (mpfr_ptr)0);
-        }
-    }
-    free(hp_site_re);
-    free(hp_site_im);
 
     /* ── Build signal mask: which positions have genuine BP information? ── */
     int *bp_has_signal = (int*)calloc(n_sites_raw, sizeof(int));
@@ -1632,8 +1663,10 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     int n_flippable = 0;
     for (int scale = 0; scale < n_sites_raw; scale++) {
         double max_p = 0.0;
-        for (int d = 0; d < 6; d++)
-            if (marginals[scale][d] > max_p) max_p = marginals[scale][d];
+        for (int d = 0; d < 6; d++) {
+            double p = mpfr_get_d(marginals[scale][d], MPFR_RNDN);
+            if (p > max_p) max_p = p;
+        }
         /* A position has signal if its max probability is significantly above uniform (1/6 ≈ 0.167) */
         if (max_p > 0.20) {
             bp_has_signal[scale] = 1;
@@ -1779,8 +1812,10 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
         if (shot == 1) {
             for (int scale = 0; scale < n_sites_raw; scale++) {
                 double mp = -1.0; int best = 0;
-                for (int d = 0; d < 6; d++)
-                    if (marginals[scale][d] > mp) { mp = marginals[scale][d]; best = d; }
+                for (int d = 0; d < 6; d++) {
+                    double p = mpfr_get_d(marginals[scale][d], MPFR_RNDN);
+                    if (p > mp) { mp = p; best = d; }
+                }
                 mcmc_state[scale] = best;
                 bigint_set_u64(&mc_d_bi, (uint64_t)best);
                 bigint_mul(&mc_term, &mc_d_bi, &p6_cache[scale]);
@@ -1796,7 +1831,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             double cdf = 0.0;
             int new_d = 0;
             for (int d = 0; d < 6; d++) {
-                cdf += marginals[flip][d];
+                cdf += mpfr_get_d(marginals[flip][d], MPFR_RNDN);
                 if (rr <= cdf) { new_d = d; break; }
             }
             int old_d = mcmc_state[flip];
