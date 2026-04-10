@@ -1732,8 +1732,11 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     int total_votes_cast = 0;
 
     /* ── Running GCD Accumulator (state owned by caller across bases) ── */
-    BigInt prev_freq;
+    /* Per-base local accumulator — folds into cross-base running_gcd after MCMC */
+    BigInt local_gcd, prev_freq;
+    bigint_set_u64(&local_gcd, 0);
     bigint_set_u64(&prev_freq, 0);
+    int local_gcd_samples = 0;
 
     /* ── Cross-shot period accumulator ── */
     BigInt cross_gcd, cross_lcm;
@@ -1830,7 +1833,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
              * before registering a new 'shot'. This ensures consecutive frequency samples 
              * are statistically independent, preventing pairwise GCD from returning 
              * isolated grid-parity artifacts (like small powers of 6). */
-            int mixing_steps = (n_flippable > 0) ? n_flippable : 1;
+            int mixing_steps = (n_flippable > 0) ? n_flippable : 1;  /* Full sweep required to draw an independent harmonic from the superposition */
             for (int step = 0; step < mixing_steps; step++) {
                 if (n_flippable == 0) break;
                 
@@ -1864,18 +1867,18 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
          * GCD of multiple harmonics F_i = s_i·F* converges to F* itself.
          * Then r = R / F*.
          * ══════════════════════════════════════════════════════════════════ */
-        if (*gcd_samples == 0) {
-            bigint_copy(running_gcd, &freq);
+        if (local_gcd_samples == 0) {
+            bigint_copy(&local_gcd, &freq);
         } else {
-            bigint_gcd(&mc_gcd_v, running_gcd, &freq);
+            bigint_gcd(&mc_gcd_v, &local_gcd, &freq);
             if (!bigint_is_zero(&mc_gcd_v))
-                bigint_copy(running_gcd, &mc_gcd_v);
+                bigint_copy(&local_gcd, &mc_gcd_v);
         }
-        (*gcd_samples)++;
+        local_gcd_samples++;
 
-        /* Derive period estimate from running GCD */
-        if (!bigint_is_zero(running_gcd) && bigint_cmp(running_gcd, &mc_one_fb) > 0) {
-            bigint_div_mod(&reg_sz, running_gcd, &mc_r_cand, &mc_rem);
+        /* Derive period estimate from per-base local GCD */
+        if (!bigint_is_zero(&local_gcd) && bigint_cmp(&local_gcd, &mc_one_fb) > 0) {
+            bigint_div_mod(&reg_sz, &local_gcd, &mc_r_cand, &mc_rem);
             if (bigint_cmp(&mc_r_cand, &mc_one_fb) > 0 && bigint_cmp(&mc_r_cand, N) < 0) {
                 VOTE_FOR_CANDIDATE(&mc_r_cand, shot);
 
@@ -1884,7 +1887,26 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                     success = 1;
                     printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (GCD accumulator)\n", shot);
                 }
+
+                /* Test small harmonic multiples — GCD may have over-reduced by small factor */
+                for (int _km = 2; _km <= 8 && !success; _km++) {
+                    BigInt _rk, _km_bi;
+                    bigint_set_u64(&_rk, 0); bigint_set_u64(&_km_bi, (uint64_t)_km);
+                    bigint_mul(&_rk, &mc_r_cand, &_km_bi);
+                    if (bigint_cmp(&_rk, N) < 0)
+                        if (try_period(&_rk, a_val, N, factor_p, factor_q) == 1) {
+                            success = 1;
+                            printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (GCD accumulator × %d)\n", shot, _km);
+                        }
+                }
             }
+
+            /* Also test local_gcd directly as a period candidate */
+            if (!success && bigint_cmp(&local_gcd, N) < 0)
+                if (try_period(&local_gcd, a_val, N, factor_p, factor_q) == 1) {
+                    success = 1;
+                    printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (GCD direct)\n", shot);
+                }
         }
         if (success) break;
 
@@ -1979,11 +2001,11 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                         }
                     }
 
-                    /* Cross-GCD voted candidate with running GCD estimate */
-                    if (!success && !bigint_is_zero(running_gcd)) {
+                    /* Cross-GCD voted candidate with local GCD estimate */
+                    if (!success && !bigint_is_zero(&local_gcd)) {
                         BigInt cross_r, cross_rem;
                         bigint_set_u64(&cross_r, 0); bigint_set_u64(&cross_rem, 0);
-                        bigint_gcd(&mc_gcd_v, &vote_table[vi].r_cand, running_gcd);
+                        bigint_gcd(&mc_gcd_v, &vote_table[vi].r_cand, &local_gcd);
                         if (bigint_cmp(&mc_gcd_v, &mc_one_fb) > 0) {
                             bigint_div_mod(&reg_sz, &mc_gcd_v, &cross_r, &cross_rem);
                             if (bigint_cmp(&cross_r, &mc_one_fb) > 0 && bigint_cmp(&cross_r, N) < 0) {
@@ -1998,12 +2020,26 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
             }
             
             /* Running GCD status */
-            uint32_t gcd_bits = bigint_bitlen(running_gcd);
+            uint32_t gcd_bits = bigint_bitlen(&local_gcd);
             uint32_t n_bits = bigint_bitlen(N);
             printf("  [Shot %5d] GCD accumulator: %u bits (%d samples) | target <%u bits\n",
-                   shot, gcd_bits, *gcd_samples, n_bits);
+                   shot, gcd_bits, local_gcd_samples, n_bits);
             fflush(stdout);
         }
+    }
+
+    /* Fold per-base local_gcd into persistent cross-base running_gcd */
+    if (!bigint_is_zero(&local_gcd) && bigint_cmp(&local_gcd, &mc_one_fb) > 0) {
+        if (*gcd_samples == 0) {
+            bigint_copy(running_gcd, &local_gcd);
+        } else {
+            bigint_gcd(&mc_gcd_v, running_gcd, &local_gcd);
+            if (!bigint_is_zero(&mc_gcd_v) && bigint_cmp(&mc_gcd_v, &mc_one_fb) > 0)
+                bigint_copy(running_gcd, &mc_gcd_v);
+        }
+        (*gcd_samples) += local_gcd_samples;
+        printf("  [Cross-base GCD] Folded base result: %u bits | cross-base accumulator: %u bits\n",
+               bigint_bitlen(&local_gcd), bigint_bitlen(running_gcd));
     }
 
     /* Surface the best partial period estimate from the vote table */
