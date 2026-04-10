@@ -28,10 +28,10 @@ Built cleanly atop the `HexState` sparse multi-precision framework natively in e
 
 ```bash
 # Compile the factorizer targeting arbitrary multi-precision bits bounds
-gcc -O2 -std=gnu99 -I.. tesseract_factor.c ../bigint.o ../quhit_triality.o ../quhit_hexagram.o ../s6_exotic.o -o factor_t22 -lgmp -lmpfr -lm -lstdc++
+gcc -O2 -std=gnu99 -I.. tesseract_factor.c ../bigint.o ../quhit_triality.o ../quhit_hexagram.o ../s6_exotic.o -o factor -lgmp -lmpfr -lm -lstdc++
 
 # Launch execution loop
-./factor_t22
+./factor
 ```
 
 > **Requirements:** The system leverages native implementations of `GMP` (`libgmp`) and `MPFR` (`libmpfr`). Ensure `gcc` multi-precision mathematical development headers are present on your base image.
