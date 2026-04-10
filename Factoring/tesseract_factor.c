@@ -110,9 +110,19 @@ static int try_period(const BigInt *r, const BigInt *a_val, const BigInt *N,
         return 1;
     }
 
-    if (bigint_cmp(&tp_p1, N) == 0 || bigint_cmp(&tp_p2, N) == 0) {
-        /* If gcd == N, it implies a^(r/2) ± 1 = 0 mod N.
-         * If a^(r/2) = -1 mod N, this is a mathematically sterile TRIVIAL ROOT!
+    if (bigint_cmp(&tp_p1, N) == 0) {
+        /* a^(r/2) ≡ 1 mod N. This means r/2 is a period multiplier. Let's try r/2 directly! */
+        BigInt r_stripped; bigint_set_u64(&r_stripped, 0);
+        bigint_copy(&r_stripped, &tp_r_half);
+        char recurse_str[1300];
+        bigint_to_decimal(recurse_str, sizeof(recurse_str), &r_stripped);
+        printf("    [Harmonic Reduction] a^(r/2) ≡ 1 mod N. Stripping factor of 2 → trying r = %s...\n", recurse_str);
+        return try_period(&r_stripped, a_val, N, factor_p, factor_q);
+    }
+
+    if (bigint_cmp(&tp_p2, N) == 0) {
+        /* If gcd(a^(r/2) + 1, N) == N, it implies a^(r/2) ≡ -1 mod N.
+         * This is a mathematically sterile TRIVIAL ROOT!
          * The base 'a' will never yield prime factors, so we must violently abort! */
         BigInt full_pow;
         bigint_pow_mod(&full_pow, a_val, r, N);
@@ -284,15 +294,27 @@ static long long lll_fhat(const BigInt *F, const BigInt *R)
 {
     const long long W = 1LL << LLL_W_BITS;
     BigInt scaled, quot, rem;
+    memset(&scaled, 0, sizeof(BigInt));
+    memset(&quot, 0, sizeof(BigInt));
+    memset(&rem, 0, sizeof(BigInt));
+    
     bigint_copy(&scaled, F);
     mpz_mul_2exp(scaled.z, scaled.z, LLL_W_BITS);   /* scaled = F << LLL_W_BITS */
     bigint_div_mod(&scaled, R, &quot, &rem);
+    
     /* quot = floor(F * W / R); add 1 if remainder >= R/2 (round) */
     BigInt half_R, two_rem;
+    memset(&half_R, 0, sizeof(BigInt));
+    memset(&two_rem, 0, sizeof(BigInt));
+    
     bigint_copy(&half_R, R);  mpz_fdiv_q_2exp(half_R.z, half_R.z, 1);
     bigint_copy(&two_rem, &rem); mpz_mul_2exp(two_rem.z, two_rem.z, 1);
     if (mpz_cmp(two_rem.z, R->z) >= 0) {
-        BigInt q1, one_bi; bigint_set_u64(&one_bi, 1);
+        BigInt q1, one_bi;
+        memset(&q1, 0, sizeof(BigInt));
+        memset(&one_bi, 0, sizeof(BigInt));
+        
+        bigint_set_u64(&one_bi, 1);
         bigint_add(&q1, &quot, &one_bi);
         bigint_copy(&quot, &q1);
     }
@@ -1215,7 +1237,7 @@ static void extract_period_cand_cf(const BigInt *freq, const BigInt *reg_size, c
     bigint_set_u64(r_cand_out, 1);
 
     BigInt best_q; bigint_set_u64(&best_q, 1);
-    BigInt max_a;  bigint_set_u64(&max_a, 0);
+    BigInt thresh; bigint_set_u64(&thresh, 50);
 
     for (int step = 0; ; step++) {
         if (bigint_cmp(&q0, N) >= 0 || bigint_bitlen(&q0) > 2000) break;
@@ -1229,12 +1251,10 @@ static void extract_period_cand_cf(const BigInt *freq, const BigInt *reg_size, c
         bigint_copy(&den, &cf_rem);
         bigint_div_mod(&num, &den, &a_next, &cf_rem);
         
-        /* The topological 'knee' occurs where the partial quotient spikes, 
-           meaning the preceding convergent perfectly captured the underlying rational 
-           before hitting the chaotic noise tail. */
-        if (bigint_cmp(&a_next, &max_a) > 0) {
-            bigint_copy(&max_a, &a_next);
+        /* The topological 'knee': the FIRST quotient that spikes means we've hit the edge of the true rational signal. */
+        if (bigint_cmp(&a_next, &thresh) > 0) {
             bigint_copy(&best_q, &q0);
+            break;
         }
         
         bigint_mul(&tmp, &a_next, &p0);    bigint_add(&p_new, &tmp, &pm1);
@@ -1930,12 +1950,10 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                     bigint_copy(&local_lcm, &mc_new_lcm);
                     local_acc_samples++;
                     
-                    if (shot % 100 == 0) {
-                        if (try_period(&local_lcm, a_val, N, factor_p, factor_q) == 1) {
-                            success = 1;
-                            printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (LCM Accumulator)\n", shot);
-                            break;
-                        }
+                    if (try_period(&local_lcm, a_val, N, factor_p, factor_q) == 1) {
+                        success = 1;
+                        printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (LCM Accumulator)\n", shot);
+                        break;
                     }
                 }
                 /* Harmonic Overshoot Strategy: if LCM slightly exceeds N, it acts as a true multiple of period */
@@ -1950,6 +1968,15 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 }
                 /* Disjoint Noise Explosion: break Initial Noise Lock */
                 else {
+                    /* The exploded LCM is huge, but it is fundamentally lcm(local_lcm, r_cand). 
+                     * If r_cand is the true period breaking through the noise, the oversized mc_new_lcm MUST be a multiple of the period! 
+                     * The recursive stripping in try_period will perfectly harvest it. */
+                    if (try_period(&mc_new_lcm, a_val, N, factor_p, factor_q) == 1) {
+                        success = 1;
+                        printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (Overshot LCM Accumulator)\n", shot);
+                        break;
+                    }
+                    
                     if (local_acc_samples == 1) {
                         /* Accumulator is 1 noisy layer deep. Flush it with new candidate to prevent permanent lock. */
                         bigint_copy(&local_lcm, &mc_r_cand);
