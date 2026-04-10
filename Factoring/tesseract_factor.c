@@ -1548,7 +1548,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 double re = graph->locals[site].edge_re[j];
                 double im = graph->locals[site].edge_im[j];
                 sr += re*cos(angle) + im*sin(angle);
-                si += re*sin(angle) - im*cos(angle);
+                si += -re*sin(angle) + im*cos(angle);
             }
             out_re[k_dft] = sr / sqrt(6.0);
             out_im[k_dft] = si / sqrt(6.0);
@@ -1746,7 +1746,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     BigInt current_p6, next_p6;
     bigint_set_u64(&current_p6, 1);
     bigint_set_u64(&next_p6, 0);
-    for (int i = n_sites_raw - 1; i >= 0; i--) {
+    for (int i = 0; i < n_sites_raw; i++) {
         bigint_copy(&p6_cache[i], &current_p6);
         bigint_mul(&next_p6, &current_p6, &b6);
         bigint_copy(&current_p6, &next_p6);
