@@ -1498,59 +1498,6 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
         fflush(stdout);
     }
 
-    /* ── QFT Twiddle Edges (distance 1-2 only, attenuated) ─────────────────
-     * Pairwise controlled-phase gates between CONTROL REGISTER qudits:
-     *   w[dj][dk] = exp(2πi · dj · dk / 6^(dist+1))
-     * Attenuated to 10% coupling to avoid overwhelming the oracle signal.   */
-    {
-        int qft_added = 0;
-        const double QFT_COUPLING = 0.10;
-        for (int sj = 0; sj < n_sites_raw; sj++) {
-            int blk_j = sj / 2, off_j = sj % 2;
-            int site_j = blk_j * 6 + off_j;
-            /* Hann window for position sj */
-            double hann_j = (n_sites_raw > 1)
-                ? 0.5 * (1.0 - cos(2.0 * 3.14159265358979323846 * sj / (n_sites_raw - 1)))
-                : 1.0;
-            hann_j = 0.05 + 0.95 * hann_j;
-
-            for (int dist = 1; dist <= 2 && sj + dist < n_sites_raw; dist++) {
-                int sk = sj + dist;
-                int blk_k = sk / 2, off_k = sk % 2;
-                int site_k = blk_k * 6 + off_k;
-
-                double twiddle_denom = 1.0;
-                for (int p = 0; p <= dist; p++) twiddle_denom *= 6.0;
-
-                double strength = QFT_COUPLING * hann_j / dist;
-
-                hpc_grow_edges(graph);
-                uint64_t eid = graph->n_edges;
-                HPCEdge *edge = &graph->edges[eid];
-                memset(edge, 0, sizeof(*edge));
-                edge->site_a = site_j;
-                edge->site_b = site_k;
-                edge->type = HPC_EDGE_PHASE;
-                edge->fidelity = 1.0;
-
-                for (int dj = 0; dj < 6; dj++) {
-                    for (int dk = 0; dk < 6; dk++) {
-                        double phase = 2.0 * 3.14159265358979323846 * dj * dk / twiddle_denom;
-                        edge->w_re[dj][dk] = cos(phase) * strength + (1.0 - strength);
-                        edge->w_im[dj][dk] = sin(phase) * strength;
-                    }
-                }
-
-                graph->n_edges++;
-                graph->phase_edges++;
-                hpc_adj_add(graph, site_j, eid);
-                hpc_adj_add(graph, site_k, eid);
-                qft_added++;
-            }
-        }
-        printf("    [QFT] %d twiddle edges (coupling=%.0f%%, max_dist=2)\n",
-               qft_added, QFT_COUPLING * 100);
-    }
 
     /* Convert Phase to Amplitude (IDFT) BEFORE BP */
     for (int site = 0; site < n_sites; site++) {
