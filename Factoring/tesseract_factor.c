@@ -1808,7 +1808,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     } while(0)
 
     for (int shot = 1; shot <= num_shots && !success; shot++) {
-        /* ── MCMC Sampling (unchanged) ── */
+        /* ── MCMC Sampling (decorrelated) ── */
         if (shot == 1) {
             for (int scale = 0; scale < n_sites_raw; scale++) {
                 double mp = -1.0; int best = 0;
@@ -1823,26 +1823,33 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 bigint_copy(&freq, &mc_tmp);
             }
         } else {
-            /* Position-aware sweep: only flip positions where BP has real signal */
-            if (n_flippable == 0) continue; /* No informed positions — skip */
-            int flip = flippable[sweep_pos % n_flippable];
-            sweep_pos++;
-            double rr = (double)rand() / RAND_MAX;
-            double cdf = 0.0;
-            int new_d = 0;
-            for (int d = 0; d < 6; d++) {
-                cdf += mpfr_get_d(marginals[flip][d], MPFR_RNDN);
-                if (rr <= cdf) { new_d = d; break; }
-            }
-            int old_d = mcmc_state[flip];
-            if (old_d != new_d) {
-                bigint_set_u64(&mc_old_d_bi, (uint64_t)old_d);
-                bigint_set_u64(&mc_new_d_bi, (uint64_t)new_d);
-                bigint_mul(&mc_old_val, &mc_old_d_bi, &p6_cache[flip]);
-                bigint_mul(&mc_new_val, &mc_new_d_bi, &p6_cache[flip]);
-                bigint_sub(&mc_tmp_freq, &freq, &mc_old_val);
-                bigint_add(&freq, &mc_tmp_freq, &mc_new_val);
-                mcmc_state[flip] = new_d;
+            /* Decorrelate the chain by performing a full sweep of all flippable positions
+             * before registering a new 'shot'. This ensures consecutive frequency samples 
+             * are statistically independent, preventing pairwise GCD from returning 
+             * isolated grid-parity artifacts (like small powers of 6). */
+            int mixing_steps = (n_flippable > 0) ? n_flippable : 1;
+            for (int step = 0; step < mixing_steps; step++) {
+                if (n_flippable == 0) break;
+                
+                int flip = flippable[sweep_pos % n_flippable];
+                sweep_pos++;
+                double rr = (double)rand() / RAND_MAX;
+                double cdf = 0.0;
+                int new_d = 0;
+                for (int d = 0; d < 6; d++) {
+                    cdf += mpfr_get_d(marginals[flip][d], MPFR_RNDN);
+                    if (rr <= cdf) { new_d = d; break; }
+                }
+                int old_d = mcmc_state[flip];
+                if (old_d != new_d) {
+                    bigint_set_u64(&mc_old_d_bi, (uint64_t)old_d);
+                    bigint_set_u64(&mc_new_d_bi, (uint64_t)new_d);
+                    bigint_mul(&mc_old_val, &mc_old_d_bi, &p6_cache[flip]);
+                    bigint_mul(&mc_new_val, &mc_new_d_bi, &p6_cache[flip]);
+                    bigint_sub(&mc_tmp_freq, &freq, &mc_old_val);
+                    bigint_add(&freq, &mc_tmp_freq, &mc_new_val);
+                    mcmc_state[flip] = new_d;
+                }
             }
         }
 
