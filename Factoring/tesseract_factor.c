@@ -125,6 +125,7 @@ static int try_period(const BigInt *r, const BigInt *a_val, const BigInt *N,
          * This is a mathematically sterile TRIVIAL ROOT!
          * The base 'a' will never yield prime factors, so we must violently abort! */
         BigInt full_pow;
+        bigint_set_u64(&full_pow, 0);
         bigint_pow_mod(&full_pow, a_val, r, N);
         if (bigint_cmp(&full_pow, &tp_one) == 0) {
             char abort_r_str[512];
@@ -2347,6 +2348,7 @@ int main(int argc, char **argv)
                         /* Also test small multiples */
                         for (int sm = 2; sm <= 12 && !success; sm++) {
                             BigInt r_mult, mult_c;
+                            bigint_set_u64(&r_mult, 0);
                             bigint_set_u64(&mult_c, sm);
                             bigint_mul(&r_mult, &cross_base_lcm, &mult_c);
                             if (bigint_cmp(&r_mult, &N) >= 0) break;
@@ -2374,6 +2376,7 @@ int main(int argc, char **argv)
                             /* Test small harmonics of the MCMC accumulator */
                             for (int sm = 2; sm <= 12 && !success; sm++) {
                                 BigInt r_mult, mult_c;
+                                bigint_set_u64(&r_mult, 0);
                                 bigint_set_u64(&mult_c, sm);
                                 bigint_mul(&r_mult, &cross_base_acc_period, &mult_c);
                                 if (bigint_cmp(&r_mult, &N) >= 0) break;
