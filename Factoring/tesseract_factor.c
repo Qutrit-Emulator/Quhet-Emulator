@@ -75,8 +75,10 @@ static int try_period(const BigInt *r, const BigInt *a_val, const BigInt *N,
             char r_str[512];
             bigint_to_decimal(r_str, sizeof(r_str), r);
             printf("    [odd period] a^%s ≡ 1 (mod N) — valid λ(N) divisor\n", r_str);
+            bigint_clear(&odd_pow);
             return 2;
         }
+        bigint_clear(&odd_pow);
         return 0;
     }
 
@@ -118,7 +120,9 @@ static int try_period(const BigInt *r, const BigInt *a_val, const BigInt *N,
         char recurse_str[1300];
         bigint_to_decimal(recurse_str, sizeof(recurse_str), &r_stripped);
         printf("    [Harmonic Reduction] a^(r/2) ≡ 1 mod N. Stripping factor of 2 → trying r = %s...\n", recurse_str);
-        return try_period(&r_stripped, a_val, N, factor_p, factor_q);
+        int ret = try_period(&r_stripped, a_val, N, factor_p, factor_q);
+        bigint_clear(&r_stripped);
+        return ret;
     }
 
     if (bigint_cmp(&tp_p2, N) == 0) {
@@ -132,9 +136,11 @@ static int try_period(const BigInt *r, const BigInt *a_val, const BigInt *N,
             char abort_r_str[512];
             bigint_to_decimal(abort_r_str, sizeof(abort_r_str), r);
             printf("\n  [!] MATHEMATICALLY STERILE BASE DETECTED (r=%s). Base yields trivial roots. Skipping...\n", abort_r_str);
+            bigint_clear(&full_pow);
             /* Return -1 instead of `exit` so that we gracefully try the next base */
             return -1;
         }
+        bigint_clear(&full_pow);
     }
 
     return 0;
@@ -2358,7 +2364,9 @@ int main(int argc, char **argv)
                                 printf("\n  ★★★ CROSS-BASE LCM × %d FACTORED N! (base a=%llu) ★★★\n",
                                        sm, (unsigned long long)base_list[bj]);
                             }
+                            bigint_clear(&r_mult); bigint_clear(&mult_c);
                         }
+                        bigint_clear(&test_a);
                     }
                     
                     /* Try the MCMC deep accumulator as a period candidate */
@@ -2386,7 +2394,9 @@ int main(int argc, char **argv)
                                     printf("\n  ★★★ MCMC DEEP ACCUMULATOR × %d FACTORED N! (base a=%llu) ★★★\n",
                                            sm, (unsigned long long)base_list[bj]);
                                 }
+                                bigint_clear(&r_mult); bigint_clear(&mult_c);
                             }
+                            bigint_clear(&test_a);
                         }
                     }
                 } else {
