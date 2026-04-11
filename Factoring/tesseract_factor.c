@@ -2166,10 +2166,35 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
     }
 
     free(mcmc_state);
+    for (int i = 0; i < n_sites_raw; i++) {
+        bigint_clear(&p6_cache[i]);
+    }
     free(p6_cache);
     free(bp_has_signal);
     free(flippable);
+    
+    /* ── Destroy multi-dimensional MPFR allocations explicitly ── */
+    for (int s = 0; s < marginals_sz; s++) {
+        for (int d = 0; d < 6; d++) {
+            mpfr_clear(marginals[s][d]);
+        }
+    }
     free(marginals);
+    
+    /* ── Clear dynamically instantiated BigInt locals ── */
+    bigint_clear(&b6); bigint_clear(&one);
+    bigint_clear(&val_k_A); bigint_clear(&val_k_B); bigint_clear(&div_6_blk);
+    bigint_clear(&gc_b36); bigint_clear(&gc_next_A); bigint_clear(&gc_next_B); bigint_clear(&gc_next_div);
+    bigint_clear(&gc_gcd_check); bigint_clear(&gc_val_minus_1); bigint_clear(&gc_dummy_rem);
+    bigint_clear(&gc_tmpA); bigint_clear(&gc_tmpB); bigint_clear(&gc_q_div);
+    bigint_clear(&gc_b6_mod); bigint_clear(&gc_shift_div_A); bigint_clear(&gc_shift_div_B); bigint_clear(&gc_dummy_rm2);
+    bigint_clear(&gc_qA); bigint_clear(&gc_qB); bigint_clear(&gc_rA_mod); bigint_clear(&gc_rB_mod);
+    bigint_clear(&gc_temp_N); bigint_clear(&gc_qN); bigint_clear(&gc_rN); bigint_clear(&gc_q_sh); bigint_clear(&gc_r_sh);
+    for (int i = 0; i < 6; i++) {
+        bigint_clear(&gc_powersA[i]);
+        bigint_clear(&gc_powersB[i]);
+    }
+    bigint_clear(&local_lcm);
     return success;
 }
 
@@ -2260,7 +2285,7 @@ int main(int argc, char **argv)
     /* ── Try constraint-satisfaction first (Hensel lift in base 6) ── */
     success = 0;
 
-    for (int bi = 0; bi < max_bases && !success; bi++) {
+    for (int bi = 181; bi < max_bases && !success; bi++) {
         if (auto_a) bigint_set_u64(&a_val, base_list[bi]);
 
         char a_str[1300];
