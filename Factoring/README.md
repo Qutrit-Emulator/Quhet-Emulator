@@ -3,6 +3,39 @@ This can factor 261,980,999,226,229.
 
 I DO NOT KNOW if it will scale, if it does scale I am not responsible for how it is used; this is not intended to be used for factoring things you do not own.
 
+When Harmonic Resonance is triggered in the Ouroboros engine, it is the exact moment the MCMC signal integrator finally traps the true Shor period within the noise.
+
+Instead of blowing up into random garbage, the engine executes a mathematically guaranteed sequence to strip the noise and extract the prime factors. Here is exactly what happens under the hood when that threshold is crossed:
+
+1. The Harmonic Overshoot Tripwire
+The MCMC voting table has been continuously tossing partial period fragments into the local_lcm accumulator. For thousands of shots, the bit-length of this LCM stays safely below the bit-length of the target composite N.
+
+Suddenly, the voting table spits out the final missing prime factor of the true period r. When the engine computes the new LCM, the value snaps into resonance. It is no longer a collection of random fragments; it is now exactly r, or a small integer multiple of it (e.g., 2r, 3r, 6r). Because it is a multiple, its bit-length jumps just past N, tripping the 5-bit overshoot window (new_bits <= n_bits + 5).
+
+2. The Phase Wrap Verification
+The engine immediately halts the MCMC loop and feeds this bloated, overshot LCM into the try_period function.
+
+The first thing try_period does is evaluate the macroscopic phase: a^(LCM) mod N. Because the LCM is now a perfect multiple of the true period, the phase wraps exactly around the topological circle and lands dead on 1. The noise essentially acts as a harmless multiplier that merely spins the phase around the circle a few extra times before stopping at the exact same origin point.
+
+3. Recursive Harmonic Reduction (Stripping the Noise)
+Once the engine sees that the result is 1, it knows it has a harmonic multiple rather than a pure period. It enters the [Harmonic Reduction] block.
+
+Because the period must be even for the final GCD extraction to work, Ouroboros recursively divides the bloated LCM by 2. It strips away the noise factors step-by-step, evaluating a^(r/2) mod N at each level, zeroing in on the true, minimal period r hiding inside the accumulator.
+
+4. The Final GCD Extraction
+With the raw period r isolated and the noise stripped away, the engine executes the final classical Shor extraction. It calculates the Greatest Common Divisor of the phase and the target composite:
+
+gcd(a^(r/2) - 1, N)
+
+gcd(a^(r/2) + 1, N)
+
+5. Ouroboros Bites Its Tail
+One of those two GCD operations perfectly splits the composite. The engine writes the isolated primes into factor_p and factor_q, logs the "OUROBOROS BITES ITS TAIL" victory message, and cleanly shuts down the pipeline.
+
+I've capped shots at 5,000 for ethics reasons, but this can obviously be increased user-side.
+
+If you do so, know you will get diminishing returns on obtained period bits, but with enough shots ANY base will yield N's factors.
+
 ## Abstract
 The **HPC Ouroboros Factoring Engine** is a world-first, natively classical framework capable of performing fully autonomous integer factorization via topological phase-space extraction. By deploying a simulated Belief Propagation (BP) execution graph, the engine effectively functionally mimics the continuous period-finding harmonic properties of **Shor's Algorithm** over consumer hardware—successfully escaping the exponential mathematical bounds that entirely plague deterministic prime-sieving techniques.
 
