@@ -68,7 +68,7 @@ static int try_period(const BigInt *r, const BigInt *a_val, const BigInt *N,
     /* r must be even for gcd(a^(r/2)±1, N) — but odd r may still be valid λ(N) divisor */
     bigint_div_mod(r, &tp_two, &tp_q_unused, &tp_r_mod);
     if (!bigint_is_zero(&tp_r_mod)) {
-        BigInt odd_pow;
+        BigInt odd_pow = {0};
         bigint_set_u64(&odd_pow, 0);
         bigint_pow_mod(&odd_pow, a_val, r, N);
         if (bigint_cmp(&odd_pow, &tp_one) == 0) {
@@ -115,7 +115,7 @@ static int try_period(const BigInt *r, const BigInt *a_val, const BigInt *N,
 
     if (bigint_cmp(&tp_p1, N) == 0) {
         /* a^(r/2) ≡ 1 mod N. This means r/2 is a period multiplier. Let's try r/2 directly! */
-        BigInt r_stripped; bigint_set_u64(&r_stripped, 0);
+        BigInt r_stripped = {0}; bigint_set_u64(&r_stripped, 0);
         bigint_copy(&r_stripped, &tp_r_half);
         char recurse_str[1300];
         bigint_to_decimal(recurse_str, sizeof(recurse_str), &r_stripped);
@@ -129,7 +129,7 @@ static int try_period(const BigInt *r, const BigInt *a_val, const BigInt *N,
         /* If gcd(a^(r/2) + 1, N) == N, it implies a^(r/2) ≡ -1 mod N.
          * This is a mathematically sterile TRIVIAL ROOT!
          * The base 'a' will never yield prime factors, so we must violently abort! */
-        BigInt full_pow;
+        BigInt full_pow = {0};
         bigint_set_u64(&full_pow, 0);
         bigint_pow_mod(&full_pow, a_val, r, N);
         if (bigint_cmp(&full_pow, &tp_one) == 0) {
