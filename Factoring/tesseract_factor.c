@@ -69,6 +69,7 @@ static int try_period(const BigInt *r, const BigInt *a_val, const BigInt *N,
     bigint_div_mod(r, &tp_two, &tp_q_unused, &tp_r_mod);
     if (!bigint_is_zero(&tp_r_mod)) {
         BigInt odd_pow;
+        bigint_set_u64(&odd_pow, 0);
         bigint_pow_mod(&odd_pow, a_val, r, N);
         if (bigint_cmp(&odd_pow, &tp_one) == 0) {
             char r_str[512];
