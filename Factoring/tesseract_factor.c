@@ -1026,16 +1026,14 @@ static const double W6_RE[6] = { 1.0, 0.5, -0.5, -1.0, -0.5,  0.5 };
 static const double W6_IM[6] = { 0.0, 0.866025403784438647, 0.866025403784438647,
                                   0.0, -0.866025403784438647, -0.866025403784438647 };
 
-static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed) {
+static double z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed, int max_iter) {
     const HPCGraph *g = ms->graph;
     int n_edges = (int)g->n_edges;
     int n_sites = (int)g->n_sites;
-    if (n_edges == 0) return;
+    if (n_edges == 0) return 1e30;
 
     ComplexEdgeMsg *msgs = (ComplexEdgeMsg*)calloc(n_edges, sizeof(ComplexEdgeMsg));
     ComplexEdgeMsg *new_msgs = (ComplexEdgeMsg*)calloc(n_edges, sizeof(ComplexEdgeMsg));
-
-    printf("      [Complex Amplitude BP] Initializing %d edges, %d sites (seed %u)...\n", n_edges, n_sites, seed);
 
     /* Initialize messages: seed 0 = uniform, others = random complex to break symmetry */
     srand(seed * 12345 + 42);
@@ -1053,7 +1051,6 @@ static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed)
         }
     }
 
-    #define CAMP_MAX_ITER 1500
     /* Simulated Annealing: damping starts high (0.5) and cools to 0.05 */
     #define CAMP_DAMPING_START 0.50
     #define CAMP_DAMPING_END   0.05
@@ -1064,7 +1061,7 @@ static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed)
     int converged = 0;
     int plateau_count = 0;
 
-    for (int it = 0; it < CAMP_MAX_ITER && !converged; it++) {
+    for (int it = 0; it < max_iter && !converged; it++) {
         double max_delta = 0.0;
 
         /* Sequential edge updates for stability on loopy graphs */
@@ -1176,7 +1173,7 @@ static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed)
     }
 
     if (!converged)
-        printf("      [Complex Amplitude BP] Reached max iterations (%d)\n", CAMP_MAX_ITER);
+        printf("      [Complex Amplitude BP] Reached max iterations (%d)\n", max_iter);
 
     /* ── Compute dressed amplitudes from converged messages ──
      * dressed[k][v] = aₖ(v) × Π_{m→k} m[v]
@@ -1227,6 +1224,7 @@ static void z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed)
 
     free(msgs);
     free(new_msgs);
+    return prev_residual;
 }
 
 
@@ -1281,10 +1279,11 @@ static void extract_period_cand_cf(const BigInt *freq, const BigInt *reg_size, c
     bigint_copy(r_cand_out, &best_q);
 }
 
-static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
+static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
                             BigInt *factor_p, BigInt *factor_q,
                             BigInt *best_period,
-                            BigInt *acc_period, int *acc_samples)
+                            BigInt *acc_period, int *acc_samples,
+                            int probe_mode)
 {
     uint32_t nbits = bigint_bitlen(N);
     /* Register needs R > N² for CF convergent extraction to find the true period.
@@ -1377,7 +1376,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 bigint_copy(factor_p, &gc_gcd_check);
                 bigint_div_mod(N, &gc_gcd_check, factor_q, &gc_dummy_rem);
                 hpc_destroy(graph);
-                return 1;
+                return probe_mode ? -1.0 : 1.0;
             }
         }
         bigint_sub(&gc_val_minus_1, &val_k_B, &one);
@@ -1666,9 +1665,35 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
      * (the Ensemble limit), we elegantly recreate the physical quantum phase superposition 
      * of traversing multiple multi-harmonic probability flows simultaneously! */
     #define N_STARTS 10
+    int max_starts = probe_mode ? 1 : N_STARTS;
+    int max_iters = probe_mode ? 50 : 1500;
 
-    for (int start = 0; start < N_STARTS; start++) {
-        z6_complex_amplitude_bp(mobius, (unsigned int)start);
+    for (int start = 0; start < max_starts; start++) {
+        double res = z6_complex_amplitude_bp(mobius, (unsigned int)start, max_iters);
+
+        if (probe_mode) {
+            hpc_destroy(graph);
+            mobius_destroy(mobius);
+            bigint_clear(&b6); bigint_clear(&one);
+            bigint_clear(&val_k_A); bigint_clear(&val_k_B); bigint_clear(&div_6_blk);
+            bigint_clear(&gc_b36); bigint_clear(&gc_next_A); bigint_clear(&gc_next_B); bigint_clear(&gc_next_div);
+            bigint_clear(&gc_gcd_check); bigint_clear(&gc_val_minus_1); bigint_clear(&gc_dummy_rem);
+            bigint_clear(&gc_tmpA); bigint_clear(&gc_tmpB); bigint_clear(&gc_q_div);
+            bigint_clear(&gc_b6_mod); bigint_clear(&gc_shift_div_A); bigint_clear(&gc_shift_div_B); bigint_clear(&gc_dummy_rm2);
+            bigint_clear(&gc_qA); bigint_clear(&gc_qB); bigint_clear(&gc_rA_mod); bigint_clear(&gc_rB_mod);
+            bigint_clear(&gc_temp_N); bigint_clear(&gc_qN); bigint_clear(&gc_rN); bigint_clear(&gc_q_sh); bigint_clear(&gc_r_sh);
+            for (int i = 0; i < 6; i++) { bigint_clear(&gc_powersA[i]); bigint_clear(&gc_powersB[i]); }
+            
+            /* Destroy MPFR array leaks */
+            for (int i = 0; i < marginals_sz; i++) {
+                for (int d = 0; d < 6; d++) {
+                    mpfr_clear(marginals[i][d]);
+                }
+            }
+            free(marginals);
+            
+            return res;
+        }
 
         for (int blk = 0; blk < n_blocks; blk++) {
             for (int offset = 0; offset <= 1; offset++) {
@@ -2150,9 +2175,21 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
         int best_vi = -1;
         for (int vi = 0; vi < VOTE_TABLE_SIZE; vi++) {
             if (vote_table[vi].votes > best_votes && bigint_bitlen(&vote_table[vi].r_cand) > 10) {
-                best_votes = vote_table[vi].votes;
-                best_vi = vi;
-                bigint_copy(best_period, &vote_table[vi].r_cand);
+                /* Exclude trivial grid artifacts (exact powers of 6). 
+                 * This cleanly handles up to 2048-bit structures natively safely. */
+                BigInt test_p6; bigint_set_u64(&test_p6, 1);
+                int is_artifact = 0;
+                while (bigint_cmp(&test_p6, &vote_table[vi].r_cand) <= 0) {
+                    if (bigint_cmp(&test_p6, &vote_table[vi].r_cand) == 0) { is_artifact = 1; break; }
+                    BigInt tmp; bigint_mul(&tmp, &test_p6, &b6);
+                    bigint_copy(&test_p6, &tmp);
+                }
+                
+                if (!is_artifact) {
+                    best_votes = vote_table[vi].votes;
+                    best_vi = vi;
+                    bigint_copy(best_period, &vote_table[vi].r_cand);
+                }
             }
         }
         if (best_votes > 0) {
@@ -2195,7 +2232,7 @@ static int factor_with_hpc(const BigInt *N, const BigInt *a_val,
         bigint_clear(&gc_powersB[i]);
     }
     bigint_clear(&local_lcm);
-    return success;
+    return (double)success;
 }
 
 
@@ -2283,9 +2320,50 @@ int main(int argc, char **argv)
     bigint_set_u64(&cross_base_acc_period, 0);
 
     /* ── Try constraint-satisfaction first (Hensel lift in base 6) ── */
+    /* ── Try constraint-satisfaction first (Hensel lift in base 6) ── */
     success = 0;
 
-    for (int bi = 181; bi < max_bases && !success; bi++) {
+    int active_base_idx = 181;
+    if (auto_a) {
+        printf("\n  ╔════════════════════════════════════════════════════════════════╗\n");
+        printf("  ║  AUTOMATED TOPOLOGICAL RESONANCE PROBE (BASE SELECTOR)         ║\n");
+        printf("  ╚════════════════════════════════════════════════════════════════╝\n");
+        double best_res = 1e30;
+        int best_idx = 0;
+        /* Probe the first 30 prime string candidates dynamically natively */
+        for (int bi = 0; bi < 30; bi++) {
+            BigInt a_test; bigint_set_u64(&a_test, base_list[bi]);
+            BigInt dummy_p, dummy_q, best_prt, x_acc;
+            bigint_set_u64(&dummy_p, 0); bigint_set_u64(&dummy_q, 0);
+            bigint_set_u64(&best_prt, 0); bigint_set_u64(&x_acc, 0);
+            int x_samp = 0;
+
+            double res = factor_with_hpc(&N, &a_test, &dummy_p, &dummy_q, &best_prt, &x_acc, &x_samp, 1);
+            if (res < 0.0) {
+                printf("    [Base a=%llu] Probe hit a direct GCD factor cascade instantly!\n", (unsigned long long)base_list[bi]);
+                best_idx = bi;
+                break;
+            }
+            printf("    [Base a=%llu] Network Residual Limit: %.6e\n", (unsigned long long)base_list[bi], res);
+            if (res < best_res) {
+                best_res = res;
+                best_idx = bi;
+            }
+        }
+        printf("  ──────────────────────────────────────────────────────────────────\n");
+        printf("  ★ OPTIMAL RESONANT BASE SELECTED: a=%llu (Residual: %.6e) ★\n", (unsigned long long)base_list[best_idx], best_res);
+        printf("  ──────────────────────────────────────────────────────────────────\n\n");
+        
+        /* Swapping the optimal base to the front of the queue to prioritize it, 
+         * safely scaling perfectly for all width architectures without breaking LCM sequences natively */
+        uint64_t tmp_b = base_list[0];
+        base_list[0] = base_list[best_idx];
+        base_list[best_idx] = tmp_b;
+        
+        active_base_idx = 0;
+    }
+
+    for (int bi = active_base_idx; bi < max_bases && !success; bi++) {
         if (auto_a) bigint_set_u64(&a_val, base_list[bi]);
 
         char a_str[1300];
@@ -2294,8 +2372,8 @@ int main(int argc, char **argv)
 
         bigint_set_u64(&best_partial, 0);
         clock_t t_start = clock();
-        success = factor_with_hpc(&N, &a_val, &factor_p, &factor_q, &best_partial,
-                                  &cross_base_acc_period, &cross_base_acc_samples);
+        success = (int)factor_with_hpc(&N, &a_val, &factor_p, &factor_q, &best_partial,
+                                  &cross_base_acc_period, &cross_base_acc_samples, 0);
         clock_t t_end = clock();
 
         if (success) {
