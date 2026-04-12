@@ -1,0 +1,47 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Makefile.quantize — HexState GGUF Quantizer Build
+#
+# Build:  make -f Makefile.quantize
+# Clean:  make -f Makefile.quantize clean
+# ═══════════════════════════════════════════════════════════════════════════
+
+CC       = gcc
+CFLAGS   = -O2 -std=gnu99 -Wall -Wno-unused-function -Wno-unused-variable
+LDFLAGS  = -lm -lgmp -lmpfr
+
+# Include parent directory for HExState headers
+INCLUDES = -I..
+
+# Source files — quantizer + HExState engine dependencies
+SRCS     = hexstate_quantize.c \
+           ../quhit_triality.c \
+           ../quhit_hexagram.c \
+           ../s6_exotic.c \
+           ../bigint.c
+
+TARGET   = hexstate_quantize
+
+.PHONY: all clean
+
+all: $(TARGET)
+
+$(TARGET): $(SRCS)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $(TARGET) $(SRCS) $(LDFLAGS)
+	@echo ""
+	@echo "  ╔════════════════════════════════════════════════════════════════╗"
+	@echo "  ║  HexState GGUF Quantizer v2.0 built successfully!            ║"
+	@echo "  ║                                                               ║"
+	@echo "  ║  Usage:                                                       ║"
+	@echo "  ║    ./hexstate_quantize <input> <output.gguf> [options]        ║"
+	@echo "  ║                                                               ║"
+	@echo "  ║  Input: .safetensors file or model directory                  ║"
+	@echo "  ║                                                               ║"
+	@echo "  ║  Options:                                                     ║"
+	@echo "  ║    --optimizer hpc|mse|hybrid  (default: hybrid)              ║"
+	@echo "  ║    --imatrix <file>            importance matrix              ║"
+	@echo "  ║    --verbose                   per-block diagnostics          ║"
+	@echo "  ╚════════════════════════════════════════════════════════════════╝"
+	@echo ""
+
+clean:
+	rm -f $(TARGET)
