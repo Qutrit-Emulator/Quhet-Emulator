@@ -228,9 +228,10 @@ static void detect_architecture(const STMultiFile *mf, ModelArchitecture *arch,
         if (strcmp(cfg.model_type, "llama") == 0 ||
             strcmp(cfg.model_type, "mistral") == 0) {
             strcpy(arch->architecture, "llama");
-        } else if (strcmp(cfg.model_type, "qwen2") == 0 ||
-                   strcmp(cfg.model_type, "qwen2_moe") == 0) {
-            strcpy(arch->architecture, "llama"); /* Qwen2 uses llama arch in GGUF */
+        } else if (strcmp(cfg.model_type, "qwen2") == 0) {
+            strcpy(arch->architecture, "qwen2");
+        } else if (strcmp(cfg.model_type, "qwen2_moe") == 0) {
+            strcpy(arch->architecture, "qwen2moe");
         } else if (strcmp(cfg.model_type, "phi3") == 0 ||
                    strcmp(cfg.model_type, "phi") == 0) {
             strcpy(arch->architecture, "phi3");
@@ -493,8 +494,9 @@ static int should_quantize(const STTensorInfo *ti, const char *gguf_name)
     /* Never quantize embedding tables (row dimension = vocab) */
     if (strstr(gguf_name, "token_embd") != NULL) return 0;
 
-    /* Never quantize output head — keep F16 for quality */
-    if (strstr(gguf_name, "output.weight") != NULL) return 0;
+    /* Never quantize LM head output — use exact match, not substring,
+     * to avoid matching "attn_output.weight" */
+    if (strcmp(gguf_name, "output.weight") == 0) return 0;
 
     /* Never quantize norm weights */
     if (strstr(gguf_name, "norm") != NULL) return 0;
@@ -1074,12 +1076,16 @@ static int write_gguf(const char *output_path, const STMultiFile *mf,
             n_kv++;  /* tokenizer.ggml.merges */
     }
 
-    /* ── Check for weight tying (missing lm_head → need output.weight) ── */
+    /* ── Check for weight tying ──
+     * If tie_word_embeddings is set and there's no separate lm_head,
+     * llama.cpp handles this internally — do NOT duplicate the tensor.
+     * Only add output.weight if the model has a separate lm_head.weight. */
     int has_lm_head = (st_multi_find_tensor(mf, "lm_head.weight") >= 0);
-    int embed_idx = st_multi_find_tensor(mf, "model.embed_tokens.weight");
-    int need_output_weight = (!has_lm_head && embed_idx >= 0) ||
-                              arch->tie_word_embeddings;
-    int total_tensors = n_include + (need_output_weight ? 1 : 0);
+    int total_tensors = n_include;
+
+    if (arch->tie_word_embeddings && !has_lm_head) {
+        printf("  Weight-tied embeddings detected — llama.cpp handles internally\n\n");
+    }
 
     /* ── Prepare tensor info ── */
     char (*gguf_names)[ST_MAX_NAME_LEN] = calloc(total_tensors, ST_MAX_NAME_LEN);
@@ -1102,7 +1108,12 @@ static int write_gguf(const char *output_path, const STMultiFile *mf,
         if (should_quantize(ti, gguf_names[i])) {
             tensor_types[i] = quant_type;
             tensor_sizes[i] = ggml_type_size(quant_type, ti->n_elements);
+        } else if (ti->n_dims >= 2) {
+            /* 2D non-quantized tensors (embeddings, output) → F16 */
+            tensor_types[i] = GGML_TYPE_F16;
+            tensor_sizes[i] = ti->n_elements * sizeof(uint16_t);
         } else {
+            /* 1D tensors (norms, biases) → F32 */
             tensor_types[i] = GGML_TYPE_F32;
             tensor_sizes[i] = ti->n_elements * sizeof(float);
         }
@@ -1113,22 +1124,6 @@ static int write_gguf(const char *output_path, const STMultiFile *mf,
         data_offset += tensor_sizes[i];
         data_offset = (data_offset + GGUF_DEFAULT_ALIGNMENT - 1) &
                       ~(uint64_t)(GGUF_DEFAULT_ALIGNMENT - 1);
-    }
-
-    /* Add synthetic output.weight if weight-tied */
-    if (need_output_weight) {
-        int idx = n_include;
-        strncpy(gguf_names[idx], "output.weight", ST_MAX_NAME_LEN - 1);
-        strncpy(tensor_hf_names[idx], "model.embed_tokens.weight", ST_MAX_NAME_LEN - 1);
-        tensor_src_idx[idx] = embed_idx;
-        tensor_types[idx] = GGML_TYPE_F32;
-        const STTensorInfo *ti = st_multi_tensor_info(mf, embed_idx);
-        tensor_sizes[idx] = ti->n_elements * sizeof(float);
-        tensor_offsets[idx] = data_offset;
-        data_offset += tensor_sizes[idx];
-        data_offset = (data_offset + GGUF_DEFAULT_ALIGNMENT - 1) &
-                      ~(uint64_t)(GGUF_DEFAULT_ALIGNMENT - 1);
-        printf("  Weight-tied: embedding → output.weight (F32)\n\n");
     }
 
     /* ── Write header ── */
@@ -1286,8 +1281,34 @@ static int write_gguf(const char *output_path, const STMultiFile *mf,
 
             free(quant_data);
             free(f32_data);
+        } else if (tensor_types[i] == GGML_TYPE_F16) {
+            /* ── Store as F16 (embeddings, output, 2D non-quantized) ── */
+            float *f32_data = st_multi_tensor_to_f32(mf, src);
+            if (!f32_data) {
+                fprintf(stderr, "\n  ERROR: Failed to convert tensor '%s'\n",
+                        ti->name);
+                continue;
+            }
+
+            /* Convert F32 → F16 */
+            uint16_t *f16_data = (uint16_t *)malloc(ti->n_elements * sizeof(uint16_t));
+            for (int64_t j = 0; j < ti->n_elements; j++)
+                f16_data[j] = gguf_fp32_to_fp16(f32_data[j]);
+
+            fwrite(f16_data, sizeof(uint16_t), ti->n_elements, fp);
+
+            total_bytes_unquantized += ti->n_elements * sizeof(uint16_t);
+
+            if (verbose) {
+                printf("\n  [F16 ] %-50s  %10ld elements → %ld bytes\n",
+                       gguf_names[i], (long)ti->n_elements,
+                       (long)(ti->n_elements * sizeof(uint16_t)));
+            }
+
+            free(f16_data);
+            free(f32_data);
         } else {
-            /* ── Keep as F32 (norms, embeddings, biases, output) ── */
+            /* ── Keep as F32 (1D: norms, biases) ── */
             float *f32_data = st_multi_tensor_to_f32(mf, src);
             if (!f32_data) {
                 fprintf(stderr, "\n  ERROR: Failed to convert tensor '%s'\n",
