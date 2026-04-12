@@ -156,19 +156,17 @@ def quantize_tensor_q2k(f32_data):
     d_scale = np.maximum(d_scale, 1e-10)
     d_min = np.maximum(d_min, 1e-10)
 
-    # Quantize sub-block scales and mins to 4-bit
-    inv_d = 1.0 / d_scale[:, None]     # [n_blocks, 1]
-    inv_dmin = 1.0 / d_min[:, None]    # [n_blocks, 1]
-
-    qscales = np.clip(np.round(sb_range * inv_d), 0, 15).astype(np.uint8)  # [n_blocks, 16]
-    qmins = np.clip(np.round((-sb_min) * inv_dmin), 0, 15).astype(np.uint8)  # [n_blocks, 16]
+    # Quantize sub-block scales and mins to 4-bit (0-15 range, q4scale=15)
+    q4scale = 15.0
+    qscales = np.clip(np.round(q4scale * sb_range / d_scale[:, None]), 0, 15).astype(np.uint8)
+    qmins = np.clip(np.round(q4scale * (-sb_min) / d_min[:, None]), 0, 15).astype(np.uint8)
 
     # Pack: low 4 bits = scale, high 4 bits = min
     scales_packed = qscales | (qmins << 4)  # [n_blocks, 16]
 
-    # Reconstruct actual per-sub-block scale and min
-    actual_scale = qscales.astype(np.float32) * d_scale[:, None]  # [n_blocks, 16]
-    actual_min = qmins.astype(np.float32) * d_min[:, None]        # [n_blocks, 16]
+    # Reconstruct actual per-sub-block scale and min (d stores max/15)
+    actual_scale = qscales.astype(np.float32) * (d_scale / q4scale)[:, None]
+    actual_min = qmins.astype(np.float32) * (d_min / q4scale)[:, None]
 
     # Quantize all weights to 2 bits: q = round((val + min) / scale)
     inv_scale = np.where(actual_scale > 0, 1.0 / actual_scale, 0.0)  # [n_blocks, 16]
@@ -187,9 +185,9 @@ def quantize_tensor_q2k(f32_data):
                  (q_groups[:, :, 3, :] << 6)).astype(np.uint8)
     qs_packed = qs_packed.reshape(n_blocks, 64)
 
-    # Convert d and dmin to fp16
-    d_fp16 = d_scale.astype(np.float16)     # [n_blocks]
-    dmin_fp16 = d_min.astype(np.float16)    # [n_blocks]
+    # Convert d and dmin to fp16 (stored as max_scale/15 per ggml convention)
+    d_fp16 = (d_scale / q4scale).astype(np.float16)
+    dmin_fp16 = (d_min / q4scale).astype(np.float16)
 
     # Build output: [n_blocks, 84] bytes
     # ggml block_q2_K layout: d(2) + dmin(2) + scales(16) + qs(64)
