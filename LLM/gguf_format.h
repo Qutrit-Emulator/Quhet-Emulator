@@ -114,14 +114,14 @@ typedef struct {
  *
  * 256-weight superblock divided into 16 sub-blocks of 16 weights.
  *
- * Layout:
- *   scales[16]: Per-sub-block scale (low 4 bits) + min (high 4 bits)
- *   qs[64]:     Packed 2-bit quants (4 weights per byte)
+ * Layout (must match ggml block_q2_K):
  *   d:          fp16 super-block scale for scales
  *   dmin:       fp16 super-block scale for mins
+ *   scales[16]: Per-sub-block scale (low 4 bits) + min (high 4 bits)
+ *   qs[64]:     Packed 2-bit quants (4 weights per byte)
  *
  * Dequantization: w_i = d * scale_j * q_i - dmin * min_j
- *   where j = sub-block index, q_i ∈ {0, 1, 2, 3}
+ *   where j = sub-block index, q_i in {0, 1, 2, 3}
  *
  * Effective: 2.625 bits per weight (84 bytes / 256 weights)
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -129,13 +129,13 @@ typedef struct {
 #define QK_K 256   /* K-quant superblock size */
 
 typedef struct {
-    uint8_t  scales[QK_K/16]; /* 16 bytes: scale(4bit) | min(4bit)       */
-    uint8_t  qs[QK_K/4];     /* 64 bytes: packed 2-bit quants            */
     uint16_t d;              /* fp16 super-block scale                   */
     uint16_t dmin;           /* fp16 super-block min scale               */
+    uint8_t  scales[QK_K/16]; /* 16 bytes: scale(4bit) | min(4bit)       */
+    uint8_t  qs[QK_K/4];     /* 64 bytes: packed 2-bit quants            */
 } BlockQ2K;
 
-/* sizeof(BlockQ2K) = 16 + 64 + 2 + 2 = 84 bytes for 256 weights */
+/* sizeof(BlockQ2K) = 2 + 2 + 16 + 64 = 84 bytes for 256 weights */
 
 /* ═══════════════════════════════════════════════════════════════════════
  * FP16 ←→ FP32 CONVERSION
