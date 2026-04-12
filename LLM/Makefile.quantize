@@ -1,0 +1,30 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Makefile.quantize — HexState GGUF Quantizer Build
+#
+# Build:  make -f Makefile.quantize
+# Clean:  make -f Makefile.quantize clean
+# ═══════════════════════════════════════════════════════════════════════════
+
+CC       = gcc
+CFLAGS   = -O2 -std=gnu99 -Wall -Wno-unused-function -Wno-unused-variable
+LDFLAGS  = -lm -lgmp -lmpfr
+
+SRCS     = hexstate_quantize.c quhit_triality.c quhit_hexagram.c s6_exotic.c
+TARGET   = hexstate_quantize
+
+.PHONY: all clean
+
+all: $(TARGET)
+
+$(TARGET): $(SRCS)
+	$(CC) $(CFLAGS) -o $(TARGET) $(SRCS) $(LDFLAGS)
+	@echo ""
+	@echo "  ╔════════════════════════════════════════════════════════════════╗"
+	@echo "  ║  HexState GGUF Quantizer built successfully!                  ║"
+	@echo "  ║                                                               ║"
+	@echo "  ║  Usage: ./hexstate_quantize input.safetensors output.gguf     ║"
+	@echo "  ╚════════════════════════════════════════════════════════════════╝"
+	@echo ""
+
+clean:
+	rm -f $(TARGET)
