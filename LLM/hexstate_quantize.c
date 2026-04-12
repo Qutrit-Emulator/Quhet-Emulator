@@ -259,7 +259,8 @@ static void map_tensor_name(const char *hf_name, char *gguf_name, int buflen)
  *   - Keep F32: norms, biases, embeddings, 1D tensors
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static int should_quantize(const STTensorInfo *ti, const char *gguf_name)
+static int should_quantize(const STTensorInfo *ti, const char *gguf_name,
+                           GGMLType quant_type)
 {
     /* Never quantize 1D tensors (norms, biases) */
     if (ti->n_dims < 2) return 0;
@@ -269,6 +270,14 @@ static int should_quantize(const STTensorInfo *ti, const char *gguf_name)
 
     /* Never quantize norm weights */
     if (strstr(gguf_name, "norm") != NULL) return 0;
+
+    /* Never quantize tensors whose row size isn't a multiple of the
+     * quantization block size.  Q2_K requires multiples of 256,
+     * Q8_0 requires multiples of 32.  llama.cpp will reject the file
+     * if this constraint is violated. */
+    int64_t block_size = ggml_type_block_size(quant_type);
+    int64_t row_size = ti->shape[ti->n_dims - 1];  /* innermost dim in safetensors */
+    if (row_size % block_size != 0) return 0;
 
     /* Quantize everything else (attention projections, FFN weights) */
     return 1;
@@ -739,7 +748,7 @@ static int write_gguf(const char *output_path, const STFile *st,
         map_tensor_name(st->tensors[i].name, gguf_names[i], ST_MAX_NAME_LEN);
         tensor_src_idx[i] = i;
 
-        if (should_quantize(&st->tensors[i], gguf_names[i])) {
+        if (should_quantize(&st->tensors[i], gguf_names[i], quant_type)) {
             tensor_types[i] = quant_type;
             tensor_sizes[i] = ggml_type_size(quant_type,
                                               st->tensors[i].n_elements);
