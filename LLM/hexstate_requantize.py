@@ -146,10 +146,15 @@ def quantize_tensor_q2k(f32_data):
     # Per-sub-block min and range
     sb_min = data.min(axis=2)           # [n_blocks, 16]
     sb_max = data.max(axis=2)           # [n_blocks, 16]
+    sb_min = np.minimum(sb_min, 0.0)    # clamp min to <= 0 (ggml convention)
     sb_range = sb_max - sb_min          # [n_blocks, 16]
 
+    # Per-sub-block scale = range / nmax (nmax=3 for Q2_K, levels 0,1,2,3)
+    nmax = 3
+    sb_scale = sb_range / nmax          # [n_blocks, 16]
+
     # Per-superblock global scale and min
-    d_scale = sb_range.max(axis=1)      # [n_blocks]
+    d_scale = sb_scale.max(axis=1)      # [n_blocks]
     d_min = (-sb_min).max(axis=1)       # [n_blocks]
 
     # Avoid division by zero
@@ -158,7 +163,7 @@ def quantize_tensor_q2k(f32_data):
 
     # Quantize sub-block scales and mins to 4-bit (0-15 range, q4scale=15)
     q4scale = 15.0
-    qscales = np.clip(np.round(q4scale * sb_range / d_scale[:, None]), 0, 15).astype(np.uint8)
+    qscales = np.clip(np.round(q4scale * sb_scale / d_scale[:, None]), 0, 15).astype(np.uint8)
     qmins = np.clip(np.round(q4scale * (-sb_min) / d_min[:, None]), 0, 15).astype(np.uint8)
 
     # Pack: low 4 bits = scale, high 4 bits = min
