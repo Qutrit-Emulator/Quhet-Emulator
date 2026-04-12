@@ -97,8 +97,24 @@ static int find_max_layer_index(const STFile *st, const char *layer_prefix)
     }
     return max_idx;
 }
-
-static void detect_architecture(const STFile *st, ModelArchitecture *arch)
+static int get_json_int(const char *path, const char *key) {
+    char *json = tok_read_file(path);
+    if (!json) return -1;
+    
+    char search_key[256];
+    snprintf(search_key, sizeof(search_key), "\"%s\"", key);
+    
+    char *ptr = strstr(json, search_key);
+    int val = -1;
+    if (ptr) {
+        ptr += strlen(search_key);
+        while (*ptr && (*ptr == ' ' || *ptr == ':')) ptr++;
+        val = atoi(ptr);
+    }
+    free(json);
+    return val;
+}
+static void detect_architecture(const STFile *st, const char *st_filename, ModelArchitecture *arch)
 {
     memset(arch, 0, sizeof(*arch));
 
@@ -108,6 +124,24 @@ static void detect_architecture(const STFile *st, ModelArchitecture *arch)
     arch->context_length = 4096;
     arch->rope_freq_base = 10000.0f;
     arch->rms_norm_eps = 1e-5f;
+
+    /* Build config.json path from safetensors path */
+    char config_path[1024];
+    strncpy(config_path, st_filename, sizeof(config_path) - 1);
+    config_path[1023] = '\0';
+    char *last_slash = strrchr(config_path, '/');
+    if (last_slash) {
+        strcpy(last_slash + 1, "config.json");
+    } else {
+        strcpy(config_path, "config.json");
+    }
+
+    /* Override heads and rms_norm_eps if config.json exists */
+    int cfg_heads = get_json_int(config_path, "num_attention_heads");
+    int cfg_kv_heads = get_json_int(config_path, "num_key_value_heads");
+    
+    if (cfg_heads > 0) arch->head_count = cfg_heads;
+    if (cfg_kv_heads > 0) arch->head_count_kv = cfg_kv_heads;
 
     /* Detect architecture from tensor naming patterns */
     int has_model_layers = count_tensors_with_prefix(st, "model.layers.");
@@ -126,29 +160,24 @@ static void detect_architecture(const STFile *st, ModelArchitecture *arch)
 
             if (qproj_idx >= 0) {
                 arch->embedding_length = st->tensors[qproj_idx].shape[1];
-                arch->head_count = st->tensors[qproj_idx].shape[0] / 
-                                   (arch->embedding_length / 
-                                    (st->tensors[qproj_idx].shape[0] > 0 ? 
-                                     (arch->embedding_length / 128) : 1));
                 
-                /* Infer head dim and head count more robustly */
-                int64_t q_out = st->tensors[qproj_idx].shape[0];
-                int64_t hidden = st->tensors[qproj_idx].shape[1];
-                arch->embedding_length = hidden;
-                
-                /* Try common head dimensions: 128, 64, 96 */
-                int head_dim = 128;
-                if (q_out % 128 == 0) head_dim = 128;
-                else if (q_out % 96 == 0) head_dim = 96;
-                else if (q_out % 64 == 0) head_dim = 64;
-                
-                arch->head_count = q_out / head_dim;
-                
-                if (kproj_idx >= 0) {
-                    int64_t k_out = st->tensors[kproj_idx].shape[0];
-                    arch->head_count_kv = k_out / head_dim;
-                } else {
-                    arch->head_count_kv = arch->head_count;
+                /* Use config.json values if we found them, else guess */
+                if (arch->head_count == 0) {
+                    int64_t q_out = st->tensors[qproj_idx].shape[0];
+                    int head_dim = 128;
+                    if (arch->embedding_length <= 2048 && q_out % 64 == 0) head_dim = 64;
+                    else if (q_out % 128 == 0) head_dim = 128;
+                    else if (q_out % 96 == 0) head_dim = 96;
+                    else if (q_out % 64 == 0) head_dim = 64;
+                    
+                    arch->head_count = q_out / head_dim;
+                    
+                    if (kproj_idx >= 0) {
+                        int64_t k_out = st->tensors[kproj_idx].shape[0];
+                        arch->head_count_kv = k_out / head_dim;
+                    } else {
+                        arch->head_count_kv = arch->head_count;
+                    }
                 }
             }
 
@@ -605,7 +634,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
         /* For each of 16 sub-blocks: find optimal (scale, min)
          * Use more refinement iterations for high-importance blocks */
         for (int j = 0; j < QK_K / 16; j++) {
-            scales[j] = gguf_make_qkx_quants(16, 3,
+            scales[j] = gguf_make_qkx_quants(16, 2,
                                                block_x + 16 * j,
                                                L + 16 * j, &mins[j]);
             if (scales[j] > max_scale) max_scale = scales[j];
@@ -672,6 +701,38 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
 
     free(importance);
     if (out_total_error) *out_total_error = total_err;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * RoPE PERMUTATION
+ *
+ * LLaMA-style RoPE expects Q and K heads to have their 'real' and 'imaginary'
+ * components interleaved. PyTorch models store them split in half.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void permute_qk_tensor(float *f32_data, int64_t n_heads, int64_t head_dim, int64_t hidden_dim) {
+    if (head_dim % 2 != 0) return;
+    
+    int64_t n_elements = n_heads * head_dim * hidden_dim;
+    float *temp = (float *)malloc(n_elements * sizeof(float));
+    if (!temp) return;
+    
+    int64_t half_dim = head_dim / 2;
+    int64_t head_size = head_dim * hidden_dim;
+    
+    for (int64_t h = 0; h < n_heads; h++) {
+        for (int64_t d0 = 0; d0 < 2; d0++) {
+            for (int64_t d1 = 0; d1 < half_dim; d1++) {
+                for (int64_t hidden = 0; hidden < hidden_dim; hidden++) {
+                    int64_t src_idx = h * head_size + d0 * (half_dim * hidden_dim) + d1 * hidden_dim + hidden;
+                    int64_t dst_idx = h * head_size + d1 * (2 * hidden_dim) + d0 * hidden_dim + hidden;
+                    temp[dst_idx] = f32_data[src_idx];
+                }
+            }
+        }
+    }
+    
+    memcpy(f32_data, temp, n_elements * sizeof(float));
+    free(temp);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -875,15 +936,28 @@ static int write_gguf(const char *output_path, const STFile *st,
         const STTensorInfo *ti = &st->tensors[src];
         long pos_before = ftell(fp);
 
+        /* Load from safetensors into F32 buffer */
+        float *f32_data = st_tensor_to_f32(st, src);
+        if (!f32_data) {
+            fprintf(stderr, "  ERROR: Failed to convert tensor '%s'\n", ti->name);
+            continue;
+        }
+
+        /* Apply RoPE permutation logic for LLaMA architectures */
+        if (strcmp(arch->architecture, "llama") == 0) {
+            if (strstr(gguf_names[i], "attn_q.weight") != NULL) {
+                int64_t head_dim = ti->shape[0] / arch->head_count;
+                int64_t hidden_dim = ti->shape[1];
+                permute_qk_tensor(f32_data, arch->head_count, head_dim, hidden_dim);
+            } else if (strstr(gguf_names[i], "attn_k.weight") != NULL) {
+                int64_t head_dim = ti->shape[0] / arch->head_count_kv;
+                int64_t hidden_dim = ti->shape[1];
+                permute_qk_tensor(f32_data, arch->head_count_kv, head_dim, hidden_dim);
+            }
+        }
+
         if (tensor_types[i] == GGML_TYPE_Q8_0 || tensor_types[i] == GGML_TYPE_Q2_K) {
             /* ── HPC-Optimized Quantization ── */
-            float *f32_data = st_tensor_to_f32(st, src);
-            if (!f32_data) {
-                fprintf(stderr, "  ERROR: Failed to convert tensor '%s' to F32\n",
-                        ti->name);
-                continue;
-            }
-
             int64_t n_elements = ti->n_elements;
             float tensor_error = 0.0f;
 
@@ -900,16 +974,13 @@ static int write_gguf(const char *output_path, const STFile *st,
                 int64_t n_blocks = n_elements / QK_K;
                 BlockQ2K *quant_data = calloc(n_blocks, sizeof(BlockQ2K));
 
-                quantize_tensor_q2k_hpc(f32_data, n_elements,
-                                          quant_data, &tensor_error);
-
+                quantize_tensor_q2k_hpc(f32_data, n_elements, quant_data, &tensor_error);
                 fwrite(quant_data, sizeof(BlockQ2K), n_blocks, fp);
 
                 float rmse = sqrtf(tensor_error / (float)n_elements);
                 printf("  [Q2_K] %-50s  %10ld elements → %ld bytes  RMSE=%.6e\n",
                        gguf_names[i], (long)ti->n_elements,
-                       (long)(n_blocks * sizeof(BlockQ2K)),
-                       rmse);
+                       (long)(n_blocks * sizeof(BlockQ2K)), rmse);
                 free(quant_data);
 
             } else {
@@ -925,41 +996,27 @@ static int write_gguf(const char *output_path, const STFile *st,
                 int64_t n_blocks = n_elements / QK8_0;
                 BlockQ8_0 *quant_data = calloc(n_blocks, sizeof(BlockQ8_0));
 
-                quantize_tensor_hpc(f32_data, n_elements,
-                                      quant_data, &tensor_error);
-
+                quantize_tensor_hpc(f32_data, n_elements, quant_data, &tensor_error);
                 fwrite(quant_data, sizeof(BlockQ8_0), n_blocks, fp);
 
                 float rmse = sqrtf(tensor_error / (float)n_elements);
                 printf("  [Q8_0] %-50s  %10ld elements → %ld bytes  RMSE=%.6e\n",
                        gguf_names[i], (long)ti->n_elements,
-                       (long)(n_blocks * sizeof(BlockQ8_0)),
-                       rmse);
+                       (long)(n_blocks * sizeof(BlockQ8_0)), rmse);
                 free(quant_data);
             }
 
             total_error_sum += tensor_error;
             quant_count++;
-
-            free(f32_data);
         } else {
             /* ── Keep as F32 (norms, embeddings) ── */
-            float *f32_data = st_tensor_to_f32(st, src);
-            if (!f32_data) {
-                fprintf(stderr, "  ERROR: Failed to convert tensor '%s'\n",
-                        ti->name);
-                continue;
-            }
-
             fwrite(f32_data, sizeof(float), ti->n_elements, fp);
-
             printf("  [F32 ] %-50s  %10ld elements → %ld bytes\n",
                    gguf_names[i], (long)ti->n_elements,
                    (long)(ti->n_elements * sizeof(float)));
-
-            free(f32_data);
         }
 
+        free(f32_data);
         /* Pad to alignment */
         gguf_write_padding(fp, GGUF_DEFAULT_ALIGNMENT);
     }
@@ -1056,7 +1113,7 @@ int main(int argc, char **argv)
     /* ── Phase 2: Detect architecture ── */
     printf("  Phase 2: Detecting model architecture...\n");
     ModelArchitecture arch;
-    detect_architecture(st, &arch);
+    detect_architecture(st, argv[1], &arch);
 
     printf("  ╔═══════════════════════════════════════════════════════════════╗\n");
     printf("  ║  Model Architecture                                         ║\n");
