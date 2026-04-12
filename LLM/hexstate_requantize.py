@@ -124,11 +124,11 @@ def f32_to_bf16(f32_array):
 def quantize_tensor_q2k(f32_data):
     """Quantize an entire tensor to Q2_K format using vectorized numpy.
 
-    Q2_K block layout (84 bytes):
-        scales[16] : packed 4-bit scale + 4-bit min per sub-block
-        qs[64]     : packed 2-bit quantized values (4 per byte)
+    Q2_K block layout (84 bytes, must match ggml block_q2_K):
         d          : fp16 super-block scale
         dmin       : fp16 super-block min-scale
+        scales[16] : packed 4-bit scale + 4-bit min per sub-block
+        qs[64]     : interleaved 2-bit quants (4 weights 32-apart per byte)
     """
     n_elements = len(f32_data)
 
@@ -178,12 +178,14 @@ def quantize_tensor_q2k(f32_data):
     # Flatten sub-blocks: [n_blocks, 256]
     q_flat = q_vals.reshape(n_blocks, QK_K)
 
-    # Pack 4 values per byte (2 bits each): [n_blocks, 64]
-    q_flat_4 = q_flat.reshape(n_blocks, 64, 4)
-    qs_packed = (q_flat_4[:, :, 0] |
-                 (q_flat_4[:, :, 1] << 2) |
-                 (q_flat_4[:, :, 2] << 4) |
-                 (q_flat_4[:, :, 3] << 6)).astype(np.uint8)
+    # Pack in ggml interleaved format: 2 groups of 128 weights, each into 32 bytes
+    # qs[l] = L[l] | (L[l+32]<<2) | (L[l+64]<<4) | (L[l+96]<<6)
+    q_groups = q_flat.reshape(n_blocks, 2, 4, 32)  # [n_blocks, 2 groups, 4 shifts, 32 positions]
+    qs_packed = (q_groups[:, :, 0, :] |
+                 (q_groups[:, :, 1, :] << 2) |
+                 (q_groups[:, :, 2, :] << 4) |
+                 (q_groups[:, :, 3, :] << 6)).astype(np.uint8)
+    qs_packed = qs_packed.reshape(n_blocks, 64)
 
     # Convert d and dmin to fp16
     d_fp16 = d_scale.astype(np.float16)     # [n_blocks]
