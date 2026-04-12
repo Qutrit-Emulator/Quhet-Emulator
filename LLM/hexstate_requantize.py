@@ -355,6 +355,49 @@ def main():
                 updated_kv.append((key, vtype, struct.pack('<I', 10)))
             elif key == 'general.quantization_version' and vtype == 4:
                 updated_kv.append((key, vtype, struct.pack('<I', 2)))
+            elif key == 'tokenizer.ggml.token_type' and vtype == 9:
+                # ── Fix Gemma 4 token types ──
+                # convert_hf_to_gguf.py incorrectly marks control tokens as
+                # NORMAL (1), causing llama.cpp to sample them (e.g. <unused24>
+                # spam). Fix: read the tokens array to find control-looking
+                # tokens, then patch their types to CONTROL (3).
+                # See: https://github.com/ggml-org/llama.cpp/issues/21321
+                tokens_kv = next((v for k, vt, v in kv_pairs
+                                  if k == 'tokenizer.ggml.tokens' and vt == 9), None)
+                token_names = []
+                if tokens_kv:
+                    bio = io.BytesIO(tokens_kv)
+                    arr_type = struct.unpack('<I', bio.read(4))[0]
+                    arr_len = struct.unpack('<Q', bio.read(8))[0]
+                    for _ in range(arr_len):
+                        slen = struct.unpack('<Q', bio.read(8))[0]
+                        token_names.append(bio.read(slen).decode('utf-8', errors='replace'))
+
+                # Parse the token_type array
+                bio2 = io.BytesIO(raw_value)
+                arr_type2 = struct.unpack('<I', bio2.read(4))[0]
+                arr_len2 = struct.unpack('<Q', bio2.read(8))[0]
+                ttypes = list(struct.unpack(f'<{arr_len2}i', bio2.read(arr_len2 * 4)))
+
+                # Patch control-looking tokens
+                n_fixed = 0
+                CONTROL_TYPE = 3
+                for i, tname in enumerate(token_names):
+                    if ttypes[i] == CONTROL_TYPE:
+                        continue  # already correct
+                    # Mark as CONTROL if it looks like a control/special token
+                    if (tname.startswith('<') and tname.endswith('>') and
+                        tname not in ('<pad>',)):  # <pad> is already CONTROL
+                        ttypes[i] = CONTROL_TYPE
+                        n_fixed += 1
+
+                print(f"  Fixed {n_fixed} token types to CONTROL (Gemma 4 <unused> fix)")
+
+                # Rebuild the raw value
+                new_raw = struct.pack('<I', arr_type2)
+                new_raw += struct.pack('<Q', arr_len2)
+                new_raw += struct.pack(f'<{arr_len2}i', *ttypes)
+                updated_kv.append((key, vtype, new_raw))
             else:
                 updated_kv.append((key, vtype, raw_value))
 
