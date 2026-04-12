@@ -16,6 +16,7 @@ import struct
 import sys
 import time
 import os
+import io
 import numpy as np
 
 # ─── Constants ──────────────────────────────────────────────────────────────
@@ -382,12 +383,25 @@ def main():
                 # Patch control-looking tokens
                 n_fixed = 0
                 CONTROL_TYPE = 3
+                import re
                 for i, tname in enumerate(token_names):
                     if ttypes[i] == CONTROL_TYPE:
                         continue  # already correct
-                    # Mark as CONTROL if it looks like a control/special token
-                    if (tname.startswith('<') and tname.endswith('>') and
-                        tname not in ('<pad>',)):  # <pad> is already CONTROL
+                    if ttypes[i] == 6:
+                        continue  # BYTE type — leave as-is
+                    # Only fix tokens that are genuine control/special tokens:
+                    # - <eos>, <bos>, <unk>, <mask>, </s> — sentence markers
+                    # - <unused0> through <unused99> — unused/reserved
+                    # - <|turn>, <turn|>, <|tool_*|> etc — delimiters
+                    is_control = False
+                    if tname in ('<eos>', '<bos>', '<unk>', '<mask>', '</s>',
+                                 '<pad>', '<s>'):
+                        is_control = True
+                    elif re.match(r'^<unused\d+>$', tname):
+                        is_control = True
+                    elif re.match(r'^<\|.*\|?>$', tname) or re.match(r'^<.*\|>$', tname):
+                        is_control = True
+                    if is_control and ttypes[i] != CONTROL_TYPE:
                         ttypes[i] = CONTROL_TYPE
                         n_fixed += 1
 
@@ -398,6 +412,27 @@ def main():
                 new_raw += struct.pack('<Q', arr_len2)
                 new_raw += struct.pack(f'<{arr_len2}i', *ttypes)
                 updated_kv.append((key, vtype, new_raw))
+            elif key == 'tokenizer.chat_template' and vtype == 8:
+                # ── Replace chat template with fixed Gemma 4 template ──
+                # The HF-exported template doesn't handle thinking mode, causing
+                # the model to emit <unused24> tokens. The fixed template from
+                # llama.cpp PR #21418 pre-fills an empty thought block when
+                # thinking is disabled: <|channel>thought\n<channel|>
+                # See: https://github.com/ggml-org/llama.cpp/pull/21418
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                workspace_dir = os.path.dirname(script_dir)
+                template_path = os.path.join(workspace_dir, 'llama-cpp-latest',
+                    'models', 'templates', 'google-gemma-4-31B-it.jinja')
+                if os.path.exists(template_path):
+                    with open(template_path, 'r') as tf:
+                        new_template = tf.read()
+                    new_raw = struct.pack('<Q', len(new_template.encode('utf-8')))
+                    new_raw += new_template.encode('utf-8')
+                    updated_kv.append((key, vtype, new_raw))
+                    print(f"  Replaced chat template with fixed Gemma 4 template ({len(new_template)} chars)")
+                else:
+                    print(f"  WARNING: Fixed template not found at {template_path}, keeping original")
+                    updated_kv.append((key, vtype, raw_value))
             else:
                 updated_kv.append((key, vtype, raw_value))
 
