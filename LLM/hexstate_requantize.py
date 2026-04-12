@@ -391,13 +391,14 @@ def main():
                         continue  # BYTE type — leave as-is
                     # Only fix tokens that are genuine control/special tokens:
                     # - <eos>, <bos>, <unk>, <mask>, </s> — sentence markers
-                    # - <unused0> through <unused99> — unused/reserved
                     # - <|turn>, <turn|>, <|tool_*|> etc — delimiters
+                    # NOTE: do NOT mark <unused*> as CONTROL — Gemma 4 uses
+                    # these tokens internally for thinking/channel markers
+                    # (e.g. <unused24> = <|channel>). The llama.cpp parser
+                    # handles them via the peg-gemma4 format instead.
                     is_control = False
                     if tname in ('<eos>', '<bos>', '<unk>', '<mask>', '</s>',
                                  '<pad>', '<s>'):
-                        is_control = True
-                    elif re.match(r'^<unused\d+>$', tname):
                         is_control = True
                     elif re.match(r'^<\|.*\|?>$', tname) or re.match(r'^<.*\|>$', tname):
                         is_control = True
