@@ -190,11 +190,12 @@ def quantize_tensor_q2k(f32_data):
     dmin_fp16 = d_min.astype(np.float16)    # [n_blocks]
 
     # Build output: [n_blocks, 84] bytes
+    # ggml block_q2_K layout: d(2) + dmin(2) + scales(16) + qs(64)
     result = np.zeros((n_blocks, 84), dtype=np.uint8)
-    result[:, 0:16] = scales_packed
-    result[:, 16:80] = qs_packed
-    result[:, 80:82] = d_fp16.view(np.uint8).reshape(n_blocks, 2)
-    result[:, 82:84] = dmin_fp16.view(np.uint8).reshape(n_blocks, 2)
+    result[:, 0:2]   = d_fp16.view(np.uint8).reshape(n_blocks, 2)
+    result[:, 2:4]   = dmin_fp16.view(np.uint8).reshape(n_blocks, 2)
+    result[:, 4:20]  = scales_packed
+    result[:, 20:84] = qs_packed
 
     return result.tobytes(), n_blocks
 
