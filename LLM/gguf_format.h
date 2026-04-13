@@ -129,10 +129,10 @@ typedef struct {
 #define QK_K 256   /* K-quant superblock size */
 
 typedef struct {
-    uint16_t d;              /* fp16 super-block scale                   */
-    uint16_t dmin;           /* fp16 super-block min scale               */
     uint8_t  scales[QK_K/16]; /* 16 bytes: scale(4bit) | min(4bit)       */
     uint8_t  qs[QK_K/4];     /* 64 bytes: packed 2-bit quants            */
+    uint16_t d;              /* fp16 super-block scale                   */
+    uint16_t dmin;           /* fp16 super-block min scale               */
 } BlockQ2K;
 
 /* sizeof(BlockQ2K) = 2 + 2 + 16 + 64 = 84 bytes for 256 weights */
