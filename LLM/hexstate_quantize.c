@@ -1388,6 +1388,51 @@ static int write_gguf(const char *output_path, const STMultiFile *mf,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * LIBRARY API — Exported functions for Python ctypes integration
+ *
+ * When built with -DHEXSTATE_LIBRARY, these are the only public symbols.
+ * The Python GGUF pipeline handles metadata/IO; C handles HPC quantization.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Initialize HExState subsystems (must be called once before quantization) */
+void hexstate_init(void)
+{
+    static int initialized = 0;
+    if (!initialized) {
+        srand(42);  /* Deterministic for reproducibility */
+        triality_exotic_init();
+        s6_exotic_init();
+        triality_stats_reset();
+        initialized = 1;
+    }
+}
+
+/* Quantize a single tensor's F32 data to Q2_K using HPC optimization.
+ *
+ * Parameters:
+ *   weights:     input F32 data (must be padded to multiple of 256)
+ *   n_elements:  number of elements (must be multiple of 256)
+ *   output:      output buffer (must be n_elements/256 * 84 bytes)
+ *   out_error:   pointer to receive total MSE (can be NULL)
+ *   opt_mode:    0=HPC, 1=MSE, 2=Hybrid (recommended)
+ *   verbose:     1 for per-block diagnostics
+ */
+void hexstate_quantize_tensor_q2k(const float *weights, int64_t n_elements,
+                                    void *output, float *out_error,
+                                    int opt_mode, int verbose)
+{
+    hexstate_init();
+    quantize_tensor_q2k_hpc(weights, n_elements,
+                              (BlockQ2K *)output, out_error,
+                              (OptimizerMode)opt_mode, NULL, verbose);
+}
+
+/* Get the block size for Q2_K (84 bytes per 256 elements) */
+int hexstate_q2k_block_bytes(void) { return sizeof(BlockQ2K); }
+int hexstate_q2k_block_elements(void) { return QK_K; }
+
+#ifndef HEXSTATE_LIBRARY
+/* ═══════════════════════════════════════════════════════════════════════════
  * MAIN
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1602,3 +1647,4 @@ int main(int argc, char **argv)
     st_multi_close(mf);
     return result;
 }
+#endif /* HEXSTATE_LIBRARY */
