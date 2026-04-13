@@ -58,28 +58,151 @@ def _load_hexstate_lib():
         lib.hexstate_q2k_block_elements.restype = ctypes.c_int
         lib.hexstate_q2k_block_elements.argtypes = []
 
+        # imatrix-aware version
+        lib.hexstate_quantize_tensor_q2k_imat.restype = None
+        lib.hexstate_quantize_tensor_q2k_imat.argtypes = [
+            ctypes.POINTER(ctypes.c_float),  # weights
+            ctypes.c_int64,                   # n_elements
+            ctypes.c_void_p,                  # output
+            ctypes.POINTER(ctypes.c_float),   # out_error
+            ctypes.c_int,                     # opt_mode
+            ctypes.POINTER(ctypes.c_float),   # imat_importance (can be NULL)
+            ctypes.c_int,                     # verbose
+        ]
+
         lib.hexstate_init()
         _HEXSTATE_LIB = lib
         return lib
     except Exception as e:
-        print(f"  WARNING: Failed to load HExState library: {e}")
+        print(f"  WARNING: Failed to load HexState library: {e}")
         return None
 
 
-def quantize_tensor_q2k_hpc(f32_data, opt_mode=2):
-    """Quantize tensor using HExState HPC-optimized C implementation.
+def _skip_gguf_kv_value(f, vtype):
+    """Skip a GGUF KV value of the given type."""
+    import struct as st
+    size_map = {0:1, 1:1, 2:2, 3:2, 4:4, 5:4, 6:4, 7:1, 10:8, 11:8, 12:8}
+    if vtype == 8:  # string
+        slen = st.unpack('<Q', f.read(8))[0]
+        f.read(slen)
+    elif vtype == 9:  # array
+        arr_type = st.unpack('<I', f.read(4))[0]
+        arr_len = st.unpack('<Q', f.read(8))[0]
+        if arr_type == 8:  # array of strings
+            for _ in range(arr_len):
+                slen = st.unpack('<Q', f.read(8))[0]
+                f.read(slen)
+        else:
+            sz = size_map.get(arr_type, 4)
+            f.read(arr_len * sz)
+    else:
+        sz = size_map.get(vtype, 4)
+        f.read(sz)
+
+
+def read_imatrix(path):
+    """Read llama.cpp importance matrix file (GGUF or legacy .dat format).
+
+    Returns dict: tensor_name -> normalized importance array (float32)
+    """
+    import struct as st
+    imat = {}
+
+    with open(path, 'rb') as f:
+        magic = st.unpack('<I', f.read(4))[0]
+
+        if magic == 0x46554747:  # GGUF format (modern llama.cpp)
+            _ver = st.unpack('<I', f.read(4))[0]
+            n_tensors = st.unpack('<Q', f.read(8))[0]
+            n_kv = st.unpack('<Q', f.read(8))[0]
+
+            # Skip KV pairs
+            for _ in range(n_kv):
+                slen = st.unpack('<Q', f.read(8))[0]
+                f.read(slen)  # key
+                vtype = st.unpack('<I', f.read(4))[0]
+                _skip_gguf_kv_value(f, vtype)
+
+            # Read tensor infos
+            tensor_infos = []
+            for _ in range(n_tensors):
+                slen = st.unpack('<Q', f.read(8))[0]
+                name = f.read(slen).decode('utf-8', errors='replace')
+                n_dims = st.unpack('<I', f.read(4))[0]
+                dims = [st.unpack('<Q', f.read(8))[0] for _ in range(n_dims)]
+                ttype = st.unpack('<I', f.read(4))[0]
+                offset = st.unpack('<Q', f.read(8))[0]
+                n_el = 1
+                for d in dims:
+                    n_el *= d
+                tensor_infos.append((name, n_el, offset))
+
+            # Data section start (32-byte aligned)
+            data_start = ((f.tell() + 31) // 32) * 32
+
+            # Group by base tensor name: collect in_sum2 and counts
+            sum2_data = {}
+            counts_data = {}
+            for name, n_el, offset in tensor_infos:
+                f.seek(data_start + offset)
+                data = np.frombuffer(f.read(n_el * 4), dtype=np.float32).copy()
+                if name.endswith('.in_sum2'):
+                    base = name[:-len('.in_sum2')]
+                    sum2_data[base] = data
+                elif name.endswith('.counts'):
+                    base = name[:-len('.counts')]
+                    counts_data[base] = data
+
+            # Compute normalized importance: sqrt(in_sum2 / counts) / mean
+            for base_name in sum2_data:
+                in_sum2 = sum2_data[base_name]
+                count = counts_data.get(base_name, np.array([1.0]))[0]
+                if count > 0:
+                    importance = np.sqrt(in_sum2 / count)
+                else:
+                    importance = np.ones_like(in_sum2)
+                mean = importance.mean()
+                if mean > 1e-30:
+                    imat[base_name] = importance / mean
+                else:
+                    imat[base_name] = np.ones_like(importance)
+
+        else:
+            # Legacy format: first 4 bytes were n_entries
+            f.seek(0)
+            n_entries = st.unpack('<i', f.read(4))[0]
+            for _ in range(n_entries):
+                name_len = st.unpack('<i', f.read(4))[0]
+                name = f.read(name_len).decode('utf-8')
+                n_values = st.unpack('<i', f.read(4))[0]
+                n_samples = st.unpack('<i', f.read(4))[0]
+                values = np.frombuffer(f.read(n_values * 4), dtype=np.float32).copy()
+                mean = values.mean()
+                if mean > 1e-30:
+                    imat[name] = values / mean
+                else:
+                    imat[name] = np.ones_like(values)
+
+    return imat
+
+
+def quantize_tensor_q2k_hpc(f32_data, opt_mode=2, importance=None):
+    """Quantize tensor using HexState HPC-optimized C implementation.
 
     opt_mode: 0=HPC (BP only), 1=MSE (grid search), 2=Hybrid (recommended)
+    importance: optional per-element importance weights (from imatrix)
     Returns: (bytes, n_blocks) same as quantize_tensor_q2k()
     """
     lib = _load_hexstate_lib()
     if lib is None:
-        raise RuntimeError("HExState library not available")
+        raise RuntimeError("HexState library not available")
 
     n_elements = len(f32_data)
     if n_elements % QK_K != 0:
         pad_len = QK_K - (n_elements % QK_K)
         f32_data = np.concatenate([f32_data, np.zeros(pad_len, dtype=np.float32)])
+        if importance is not None:
+            importance = np.concatenate([importance, np.ones(pad_len, dtype=np.float32)])
         n_elements = len(f32_data)
 
     n_blocks = n_elements // QK_K
@@ -89,14 +212,22 @@ def quantize_tensor_q2k_hpc(f32_data, opt_mode=2):
     output = np.zeros(n_blocks * block_bytes, dtype=np.uint8)
     error = ctypes.c_float(0.0)
 
-    # Call C quantizer
+    # Call C quantizer with or without importance weights
     f32_contiguous = np.ascontiguousarray(f32_data, dtype=np.float32)
-    lib.hexstate_quantize_tensor_q2k(
+
+    if importance is not None:
+        imat_contiguous = np.ascontiguousarray(importance, dtype=np.float32)
+        imat_ptr = imat_contiguous.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    else:
+        imat_ptr = None
+
+    lib.hexstate_quantize_tensor_q2k_imat(
         f32_contiguous.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         ctypes.c_int64(n_elements),
         output.ctypes.data_as(ctypes.c_void_p),
         ctypes.byref(error),
         ctypes.c_int(opt_mode),
+        imat_ptr,
         ctypes.c_int(0),  # not verbose
     )
 
@@ -386,22 +517,17 @@ def quantize_tensor_q2k(f32_data):
 def should_quantize(name, n_dims, dims):
     """Should this tensor be quantized to Q2_K?
 
-    Matches llama.cpp's tensor_allows_quantization plus the Q2_K-specific
-    type promotions from llama_tensor_get_type_impl. Since our quantizer
-    only supports Q2_K (which is too lossy for certain sensitive tensors),
-    we keep those tensors in their original precision.
+    With iMatrix importance weighting, Q2_K quality is sufficient for most
+    weight tensors. We now quantize attn_v, ffn_down, attn_output, inp_gate,
+    and proj tensors that were previously excluded.
 
     Tensors kept as-is:
       - 1D tensors (norms, biases) — always kept
-      - token_embd, output.weight — embeddings
-      - _norm, .bias — normalization
+      - token_embd, output.weight — embeddings (too critical)
+      - _norm, .bias — normalization layers
       - ffn_gate_inp — MoE routing gate
       - per_layer_model_proj — Gemma 4 layer proj (too small)
-      - attn_v.weight — llama.cpp promotes to Q4_K for Q2_K
-      - ffn_down.weight — llama.cpp promotes to Q3_K for Q2_K
-      - attn_output.weight — llama.cpp promotes to Q3_K for Q2_K
-      - inp_gate, proj — Gemma 4 Delta Net recurrence (small, sensitive)
-      - layer_output_scale — per-layer scaling factor
+      - layer_output_scale — per-layer scaling factor (scalar)
       - altup, laurel — small Gemma-specific tensors
     """
     n_elements = 1
@@ -425,21 +551,6 @@ def should_quantize(name, n_dims, dims):
     if 'altup' in name or 'laurel' in name:
         return False
     if 'layer_output_scale' in name:
-        return False
-    # ── Tensors that llama.cpp promotes above Q2_K ──
-    # Since we only support Q2_K and it's too lossy for these,
-    # keep them in original precision.
-    if 'attn_v.weight' in name:
-        return False
-    if 'ffn_down.weight' in name:
-        return False
-    if 'attn_output.weight' in name:
-        return False
-    # ── Gemma 4 Delta Net / recurrent gating tensors ──
-    # These are small and sensitive to quantization.
-    if 'inp_gate.weight' in name:
-        return False
-    if '.proj.weight' in name and 'ffn' not in name and 'attn' not in name:
         return False
     # Skip vision/audio encoder tensors
     if 'v.' in name and name.startswith('v.'):
@@ -469,6 +580,18 @@ def main():
     keep_metadata = '--keep-metadata' in sys.argv
     quantize_none = '--quantize-none' in sys.argv
 
+    # Check for imatrix
+    imatrix_data = None
+    for i, arg in enumerate(sys.argv):
+        if arg == '--imatrix' and i + 1 < len(sys.argv):
+            imat_path = sys.argv[i + 1]
+            if os.path.exists(imat_path):
+                imatrix_data = read_imatrix(imat_path)
+                print(f"  Loaded imatrix: {len(imatrix_data)} tensors from {imat_path}")
+            else:
+                print(f"  WARNING: imatrix file not found: {imat_path}")
+            break
+
     # Check for HPC C library
     use_hpc = _load_hexstate_lib() is not None
 
@@ -476,7 +599,9 @@ def main():
     print("  ╔════════════════════════════════════════════════════════════════╗")
     print("  ║  HExState GGUF Re-Quantizer                                  ║")
     print("  ║  GGUF → Q2_K GGUF with metadata passthrough                  ║")
-    if use_hpc:
+    if use_hpc and imatrix_data:
+        print("  ║  Engine: HPC + iMatrix (calibrated sensitivity propagation)  ║")
+    elif use_hpc:
         print("  ║  Engine: HPC (BP + MSE Grid + Sensitivity Propagation)       ║")
     else:
         print("  ║  Engine: Python (numpy vectorized)                           ║")
@@ -745,7 +870,15 @@ def main():
 
                     # Quantize to Q2_K (HPC C library or Python fallback)
                     if use_hpc:
-                        q2k_data, n_blocks = quantize_tensor_q2k_hpc(f32, opt_mode=2)
+                        # Look up imatrix importance for this tensor
+                        imat_weights = None
+                        if imatrix_data and ti['name'] in imatrix_data:
+                            iw = imatrix_data[ti['name']]
+                            # imatrix has per-column importance; tile to match tensor
+                            n_cols = iw.shape[0]
+                            n_rows = ti['n_elements'] // n_cols if n_cols > 0 else 1
+                            imat_weights = np.tile(iw, n_rows)[:ti['n_elements']]
+                        q2k_data, n_blocks = quantize_tensor_q2k_hpc(f32, opt_mode=2, importance=imat_weights)
                     else:
                         q2k_data, n_blocks = quantize_tensor_q2k(f32)
                     fout.write(q2k_data)
