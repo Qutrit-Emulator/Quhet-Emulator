@@ -17,7 +17,91 @@ import sys
 import time
 import os
 import io
+import ctypes
 import numpy as np
+
+# ─── HExState C Library (HPC-optimized Q2_K quantization) ──────────────────
+_HEXSTATE_LIB = None
+
+def _load_hexstate_lib():
+    """Try to load the HExState C shared library for HPC-optimized quantization."""
+    global _HEXSTATE_LIB
+    if _HEXSTATE_LIB is not None:
+        return _HEXSTATE_LIB
+
+    lib_dir = os.path.dirname(os.path.abspath(__file__))
+    lib_path = os.path.join(lib_dir, "libhexstate_q2k.so")
+
+    if not os.path.exists(lib_path):
+        return None
+
+    try:
+        lib = ctypes.CDLL(lib_path)
+
+        # void hexstate_init(void)
+        lib.hexstate_init.restype = None
+        lib.hexstate_init.argtypes = []
+
+        # void hexstate_quantize_tensor_q2k(const float*, int64_t, void*, float*, int, int)
+        lib.hexstate_quantize_tensor_q2k.restype = None
+        lib.hexstate_quantize_tensor_q2k.argtypes = [
+            ctypes.POINTER(ctypes.c_float),  # weights
+            ctypes.c_int64,                   # n_elements
+            ctypes.c_void_p,                  # output
+            ctypes.POINTER(ctypes.c_float),   # out_error
+            ctypes.c_int,                     # opt_mode (0=HPC, 1=MSE, 2=Hybrid)
+            ctypes.c_int,                     # verbose
+        ]
+
+        lib.hexstate_q2k_block_bytes.restype = ctypes.c_int
+        lib.hexstate_q2k_block_bytes.argtypes = []
+        lib.hexstate_q2k_block_elements.restype = ctypes.c_int
+        lib.hexstate_q2k_block_elements.argtypes = []
+
+        lib.hexstate_init()
+        _HEXSTATE_LIB = lib
+        return lib
+    except Exception as e:
+        print(f"  WARNING: Failed to load HExState library: {e}")
+        return None
+
+
+def quantize_tensor_q2k_hpc(f32_data, opt_mode=2):
+    """Quantize tensor using HExState HPC-optimized C implementation.
+
+    opt_mode: 0=HPC (BP only), 1=MSE (grid search), 2=Hybrid (recommended)
+    Returns: (bytes, n_blocks) same as quantize_tensor_q2k()
+    """
+    lib = _load_hexstate_lib()
+    if lib is None:
+        raise RuntimeError("HExState library not available")
+
+    n_elements = len(f32_data)
+    if n_elements % QK_K != 0:
+        pad_len = QK_K - (n_elements % QK_K)
+        f32_data = np.concatenate([f32_data, np.zeros(pad_len, dtype=np.float32)])
+        n_elements = len(f32_data)
+
+    n_blocks = n_elements // QK_K
+    block_bytes = lib.hexstate_q2k_block_bytes()  # 84
+
+    # Allocate output buffer
+    output = np.zeros(n_blocks * block_bytes, dtype=np.uint8)
+    error = ctypes.c_float(0.0)
+
+    # Call C quantizer
+    f32_contiguous = np.ascontiguousarray(f32_data, dtype=np.float32)
+    lib.hexstate_quantize_tensor_q2k(
+        f32_contiguous.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        ctypes.c_int64(n_elements),
+        output.ctypes.data_as(ctypes.c_void_p),
+        ctypes.byref(error),
+        ctypes.c_int(opt_mode),
+        ctypes.c_int(0),  # not verbose
+    )
+
+    return output.tobytes(), n_blocks
+
 
 # ─── Constants ──────────────────────────────────────────────────────────────
 GGUF_MAGIC = 0x46554747
@@ -385,10 +469,17 @@ def main():
     keep_metadata = '--keep-metadata' in sys.argv
     quantize_none = '--quantize-none' in sys.argv
 
+    # Check for HPC C library
+    use_hpc = _load_hexstate_lib() is not None
+
     print()
     print("  ╔════════════════════════════════════════════════════════════════╗")
     print("  ║  HExState GGUF Re-Quantizer                                  ║")
     print("  ║  GGUF → Q2_K GGUF with metadata passthrough                  ║")
+    if use_hpc:
+        print("  ║  Engine: HPC (BP + MSE Grid + Sensitivity Propagation)       ║")
+    else:
+        print("  ║  Engine: Python (numpy vectorized)                           ║")
     print("  ╚════════════════════════════════════════════════════════════════╝")
     print()
 
@@ -652,8 +743,11 @@ def main():
                             fout.write(b'\x00' * pad)
                         continue
 
-                    # Quantize to Q2_K
-                    q2k_data, n_blocks = quantize_tensor_q2k(f32)
+                    # Quantize to Q2_K (HPC C library or Python fallback)
+                    if use_hpc:
+                        q2k_data, n_blocks = quantize_tensor_q2k_hpc(f32, opt_mode=2)
+                    else:
+                        q2k_data, n_blocks = quantize_tensor_q2k(f32)
                     fout.write(q2k_data)
 
                     quant_count += 1
