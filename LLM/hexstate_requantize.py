@@ -121,9 +121,17 @@ def f32_to_bf16(f32_array):
     return bf16.tobytes()
 
 
-# ─── Q2_K quantization (fully vectorized numpy) ────────────────────────────
+# ─── Q2_K quantization — faithful port of ggml quantize_row_q2_K_ref ───────
+# Vectorized with numpy for performance. Uses make_qkx2_quants algorithm:
+# - Weighted MAD error with weights[i] = |x[i]|
+# - Joint scale+min least-squares solve
+# - 16-step grid search for initial iscale
+
 def quantize_tensor_q2k(f32_data):
-    """Quantize an entire tensor to Q2_K format using vectorized numpy.
+    """Quantize an entire tensor to Q2_K format.
+
+    Faithful vectorized port of ggml quantize_row_q2_K_ref with
+    make_qkx2_quants sub-block optimization.
 
     Q2_K block layout (84 bytes, must match ggml block_q2_K):
         d          : fp16 super-block scale
@@ -132,6 +140,8 @@ def quantize_tensor_q2k(f32_data):
         qs[64]     : interleaved 2-bit quants (4 weights 32-apart per byte)
     """
     n_elements = len(f32_data)
+    nmax = 3
+    q4scale = 15.0
 
     # Pad to QK_K (256) multiple
     if n_elements % QK_K != 0:
@@ -142,72 +152,177 @@ def quantize_tensor_q2k(f32_data):
     n_blocks = n_elements // QK_K
 
     # Reshape: [n_blocks, 16 sub-blocks, 16 weights]
-    data = f32_data.reshape(n_blocks, 16, 16)
+    data = f32_data.reshape(n_blocks, 16, 16).astype(np.float64)
 
-    # Per-sub-block min and range
-    sb_min = data.min(axis=2)           # [n_blocks, 16]
-    sb_max = data.max(axis=2)           # [n_blocks, 16]
-    sb_min = np.minimum(sb_min, 0.0)    # clamp min to <= 0 (ggml convention)
-    sb_range = sb_max - sb_min          # [n_blocks, 16]
+    # ── make_qkx2_quants vectorized over all sub-blocks ──
+    # Shape key: S = [n_blocks, 16], V = [n_blocks, 16, 16]
 
-    # Per-sub-block scale = range / nmax (nmax=3 for Q2_K, levels 0,1,2,3)
-    nmax = 3
-    sb_scale = sb_range / nmax          # [n_blocks, 16]
+    weights = np.abs(data)  # [n_blocks, 16, 16]
 
-    # Per-superblock global scale and min
-    d_scale = sb_scale.max(axis=1)      # [n_blocks]
-    d_min = (-sb_min).max(axis=1)       # [n_blocks]
+    sb_min = data.min(axis=2)  # [n_blocks, 16]
+    sb_max = data.max(axis=2)  # [n_blocks, 16]
+    sb_min = np.minimum(sb_min, 0.0)
 
-    # Avoid division by zero
-    d_scale = np.maximum(d_scale, 1e-10)
-    d_min = np.maximum(d_min, 1e-10)
+    # Weighted sums (needed for least-squares solve)
+    sum_w = weights.sum(axis=2)           # [n_blocks, 16]
+    sum_x = (weights * data).sum(axis=2)  # [n_blocks, 16]
 
-    # Quantize sub-block scales and mins to 4-bit (0-15 range, q4scale=15)
-    q4scale = 15.0
-    qscales = np.clip(np.round(q4scale * sb_scale / d_scale[:, None]), 0, 15).astype(np.uint8)
-    qmins = np.clip(np.round(q4scale * (-sb_min) / d_min[:, None]), 0, 15).astype(np.uint8)
+    sb_range = sb_max - sb_min
+    degenerate = sb_range < 1e-30  # [n_blocks, 16]
+    safe_range = np.maximum(sb_range, 1e-30)
 
-    # Pack: low 4 bits = scale, high 4 bits = min
-    scales_packed = qscales | (qmins << 4)  # [n_blocks, 16]
+    # Initial quantization
+    iscale0 = nmax / safe_range
+    scale0 = 1.0 / np.maximum(iscale0, 1e-30)
 
-    # Reconstruct actual per-sub-block scale and min (d stores max/15)
-    actual_scale = qscales.astype(np.float32) * (d_scale / q4scale)[:, None]
-    actual_min = qmins.astype(np.float32) * (d_min / q4scale)[:, None]
+    shifted0 = data - sb_min[:, :, None]  # [n_blocks, 16, 16]
+    L0 = np.clip(np.round(iscale0[:, :, None] * shifted0), 0, nmax).astype(np.float64)
 
-    # Quantize all weights to 2 bits: q = round((val + min) / scale)
-    inv_scale = np.where(actual_scale > 0, 1.0 / actual_scale, 0.0)  # [n_blocks, 16]
-    q_vals = np.round((data + actual_min[:, :, None]) * inv_scale[:, :, None])
-    q_vals = np.clip(q_vals, 0, 3).astype(np.uint8)  # [n_blocks, 16, 16]
+    # Initial error (MAD): sum(w * |scale*L + min - x|)
+    recon0 = scale0[:, :, None] * L0 + sb_min[:, :, None]
+    best_error = (weights * np.abs(recon0 - data)).sum(axis=2)  # [n_blocks, 16]
 
-    # Flatten sub-blocks: [n_blocks, 256]
+    best_L = L0.copy()
+    best_scale = scale0.copy()
+    best_min = sb_min.copy()
+
+    # Grid search: 16 steps (nstep=15, rmin=-0.5, rdelta=0.1)
+    rmin, rdelta, nstep = -0.5, 0.1, 15
+    for ist in range(nstep + 1):
+        iscale_try = (rmin + rdelta * ist + nmax) / safe_range  # [n_blocks, 16]
+
+        shifted = data - sb_min[:, :, None]  # use original min for quantization
+        Laux = np.clip(np.round(iscale_try[:, :, None] * shifted), 0, nmax).astype(np.float64)
+
+        # Weighted sums for least-squares solve
+        wL = weights * Laux  # [n_blocks, 16, 16]
+        sum_l = wL.sum(axis=2)            # [n_blocks, 16]
+        sum_l2 = (wL * Laux).sum(axis=2)  # [n_blocks, 16]
+        sum_xl = (wL * data).sum(axis=2)  # [n_blocks, 16]
+
+        # Solve 2-var system: x[i] ≈ this_scale * L[i] + this_min
+        D = sum_w * sum_l2 - sum_l * sum_l
+        valid_D = D > 0
+
+        this_scale = np.where(valid_D,
+                              (sum_w * sum_xl - sum_x * sum_l) / np.maximum(D, 1e-30),
+                              0.0)
+        this_min = np.where(valid_D,
+                            (sum_l2 * sum_x - sum_l * sum_xl) / np.maximum(D, 1e-30),
+                            0.0)
+
+        # If this_min > 0, clamp to 0 and recompute scale
+        pos_min = this_min > 0
+        this_min = np.where(pos_min, 0.0, this_min)
+        this_scale = np.where(pos_min & (sum_l2 > 0),
+                              sum_xl / np.maximum(sum_l2, 1e-30),
+                              this_scale)
+
+        # Compute error for this trial
+        recon = this_scale[:, :, None] * Laux + this_min[:, :, None]
+        cur_error = (weights * np.abs(recon - data)).sum(axis=2)
+
+        # Update where this trial is better
+        better = valid_D & (cur_error < best_error) & ~degenerate
+        if better.any():
+            # Expand mask to weight dimension for L update
+            better3d = better[:, :, None]
+            best_L = np.where(better3d, Laux, best_L)
+            best_error = np.where(better, cur_error, best_error)
+            best_scale = np.where(better, this_scale, best_scale)
+            best_min = np.where(better, this_min, best_min)
+
+    # the_min = -best_min (make positive)
+    sb_scale = np.maximum(best_scale, 0.0).astype(np.float32)  # [n_blocks, 16]
+    sb_the_min = np.maximum(-best_min, 0.0).astype(np.float32)  # [n_blocks, 16]
+
+    # Handle degenerate sub-blocks
+    sb_scale[degenerate] = 0.0
+    sb_the_min[degenerate] = np.maximum(-sb_min[degenerate], 0.0).astype(np.float32)
+
+    # ── Phase 2: quantize scales/mins to 4-bit ──
+    max_scale = sb_scale.max(axis=1)     # [n_blocks]
+    max_min = sb_the_min.max(axis=1)     # [n_blocks]
+
+    # Quantize sub-block scales to 4-bit
+    has_scale = max_scale > 0
+    iscale_s = np.where(has_scale, q4scale / np.maximum(max_scale, 1e-30), 0.0)
+    scales_q = np.where(has_scale[:, None],
+                        np.clip(np.round(iscale_s[:, None] * sb_scale), 0, 15),
+                        0.0).astype(np.uint8)
+
+    # Quantize sub-block mins to 4-bit
+    has_min = max_min > 0
+    iscale_m = np.where(has_min, q4scale / np.maximum(max_min, 1e-30), 0.0)
+    mins_q = np.where(has_min[:, None],
+                      np.clip(np.round(iscale_m[:, None] * sb_the_min), 0, 15),
+                      0.0).astype(np.uint8)
+
+    d_fp16 = np.where(has_scale, max_scale / q4scale, 0.0).astype(np.float16)
+    dmin_fp16 = np.where(has_min, max_min / q4scale, 0.0).astype(np.float16)
+
+    # ── Phase 3: requantize using fp16-truncated d/dmin ──
+    scales_packed = scales_q | (mins_q << 4)  # [n_blocks, 16]
+
+    d_f32 = d_fp16.astype(np.float32)
+    dmin_f32 = dmin_fp16.astype(np.float32)
+
+    d_sub = d_f32[:, None] * (scales_packed & 0xF).astype(np.float32)
+    dm_sub = dmin_f32[:, None] * (scales_packed >> 4).astype(np.float32)
+
+    # l = nearest_int((x + dm) / d), clamp [0,3]
+    valid_d = d_sub > 0
+    inv_d = np.where(valid_d, 1.0 / np.maximum(d_sub, 1e-30), 0.0)
+    q_vals = np.where(valid_d[:, :, None],
+                      np.clip(np.round(
+                          (f32_data.reshape(n_blocks, 16, 16) + dm_sub[:, :, None]) * inv_d[:, :, None]
+                      ), 0, 3),
+                      0).astype(np.uint8)
+
+    # ── Phase 4: pack ──
     q_flat = q_vals.reshape(n_blocks, QK_K)
-
-    # Pack in ggml interleaved format: 2 groups of 128 weights, each into 32 bytes
-    # qs[l] = L[l] | (L[l+32]<<2) | (L[l+64]<<4) | (L[l+96]<<6)
-    q_groups = q_flat.reshape(n_blocks, 2, 4, 32)  # [n_blocks, 2 groups, 4 shifts, 32 positions]
+    q_groups = q_flat.reshape(n_blocks, 2, 4, 32)
     qs_packed = (q_groups[:, :, 0, :] |
                  (q_groups[:, :, 1, :] << 2) |
                  (q_groups[:, :, 2, :] << 4) |
                  (q_groups[:, :, 3, :] << 6)).astype(np.uint8)
     qs_packed = qs_packed.reshape(n_blocks, 64)
 
-    # Convert d and dmin to fp16 (stored as max_scale/15 per ggml convention)
-    d_fp16 = (d_scale / q4scale).astype(np.float16)
-    dmin_fp16 = (d_min / q4scale).astype(np.float16)
-
     # Build output: [n_blocks, 84] bytes
-    # ggml block_q2_K layout: d(2) + dmin(2) + scales(16) + qs(64)
+    # Layout matches ggml block_q2_K: scales[16] | qs[64] | d(fp16) | dmin(fp16)
     result = np.zeros((n_blocks, 84), dtype=np.uint8)
-    result[:, 0:2]   = d_fp16.view(np.uint8).reshape(n_blocks, 2)
-    result[:, 2:4]   = dmin_fp16.view(np.uint8).reshape(n_blocks, 2)
-    result[:, 4:20]  = scales_packed
-    result[:, 20:84] = qs_packed
+    result[:, 0:16] = scales_packed
+    result[:, 16:80] = qs_packed
+    result[:, 80:82] = d_fp16.view(np.uint8).reshape(n_blocks, 2)
+    result[:, 82:84] = dmin_fp16.view(np.uint8).reshape(n_blocks, 2)
 
     return result.tobytes(), n_blocks
 
 
-def should_quantize(name, n_dims, n_elements):
-    """Should this tensor be quantized to Q2_K?"""
+def should_quantize(name, n_dims, dims):
+    """Should this tensor be quantized to Q2_K?
+
+    Matches llama.cpp's tensor_allows_quantization plus the Q2_K-specific
+    type promotions from llama_tensor_get_type_impl. Since our quantizer
+    only supports Q2_K (which is too lossy for certain sensitive tensors),
+    we keep those tensors in their original precision.
+
+    Tensors kept as-is:
+      - 1D tensors (norms, biases) — always kept
+      - token_embd, output.weight — embeddings
+      - _norm, .bias — normalization
+      - ffn_gate_inp — MoE routing gate
+      - per_layer_model_proj — Gemma 4 layer proj (too small)
+      - attn_v.weight — llama.cpp promotes to Q4_K for Q2_K
+      - ffn_down.weight — llama.cpp promotes to Q3_K for Q2_K
+      - attn_output.weight — llama.cpp promotes to Q3_K for Q2_K
+      - inp_gate, proj — Gemma 4 Delta Net recurrence (small, sensitive)
+      - layer_output_scale — per-layer scaling factor
+      - altup, laurel — small Gemma-specific tensors
+    """
+    n_elements = 1
+    for d in dims:
+        n_elements *= d
     if n_dims < 2:
         return False
     if 'token_embd' in name or 'embed_tokens' in name:
@@ -220,6 +335,28 @@ def should_quantize(name, n_dims, n_elements):
         return False
     if 'ffn_gate_inp' in name:
         return False
+    # ── Tensors that llama.cpp never quantizes ──
+    if 'per_layer_model_proj' in name:
+        return False
+    if 'altup' in name or 'laurel' in name:
+        return False
+    if 'layer_output_scale' in name:
+        return False
+    # ── Tensors that llama.cpp promotes above Q2_K ──
+    # Since we only support Q2_K and it's too lossy for these,
+    # keep them in original precision.
+    if 'attn_v.weight' in name:
+        return False
+    if 'ffn_down.weight' in name:
+        return False
+    if 'attn_output.weight' in name:
+        return False
+    # ── Gemma 4 Delta Net / recurrent gating tensors ──
+    # These are small and sensitive to quantization.
+    if 'inp_gate.weight' in name:
+        return False
+    if '.proj.weight' in name and 'ffn' not in name and 'attn' not in name:
+        return False
     # Skip vision/audio encoder tensors
     if 'v.' in name and name.startswith('v.'):
         return False
@@ -231,16 +368,22 @@ def should_quantize(name, n_dims, n_elements):
     # Must be divisible by QK_K
     if n_elements % QK_K != 0:
         return False
+    # Row dimension (dims[0] in GGUF) must be divisible by QK_K
+    # This catches MoE expert tensors with row width like 704
+    if dims[0] % QK_K != 0:
+        return False
     return True
 
 
 def main():
     if len(sys.argv) < 3:
-        print("Usage: python3 hexstate_requantize.py <input.gguf> <output.gguf>")
+        print("Usage: python3 hexstate_requantize.py <input.gguf> <output.gguf> [--keep-metadata]")
         sys.exit(1)
 
     input_path = sys.argv[1]
     output_path = sys.argv[2]
+    keep_metadata = '--keep-metadata' in sys.argv
+    quantize_none = '--quantize-none' in sys.argv
 
     print()
     print("  ╔════════════════════════════════════════════════════════════════╗")
@@ -311,7 +454,7 @@ def main():
         total_quant = 0
         total_keep = 0
         for ti in tensor_infos:
-            will_quant = should_quantize(ti['name'], ti['n_dims'], ti['n_elements'])
+            will_quant = False if quantize_none else should_quantize(ti['name'], ti['n_dims'], ti['dims'])
             quant_plan.append(will_quant)
             if will_quant:
                 total_quant += 1
@@ -348,94 +491,98 @@ def main():
             out_data_offset += out_size
             out_data_offset = align_offset(out_data_offset)
 
-        # ── Update file_type KV if present ──
-        # file_type=10 means Q2_K in llama.cpp
+        # ── Update KV pairs ──
         updated_kv = []
-        for key, vtype, raw_value in kv_pairs:
-            if key == 'general.file_type' and vtype == 4:  # UINT32
-                updated_kv.append((key, vtype, struct.pack('<I', 10)))
-            elif key == 'general.quantization_version' and vtype == 4:
-                updated_kv.append((key, vtype, struct.pack('<I', 2)))
-            elif key == 'tokenizer.ggml.token_type' and vtype == 9:
-                # ── Fix Gemma 4 token types ──
-                # convert_hf_to_gguf.py incorrectly marks control tokens as
-                # NORMAL (1), causing llama.cpp to sample them (e.g. <unused24>
-                # spam). Fix: read the tokens array to find control-looking
-                # tokens, then patch their types to CONTROL (3).
-                # See: https://github.com/ggml-org/llama.cpp/issues/21321
-                tokens_kv = next((v for k, vt, v in kv_pairs
-                                  if k == 'tokenizer.ggml.tokens' and vt == 9), None)
-                token_names = []
-                if tokens_kv:
-                    bio = io.BytesIO(tokens_kv)
-                    arr_type = struct.unpack('<I', bio.read(4))[0]
-                    arr_len = struct.unpack('<Q', bio.read(8))[0]
-                    for _ in range(arr_len):
-                        slen = struct.unpack('<Q', bio.read(8))[0]
-                        token_names.append(bio.read(slen).decode('utf-8', errors='replace'))
+        if keep_metadata:
+            print("  --keep-metadata: passing through ALL KV pairs unchanged")
+            updated_kv = list(kv_pairs)
+        else:
+            for key, vtype, raw_value in kv_pairs:
+                if key == 'general.file_type' and vtype == 4:  # UINT32
+                    # file_type=10 means Q2_K in llama.cpp
+                    updated_kv.append((key, vtype, struct.pack('<I', 10)))
+                elif key == 'general.quantization_version' and vtype == 4:
+                    updated_kv.append((key, vtype, struct.pack('<I', 2)))
+                elif key == 'tokenizer.ggml.token_type' and vtype == 9:
+                    # ── Fix Gemma 4 token types ──
+                    # convert_hf_to_gguf.py incorrectly marks control tokens as
+                    # NORMAL (1), causing llama.cpp to sample them (e.g. <unused24>
+                    # spam). Fix: read the tokens array to find control-looking
+                    # tokens, then patch their types to CONTROL (3).
+                    # See: https://github.com/ggml-org/llama.cpp/issues/21321
+                    tokens_kv = next((v for k, vt, v in kv_pairs
+                                      if k == 'tokenizer.ggml.tokens' and vt == 9), None)
+                    token_names = []
+                    if tokens_kv:
+                        bio = io.BytesIO(tokens_kv)
+                        arr_type = struct.unpack('<I', bio.read(4))[0]
+                        arr_len = struct.unpack('<Q', bio.read(8))[0]
+                        for _ in range(arr_len):
+                            slen = struct.unpack('<Q', bio.read(8))[0]
+                            token_names.append(bio.read(slen).decode('utf-8', errors='replace'))
 
-                # Parse the token_type array
-                bio2 = io.BytesIO(raw_value)
-                arr_type2 = struct.unpack('<I', bio2.read(4))[0]
-                arr_len2 = struct.unpack('<Q', bio2.read(8))[0]
-                ttypes = list(struct.unpack(f'<{arr_len2}i', bio2.read(arr_len2 * 4)))
+                    # Parse the token_type array
+                    bio2 = io.BytesIO(raw_value)
+                    arr_type2 = struct.unpack('<I', bio2.read(4))[0]
+                    arr_len2 = struct.unpack('<Q', bio2.read(8))[0]
+                    ttypes = list(struct.unpack(f'<{arr_len2}i', bio2.read(arr_len2 * 4)))
 
-                # Patch control-looking tokens
-                n_fixed = 0
-                CONTROL_TYPE = 3
-                import re
-                for i, tname in enumerate(token_names):
-                    if ttypes[i] == CONTROL_TYPE:
-                        continue  # already correct
-                    if ttypes[i] == 6:
-                        continue  # BYTE type — leave as-is
-                    # Only fix tokens that are genuine control/special tokens:
-                    # - <eos>, <bos>, <unk>, <mask>, </s> — sentence markers
-                    # - <|turn>, <turn|>, <|tool_*|> etc — delimiters
-                    # NOTE: do NOT mark <unused*> as CONTROL — Gemma 4 uses
-                    # these tokens internally for thinking/channel markers
-                    # (e.g. <unused24> = <|channel>). The llama.cpp parser
-                    # handles them via the peg-gemma4 format instead.
-                    is_control = False
-                    if tname in ('<eos>', '<bos>', '<unk>', '<mask>', '</s>',
-                                 '<pad>', '<s>'):
-                        is_control = True
-                    elif re.match(r'^<\|.*\|?>$', tname) or re.match(r'^<.*\|>$', tname):
-                        is_control = True
-                    if is_control and ttypes[i] != CONTROL_TYPE:
-                        ttypes[i] = CONTROL_TYPE
-                        n_fixed += 1
+                    # Patch control-looking tokens
+                    n_fixed = 0
+                    CONTROL_TYPE = 3
+                    import re
+                    for i, tname in enumerate(token_names):
+                        if ttypes[i] == CONTROL_TYPE:
+                            continue  # already correct
+                        if ttypes[i] == 6:
+                            continue  # BYTE type — leave as-is
+                        # Only fix tokens that are genuine control/special tokens:
+                        # - <eos>, <bos>, <unk>, <mask>, </s> — sentence markers
+                        # - <|turn>, <turn|>, <|tool_*|> etc — delimiters
+                        # NOTE: do NOT mark <unused*> as CONTROL — Gemma 4 uses
+                        # these tokens internally for thinking/channel markers
+                        # (e.g. <unused24> = <|channel>). The llama.cpp parser
+                        # handles them via the peg-gemma4 format instead.
+                        is_control = False
+                        if tname in ('<eos>', '<bos>', '<unk>', '<mask>', '</s>',
+                                     '<pad>', '<s>'):
+                            is_control = True
+                        elif re.match(r'^<\|.*\|?>$', tname) or re.match(r'^<.*\|>$', tname):
+                            is_control = True
+                        if is_control and ttypes[i] != CONTROL_TYPE:
+                            ttypes[i] = CONTROL_TYPE
+                            n_fixed += 1
 
-                print(f"  Fixed {n_fixed} token types to CONTROL (Gemma 4 <unused> fix)")
+                    print(f"  Fixed {n_fixed} token types to CONTROL (Gemma 4 <unused> fix)")
 
-                # Rebuild the raw value
-                new_raw = struct.pack('<I', arr_type2)
-                new_raw += struct.pack('<Q', arr_len2)
-                new_raw += struct.pack(f'<{arr_len2}i', *ttypes)
-                updated_kv.append((key, vtype, new_raw))
-            elif key == 'tokenizer.chat_template' and vtype == 8:
-                # ── Replace chat template with fixed Gemma 4 template ──
-                # The HF-exported template doesn't handle thinking mode, causing
-                # the model to emit <unused24> tokens. The fixed template from
-                # llama.cpp PR #21418 pre-fills an empty thought block when
-                # thinking is disabled: <|channel>thought\n<channel|>
-                # See: https://github.com/ggml-org/llama.cpp/pull/21418
-                script_dir = os.path.dirname(os.path.abspath(__file__))
-                workspace_dir = os.path.dirname(script_dir)
-                template_path = os.path.join(workspace_dir, 'llama-cpp-latest',
-                    'models', 'templates', 'google-gemma-4-31B-it.jinja')
-                if os.path.exists(template_path):
-                    with open(template_path, 'r') as tf:
-                        new_template = tf.read()
-                    new_raw = struct.pack('<Q', len(new_template.encode('utf-8')))
-                    new_raw += new_template.encode('utf-8')
+                    # Rebuild the raw value
+                    new_raw = struct.pack('<I', arr_type2)
+                    new_raw += struct.pack('<Q', arr_len2)
+                    new_raw += struct.pack(f'<{arr_len2}i', *ttypes)
                     updated_kv.append((key, vtype, new_raw))
-                    print(f"  Replaced chat template with fixed Gemma 4 template ({len(new_template)} chars)")
+                elif key == 'tokenizer.chat_template' and vtype == 8:
+                    # ── Replace chat template with fixed Gemma 4 template ──
+                    # The HF-exported template doesn't handle thinking mode, causing
+                    # the model to emit <unused24> tokens. The fixed template from
+                    # llama.cpp PR #21418 pre-fills an empty thought block when
+                    # thinking is disabled: <|channel>thought\n<channel|>
+                    # See: https://github.com/ggml-org/llama.cpp/pull/21418
+                    script_dir = os.path.dirname(os.path.abspath(__file__))
+                    workspace_dir = os.path.dirname(script_dir)
+                    template_path = os.path.join(workspace_dir, 'llama-cpp-latest',
+                        'models', 'templates', 'google-gemma-4-31B-it.jinja')
+                    if os.path.exists(template_path):
+                        with open(template_path, 'r') as tf:
+                            new_template = tf.read()
+                        new_raw = struct.pack('<Q', len(new_template.encode('utf-8')))
+                        new_raw += new_template.encode('utf-8')
+                        updated_kv.append((key, vtype, new_raw))
+                        print(f"  Replaced chat template with fixed Gemma 4 template ({len(new_template)} chars)")
+                    else:
+                        print(f"  WARNING: Fixed template not found at {template_path}, keeping original")
+                        updated_kv.append((key, vtype, raw_value))
                 else:
-                    print(f"  WARNING: Fixed template not found at {template_path}, keeping original")
                     updated_kv.append((key, vtype, raw_value))
-            else:
-                updated_kv.append((key, vtype, raw_value))
 
         # ── Write output GGUF ──
         print("  Writing output GGUF...")
