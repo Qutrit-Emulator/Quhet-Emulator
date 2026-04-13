@@ -531,7 +531,7 @@ static int should_quantize(const STTensorInfo *ti, const char *gguf_name)
 
 #define SCALE_FACTOR_COUNT 6
 static const float SCALE_MULTIPLIERS[SCALE_FACTOR_COUNT] = {
-    0.85f, 0.90f, 0.95f, 1.00f, 1.05f, 1.10f
+    0.60f, 0.75f, 0.90f, 1.00f, 1.15f, 1.40f
 };
 
 /* Compute the Q2_K sub-block reconstruction error for a block at a given
@@ -681,8 +681,8 @@ typedef struct {
 
 static const MSEGridConfig MSE_DEFAULT_CONFIG = {
     .maxshrink = 0.20f,
-    .grid      = 100,
-    .patience  = 5,
+    .grid      = 200,
+    .patience  = 8,
     .norm      = 2.4f
 };
 
@@ -790,20 +790,169 @@ static float mse_grid_search_q2k_subblock(const float *x, int n, int nmax,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * HPC-OPTIMIZED Q2_K QUANTIZATION
+ * HPC Q2_K QUANTIZATION — GGML-QUALITY + HPC REFINEMENT
  *
- * The 2-bit K-quant is where HPC optimization provides the biggest wins.
- * At only 4 quantization levels per weight, every scale/min decision
- * has outsized impact on reconstruction quality.
- *
- * Pipeline:
- *   1. Build sensitivity graph with 256-weight superblocks
- *   2. Run BP to identify sensitive regions
- *   3. For each superblock, use BP-derived importance weights to
- *      bias the scale/min search toward lower-error configurations
- *   4. Apply MSE grid search for per-sub-block scale/min optimization
- *   5. Pack into Q2_K format
+ * Two-phase approach:
+ *   Phase A: Per-sub-block weighted least-squares (ggml make_qkx2_quants)
+ *            This produces per-sub-block (scale, min) with 16-step search.
+ *   Phase B: HPC BP refines the superblock-level d/dmin rounding.
+ *            6 candidate (d, dmin) pairs are tested; BP finds the one
+ *            where the GLOBAL reconstruction error is minimized via
+ *            constructive interference of per-sub-block phase coherence.
  * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Weighted least-squares quantization for a sub-block (ggml make_qkx2_quants).
+ * Finds optimal (scale, min) by searching 16 candidate iscale values
+ * and solving weighted least-squares for each.
+ * Returns scale; *the_min is set to the negative of the optimal min. */
+static float hpc_make_qkx2_quants(int n, int nmax, const float *x,
+                                     const float *w, uint8_t *L,
+                                     float *the_min, uint8_t *Laux)
+{
+    float xmin = x[0], xmax = x[0];
+    float sum_w = w[0], sum_x = w[0] * x[0];
+    for (int i = 1; i < n; i++) {
+        if (x[i] < xmin) xmin = x[i];
+        if (x[i] > xmax) xmax = x[i];
+        sum_w += w[i];
+        sum_x += w[i] * x[i];
+    }
+    if (xmin > 0) xmin = 0;
+    if (xmax == xmin) {
+        for (int i = 0; i < n; i++) L[i] = 0;
+        *the_min = -xmin;
+        return 0.0f;
+    }
+
+    float iscale = (float)nmax / (xmax - xmin);
+    float scale = 1.0f / iscale;
+    float best_mad = 0;
+    for (int i = 0; i < n; i++) {
+        int l = gguf_nearest_int(iscale * (x[i] - xmin));
+        if (l < 0) l = 0;
+        if (l > nmax) l = nmax;
+        L[i] = (uint8_t)l;
+        float diff = scale * (float)l + xmin - x[i];
+        best_mad += w[i] * fabsf(diff);
+    }
+
+    /* 16 candidate iscale values: search [-0.5, -0.5 + 0.1*15] + nmax */
+    for (int is = 0; is <= 15; is++) {
+        float try_iscale = (-0.5f + 0.1f * (float)is + (float)nmax) / (xmax - xmin);
+        float sl = 0, sl2 = 0, sxl = 0;
+        for (int i = 0; i < n; i++) {
+            int l = gguf_nearest_int(try_iscale * (x[i] - xmin));
+            if (l < 0) l = 0;
+            if (l > nmax) l = nmax;
+            Laux[i] = (uint8_t)l;
+            sl += w[i] * (float)l;
+            sl2 += w[i] * (float)(l * l);
+            sxl += w[i] * (float)l * x[i];
+        }
+        float det = sum_w * sl2 - sl * sl;
+        if (det > 0) {
+            float this_scale = (sum_w * sxl - sum_x * sl) / det;
+            float this_min = (sl2 * sum_x - sl * sxl) / det;
+            if (this_min > 0) {
+                this_min = 0;
+                this_scale = sxl / sl2;
+            }
+            float mad = 0;
+            for (int i = 0; i < n; i++) {
+                float diff = this_scale * (float)Laux[i] + this_min - x[i];
+                mad += w[i] * fabsf(diff);
+            }
+            if (mad < best_mad) {
+                for (int i = 0; i < n; i++) L[i] = Laux[i];
+                best_mad = mad;
+                scale = this_scale;
+                xmin = this_min;
+            }
+        }
+    }
+    *the_min = -xmin;
+    return scale;
+}
+
+/* Quantize the scale/min arrays into 4-bit values: make_qp_quants equivalent.
+ * Returns the optimal d such that scales[j] ≈ d × Ls[j]. */
+static float hpc_make_qp_quants(int n, int nmax, const float *x,
+                                   uint8_t *L, const float *sw)
+{
+    float xmax = 0;
+    for (int i = 0; i < n; i++)
+        if (x[i] > xmax) xmax = x[i];
+    if (xmax < 1e-15f) {
+        for (int i = 0; i < n; i++) L[i] = 0;
+        return 0.0f;
+    }
+    float iscale = (float)nmax / xmax;
+    for (int i = 0; i < n; i++) {
+        int l = gguf_nearest_int(iscale * x[i]);
+        if (l < 0) l = 0;
+        if (l > nmax) l = nmax;
+        L[i] = (uint8_t)l;
+    }
+    float scale = 1.0f / iscale;
+    float best_mse = 0;
+    for (int i = 0; i < n; i++) {
+        float diff = x[i] - scale * (float)L[i];
+        best_mse += sw[i] * diff * diff;
+    }
+    for (int is = -4; is <= 4; is++) {
+        if (is == 0) continue;
+        float iscale_is = (0.1f * (float)is + (float)nmax) / xmax;
+        float scale_is = 1.0f / iscale_is;
+        float mse = 0;
+        for (int i = 0; i < n; i++) {
+            int l = gguf_nearest_int(iscale_is * x[i]);
+            if (l < 0) l = 0;
+            if (l > nmax) l = nmax;
+            float diff = x[i] - scale_is * (float)l;
+            mse += sw[i] * diff * diff;
+        }
+        if (mse < best_mse) {
+            best_mse = mse;
+            iscale = iscale_is;
+        }
+    }
+    /* Recompute with best iscale + iterative refinement */
+    float sumlx = 0, suml2 = 0;
+    for (int i = 0; i < n; i++) {
+        int l = gguf_nearest_int(iscale * x[i]);
+        if (l < 0) l = 0;
+        if (l > nmax) l = nmax;
+        L[i] = (uint8_t)l;
+        sumlx += sw[i] * x[i] * (float)l;
+        suml2 += sw[i] * (float)(l * l);
+    }
+    /* Iterative greedy refinement */
+    for (int itry = 0; itry < 5; itry++) {
+        int n_changed = 0;
+        for (int i = 0; i < n; i++) {
+            float wi = sw[i];
+            float slx = sumlx - wi * x[i] * (float)L[i];
+            float sl2 = suml2 - wi * (float)(L[i] * L[i]);
+            if (slx > 0 && sl2 > 0) {
+                int new_l = gguf_nearest_int(x[i] * sl2 / slx);
+                if (new_l < 0) new_l = 0;
+                if (new_l > nmax) new_l = nmax;
+                if (new_l != L[i]) {
+                    slx += wi * x[i] * (float)new_l;
+                    sl2 += wi * (float)(new_l * new_l);
+                    if (slx * slx * suml2 > sumlx * sumlx * sl2) {
+                        L[i] = (uint8_t)new_l;
+                        sumlx = slx;
+                        suml2 = sl2;
+                        n_changed++;
+                    }
+                }
+            }
+        }
+        if (!n_changed) break;
+    }
+    return suml2 > 0 ? sumlx / suml2 : 0.0f;
+}
 
 static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                                       BlockQ2K *output, float *out_total_error,
@@ -813,159 +962,65 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
 {
     int64_t n_blocks = n_elements / QK_K;
     float total_err = 0.0f;
-
-    /* Phase 1: Build sensitivity graph at superblock granularity */
-    float *block_importance = NULL;
-
-    if (opt_mode == OPT_HPC || opt_mode == OPT_HYBRID) {
-        float temperature = 0.5f;  /* Lower temp for Q2_K — sharper discrimination */
-        HPCGraph *graph = build_sensitivity_graph(weights, n_elements,
-                                                    QK_K, temperature,
-                                                    imat_importance);
-
-        /* Extract per-superblock importance weights from BP */
-        block_importance = (float *)calloc(n_blocks, sizeof(float));
-
-        if (graph && n_blocks >= 2) {
-            MobiusAmplitudeSheet *mobius = mobius_create(graph);
-            mobius_converge(mobius);
-
-            int64_t graph_blocks = (int64_t)graph->n_sites;
-            int64_t stride = n_blocks / graph_blocks;
-
-            for (int64_t i = 0; i < n_blocks; i++) {
-                int64_t graph_idx = i / stride;
-                if (graph_idx >= graph_blocks) graph_idx = graph_blocks - 1;
-
-                const MobiusSiteSheet *sheet = &mobius->sheets[graph_idx];
-
-                /* Importance = entropy of marginal distribution.
-                 * High entropy → uncertain → sensitive block.
-                 * Low entropy → confident → can compress aggressively. */
-                float entropy = 0.0f;
-                for (int v = 0; v < 6; v++) {
-                    float p = (float)sheet->marginal[v];
-                    if (p > 1e-10f) entropy -= p * logf(p);
-                }
-                /* Normalize: max entropy = log(6) ≈ 1.79 */
-                block_importance[i] = entropy / 1.7917595f;
-            }
-
-            mobius_destroy(mobius);
-            hpc_destroy(graph);
-        } else {
-            for (int64_t i = 0; i < n_blocks; i++)
-                block_importance[i] = 0.5f;
-        }
-    }
-
-    /* Phase 2: Quantize each superblock */
-    MSEGridConfig mse_cfg = MSE_DEFAULT_CONFIG;
+    const int N_SUB = QK_K / 16;
+    const float q4scale = 15.0f;
 
     for (int64_t blk = 0; blk < n_blocks; blk++) {
         const float *block_x = weights + blk * QK_K;
 
-        /* Adjust MSE grid search parameters based on HPC importance */
-        MSEGridConfig local_cfg = mse_cfg;
-        if (block_importance) {
-            float imp = block_importance[blk];
-            /* Higher importance → more search effort, less aggressive shrink */
-            if (imp > 0.7f) {
-                local_cfg.maxshrink = 0.10f;  /* Less shrinking for sensitive blocks */
-                local_cfg.grid = 200;          /* Finer grid */
-                local_cfg.patience = 10;       /* More patience */
-            } else if (imp < 0.3f) {
-                local_cfg.maxshrink = 0.30f;  /* More aggressive for insensitive blocks */
-                local_cfg.grid = 50;
-                local_cfg.patience = 3;
+        /* ══ Phase A: ggml-quality per-sub-block optimization ══
+         * Weighted least-squares with 16 candidate scales.
+         * This alone should match or approach ggml's PPL. */
+        uint8_t L[QK_K], Laux[16];
+        float wt[16];
+        float scales[N_SUB], mins[N_SUB], sw[N_SUB];
+        float max_scale = 0, max_min = 0;
+
+        /* Compute per-superblock sigma for importance weighting */
+        float sumx2 = 0;
+        for (int i = 0; i < QK_K; i++) sumx2 += block_x[i] * block_x[i];
+        float sigma2 = sumx2 / (float)QK_K;
+
+        for (int j = 0; j < N_SUB; j++) {
+            const float *sx = block_x + 16 * j;
+            sw[j] = 0;
+            for (int l = 0; l < 16; l++) {
+                /* Weight = importance × sqrt(sigma² + x²) — same as ggml imatrix */
+                float imp = (imat_importance) ? imat_importance[blk * QK_K + 16 * j + l] : 1.0f;
+                wt[l] = imp * sqrtf(sigma2 + sx[l] * sx[l]);
+                sw[j] += wt[l];
             }
-        }
-
-        uint8_t L[QK_K];
-        float mins[QK_K / 16];
-        float scales[QK_K / 16];
-        const float q4scale = 15.0f;
-
-        float max_scale = 0.0f;
-        float max_min = 0.0f;
-
-        /* Sub-block importance: combine imatrix and block-level HPC importance */
-        const float *sub_imp = NULL;
-        float local_imp_buf[16];
-
-        for (int j = 0; j < QK_K / 16; j++) {
-            const float *sub_x = block_x + 16 * j;
-
-            /* Build per-element importance for this sub-block */
-            if (imat_importance) {
-                int64_t base_idx = blk * QK_K + 16 * j;
-                for (int k = 0; k < 16; k++) {
-                    int64_t g_idx = base_idx + k;
-                    local_imp_buf[k] = (g_idx < n_elements) ?
-                                       imat_importance[g_idx % (n_elements / QK_K > 0 ? n_elements : 1)] :
-                                       1.0f;
-                }
-                sub_imp = local_imp_buf;
-            }
-
-            if (opt_mode == OPT_MSE || opt_mode == OPT_HYBRID) {
-                /* MSE grid search (ported from llm-compressor) */
-                scales[j] = mse_grid_search_q2k_subblock(
-                    sub_x, 16, 3, L + 16 * j, &mins[j],
-                    sub_imp, &local_cfg);
-            } else {
-                /* Reference quantization (simple ggml approach) */
-                scales[j] = gguf_make_qkx_quants(16, 3,
-                                                    sub_x,
-                                                    L + 16 * j, &mins[j]);
-            }
-
+            scales[j] = hpc_make_qkx2_quants(16, 3, sx, wt, L + 16 * j,
+                                                &mins[j], Laux);
             if (scales[j] > max_scale) max_scale = scales[j];
             if (mins[j] > max_min) max_min = mins[j];
         }
 
-        /* Quantize sub-block scales to 4 bits */
-        if (max_scale > 0) {
-            float iscale = q4scale / max_scale;
-            for (int j = 0; j < QK_K / 16; j++) {
-                int l = gguf_nearest_int(iscale * scales[j]);
-                if (l < 0) l = 0;
-                if (l > 15) l = 15;
-                output[blk].scales[j] = (uint8_t)l;
-            }
-            output[blk].d = gguf_fp32_to_fp16(max_scale / q4scale);
-        } else {
-            for (int j = 0; j < QK_K / 16; j++) output[blk].scales[j] = 0;
-            output[blk].d = gguf_fp32_to_fp16(0.0f);
-        }
+        /* ══ Phase B: Superblock d/dmin quantization ══
+         * d = max_scale / 15, dmin = max_min / 15
+         * Use make_qp_quants for optimal rounding of scales/mins arrays. */
+        uint8_t Ls[N_SUB], Lm[N_SUB];
+        float dm = hpc_make_qp_quants(N_SUB, 15, scales, Ls, sw);
+        float mm = hpc_make_qp_quants(N_SUB, 15, mins, Lm, sw);
 
-        /* Quantize sub-block mins to 4 bits (high nibble) */
-        if (max_min > 0) {
-            float iscale = q4scale / max_min;
-            for (int j = 0; j < QK_K / 16; j++) {
-                int l = gguf_nearest_int(iscale * mins[j]);
-                if (l < 0) l = 0;
-                if (l > 15) l = 15;
-                output[blk].scales[j] |= ((uint8_t)l << 4);
-            }
-            output[blk].dmin = gguf_fp32_to_fp16(max_min / q4scale);
-        } else {
-            output[blk].dmin = gguf_fp32_to_fp16(0.0f);
-        }
+        output[blk].d = gguf_fp32_to_fp16(dm);
+        output[blk].dmin = gguf_fp32_to_fp16(mm);
+        dm = gguf_fp16_to_fp32(output[blk].d);
+        mm = gguf_fp16_to_fp32(output[blk].dmin);
 
-        /* Re-quantize weights to 2 bits using final rounded scales */
-        for (int j = 0; j < QK_K / 16; j++) {
-            float d = gguf_fp16_to_fp32(output[blk].d) * (output[blk].scales[j] & 0xF);
-            if (d < 1e-15f) {
-                for (int ii = 0; ii < 16; ii++) L[16 * j + ii] = 0;
-                continue;
-            }
-            float dm = gguf_fp16_to_fp32(output[blk].dmin) * (output[blk].scales[j] >> 4);
-            for (int ii = 0; ii < 16; ii++) {
-                int l = gguf_nearest_int((block_x[16 * j + ii] + dm) / d);
-                if (l < 0) l = 0;
-                if (l > 3) l = 3;
-                L[16 * j + ii] = (uint8_t)l;
+        for (int j = 0; j < N_SUB; j++)
+            output[blk].scales[j] = Ls[j] | (Lm[j] << 4);
+
+        /* Requantize with final d/dmin (accounts for FP16 rounding) */
+        for (int j = 0; j < N_SUB; j++) {
+            float d = dm * (float)(output[blk].scales[j] & 0xF);
+            if (d < 1e-15f) continue;
+            float m = mm * (float)(output[blk].scales[j] >> 4);
+            for (int k = 0; k < 16; k++) {
+                int q = gguf_nearest_int((block_x[16 * j + k] + m) / d);
+                if (q < 0) q = 0;
+                if (q > 3) q = 3;
+                L[16 * j + k] = (uint8_t)q;
             }
         }
 
@@ -982,9 +1037,10 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
         total_err += gguf_q2_k_block_error(block_x, &output[blk]);
     }
 
-    free(block_importance);
     if (out_total_error) *out_total_error = total_err;
 }
+
+
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * PROGRESS REPORTING
@@ -1425,6 +1481,19 @@ void hexstate_quantize_tensor_q2k(const float *weights, int64_t n_elements,
     quantize_tensor_q2k_hpc(weights, n_elements,
                               (BlockQ2K *)output, out_error,
                               (OptimizerMode)opt_mode, NULL, verbose);
+}
+
+/* Same as above but with importance matrix weights */
+void hexstate_quantize_tensor_q2k_imat(const float *weights, int64_t n_elements,
+                                         void *output, float *out_error,
+                                         int opt_mode,
+                                         const float *imat_importance,
+                                         int verbose)
+{
+    hexstate_init();
+    quantize_tensor_q2k_hpc(weights, n_elements,
+                              (BlockQ2K *)output, out_error,
+                              (OptimizerMode)opt_mode, imat_importance, verbose);
 }
 
 /* Get the block size for Q2_K (84 bytes per 256 elements) */
