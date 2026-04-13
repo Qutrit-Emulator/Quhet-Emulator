@@ -517,16 +517,13 @@ def quantize_tensor_q2k(f32_data):
 def should_quantize(name, n_dims, dims):
     """Should this tensor be quantized to Q2_K?
 
-    With iMatrix importance weighting, Q2_K quality is sufficient for most
-    weight tensors. We now quantize attn_v, ffn_down, attn_output, inp_gate,
-    and proj tensors that were previously excluded.
+    With iMatrix importance weighting, Q2_K is applied to ALL eligible
+    tensors including embeddings for maximum compression.
 
     Tensors kept as-is:
       - 1D tensors (norms, biases) — always kept
-      - token_embd, output.weight — embeddings (too critical)
       - _norm, .bias — normalization layers
       - ffn_gate_inp — MoE routing gate
-      - per_layer_model_proj — Gemma 4 layer proj (too small)
       - layer_output_scale — per-layer scaling factor (scalar)
       - altup, laurel — small Gemma-specific tensors
     """
@@ -535,18 +532,11 @@ def should_quantize(name, n_dims, dims):
         n_elements *= d
     if n_dims < 2:
         return False
-    if 'token_embd' in name or 'embed_tokens' in name:
-        return False
-    if name == 'output.weight':
-        return False
     if 'norm' in name:
         return False
     if '.bias' in name:
         return False
     if 'ffn_gate_inp' in name:
-        return False
-    # ── Tensors that llama.cpp never quantizes ──
-    if 'per_layer_model_proj' in name:
         return False
     if 'altup' in name or 'laurel' in name:
         return False
@@ -869,18 +859,35 @@ def main():
                         continue
 
                     # Quantize to Q2_K (HPC C library or Python fallback)
-                    if use_hpc:
+                    # For massive tensors (embeddings), use chunked numpy path
+                    FAST_THRESHOLD = 50_000_000  # 50M elements
+                    if use_hpc and ti['n_elements'] < FAST_THRESHOLD:
                         # Look up imatrix importance for this tensor
                         imat_weights = None
                         if imatrix_data and ti['name'] in imatrix_data:
                             iw = imatrix_data[ti['name']]
-                            # imatrix has per-column importance; tile to match tensor
                             n_cols = iw.shape[0]
                             n_rows = ti['n_elements'] // n_cols if n_cols > 0 else 1
                             imat_weights = np.tile(iw, n_rows)[:ti['n_elements']]
                         q2k_data, n_blocks = quantize_tensor_q2k_hpc(f32, opt_mode=2, importance=imat_weights)
                     else:
-                        q2k_data, n_blocks = quantize_tensor_q2k(f32)
+                        # Chunked numpy path for massive tensors
+                        CHUNK_SIZE = 10_000_000  # 10M elements per chunk
+                        # Round chunk size to QK_K boundary
+                        CHUNK_SIZE = (CHUNK_SIZE // QK_K) * QK_K
+                        n_el = ti['n_elements']
+                        chunks = []
+                        processed = 0
+                        while processed < n_el:
+                            end = min(processed + CHUNK_SIZE, n_el)
+                            chunk_data, _ = quantize_tensor_q2k(f32[processed:end])
+                            chunks.append(chunk_data)
+                            processed = end
+                            pct = 100.0 * processed / n_el
+                            print(f"\r    → {processed/1e6:.0f}M/{n_el/1e6:.0f}M ({pct:.0f}%)", end='', flush=True)
+                        print()
+                        q2k_data = b''.join(chunks)
+                        n_blocks = n_el // QK_K
                     fout.write(q2k_data)
 
                     quant_count += 1
