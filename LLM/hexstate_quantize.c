@@ -954,6 +954,170 @@ static float hpc_make_qp_quants(int n, int nmax, const float *x,
     return suml2 > 0 ? sumlx / suml2 : 0.0f;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * COMPLEX AMPLITUDE BELIEF PROPAGATION
+ * (Ported from tesseract_factor.c for cross-block scale optimization)
+ *
+ * For CZ edges w(va,vb) = ω^(va·vb):
+ *   m_{a→b}[vb] = Σ_{va} [aₐ(va) × msgs(va)] × ω^(va·vb) = DFT₆{...}
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    double re[2][6]; /* re[0]: sa→sb, re[1]: sb→sa */
+    double im[2][6];
+} ComplexEdgeMsg;
+
+/* ω₆ roots of unity for CZ phase lookup */
+static const double W6_RE[6] = { 1.0, 0.5, -0.5, -1.0, -0.5,  0.5 };
+static const double W6_IM[6] = { 0.0, 0.866025403784438647, 0.866025403784438647,
+                                  0.0, -0.866025403784438647, -0.866025403784438647 };
+
+static double z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed, int max_iter) {
+    const HPCGraph *g = ms->graph;
+    int n_edges = (int)g->n_edges;
+    int n_sites = (int)g->n_sites;
+    if (n_edges == 0) return 1e30;
+
+    ComplexEdgeMsg *msgs = (ComplexEdgeMsg*)calloc(n_edges, sizeof(ComplexEdgeMsg));
+
+    srand(seed * 12345 + 42);
+    for (int e = 0; e < n_edges; e++) {
+        for (int v = 0; v < 6; v++) {
+            if (seed == 0) {
+                msgs[e].re[0][v] = 1.0; msgs[e].im[0][v] = 0.0;
+                msgs[e].re[1][v] = 1.0; msgs[e].im[1][v] = 0.0;
+            } else {
+                double angle0 = 2.0 * 3.14159265358979323846 * ((double)rand() / RAND_MAX);
+                double angle1 = 2.0 * 3.14159265358979323846 * ((double)rand() / RAND_MAX);
+                msgs[e].re[0][v] = cos(angle0); msgs[e].im[0][v] = sin(angle0);
+                msgs[e].re[1][v] = cos(angle1); msgs[e].im[1][v] = sin(angle1);
+            }
+        }
+    }
+
+    #define QUANT_DAMPING_START 0.50
+    #define QUANT_DAMPING_END   0.25
+    #define QUANT_COOL_ITERS    100
+    #define QUANT_TOL           1e-6
+
+    double prev_residual = 1e30;
+    int converged = 0;
+
+    for (int it = 0; it < max_iter && !converged; it++) {
+        double max_delta = 0.0;
+
+        double anneal_alpha = (it < QUANT_COOL_ITERS)
+            ? QUANT_DAMPING_START * exp(log(QUANT_DAMPING_END / QUANT_DAMPING_START) * ((double)it / QUANT_COOL_ITERS))
+            : QUANT_DAMPING_END;
+
+        for (int eid = 0; eid < n_edges; eid++) {
+            const HPCEdge *edge = &g->edges[eid];
+            uint64_t sa = edge->site_a, sb = edge->site_b;
+
+            for (int dir = 0; dir < 2; dir++) {
+                uint64_t src = (dir == 0) ? sa : sb;
+                double prod_re[6], prod_im[6];
+
+                for (int v_src = 0; v_src < 6; v_src++) {
+                    prod_re[v_src] = g->locals[src].edge_re[v_src];
+                    prod_im[v_src] = g->locals[src].edge_im[v_src];
+
+                    const HPCAdjList *adj = &g->adj[src];
+                    for (uint64_t mi = 0; mi < adj->count; mi++) {
+                        uint64_t in_eid = adj->edge_ids[mi];
+                        if (in_eid == (uint64_t)eid) continue;
+
+                        int in_dir = (g->edges[in_eid].site_b == src) ? 0 : 1;
+                        double mr = msgs[in_eid].re[in_dir][v_src];
+                        double mi_v = msgs[in_eid].im[in_dir][v_src];
+
+                        double nr = prod_re[v_src] * mr - prod_im[v_src] * mi_v;
+                        double ni = prod_re[v_src] * mi_v + prod_im[v_src] * mr;
+                        prod_re[v_src] = nr;
+                        prod_im[v_src] = ni;
+                    }
+                }
+
+                /* DFT₆ sum-product for CZ edges */
+                double new_re[6], new_im[6];
+                for (int vb = 0; vb < 6; vb++) {
+                    double sum_re = 0.0, sum_im = 0.0;
+                    for (int va = 0; va < 6; va++) {
+                        int pidx = (va * vb) % 6;
+                        double w_re = W6_RE[pidx], w_im = W6_IM[pidx];
+                        sum_re += prod_re[va] * w_re - prod_im[va] * w_im;
+                        sum_im += prod_re[va] * w_im + prod_im[va] * w_re;
+                    }
+                    new_re[vb] = sum_re;
+                    new_im[vb] = sum_im;
+                }
+
+                /* Normalize */
+                double norm_sq = 0.0;
+                for (int v = 0; v < 6; v++)
+                    norm_sq += new_re[v]*new_re[v] + new_im[v]*new_im[v];
+                if (norm_sq > 1e-30) {
+                    double inv_norm = 1.0 / sqrt(norm_sq);
+                    for (int v = 0; v < 6; v++) {
+                        new_re[v] *= inv_norm;
+                        new_im[v] *= inv_norm;
+                    }
+                } else {
+                    for (int v = 0; v < 6; v++) {
+                        new_re[v] = 1.0 / sqrt(6.0);
+                        new_im[v] = 0.0;
+                    }
+                }
+
+                /* Damped update */
+                double delta = 0.0;
+                for (int v = 0; v < 6; v++) {
+                    double upd_re = anneal_alpha * new_re[v] +
+                                    (1.0 - anneal_alpha) * msgs[eid].re[dir][v];
+                    double upd_im = anneal_alpha * new_im[v] +
+                                    (1.0 - anneal_alpha) * msgs[eid].im[dir][v];
+                    double dr = upd_re - msgs[eid].re[dir][v];
+                    double di = upd_im - msgs[eid].im[dir][v];
+                    delta += dr*dr + di*di;
+                    msgs[eid].re[dir][v] = upd_re;
+                    msgs[eid].im[dir][v] = upd_im;
+                }
+                if (delta > max_delta) max_delta = delta;
+            }
+        }
+
+        if (max_delta < QUANT_TOL) converged = 1;
+        prev_residual = max_delta;
+    }
+
+    /* Compute dressed amplitudes */
+    for (int s = 0; s < n_sites; s++) {
+        for (int v = 0; v < 6; v++) {
+            double d_re = g->locals[s].edge_re[v];
+            double d_im = g->locals[s].edge_im[v];
+
+            const HPCAdjList *adj = &g->adj[s];
+            for (uint64_t mi = 0; mi < adj->count; mi++) {
+                uint64_t in_eid = adj->edge_ids[mi];
+                int in_dir = (g->edges[in_eid].site_b == (uint64_t)s) ? 0 : 1;
+
+                double mr = msgs[in_eid].re[in_dir][v];
+                double mi_v = msgs[in_eid].im[in_dir][v];
+                double nr = d_re * mr - d_im * mi_v;
+                double ni = d_re * mi_v + d_im * mr;
+                d_re = nr;
+                d_im = ni;
+            }
+
+            ms->sheets[s].dressed_re[v] = d_re;
+            ms->sheets[s].dressed_im[v] = d_im;
+        }
+    }
+
+    free(msgs);
+    return prev_residual;
+}
+
 static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                                       BlockQ2K *output, float *out_total_error,
                                       OptimizerMode opt_mode,
@@ -963,20 +1127,75 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
     int64_t n_blocks = n_elements / QK_K;
     float total_err = 0.0f;
     const int N_SUB = QK_K / 16;
-    const float q4scale = 15.0f;
 
+    /* ══════════════════════════════════════════════════════════════════
+     * HPC SENSITIVITY GRAPH — Cross-Block Interference
+     *
+     * The HExState architecture: build a factor graph over ALL blocks
+     * in the tensor, run complex amplitude BP, and use the dressed
+     * marginals to select per-block scale multipliers.
+     *
+     * Each block's 6 amplitudes encode Boltzmann-weighted error for
+     * 6 scale candidates. CZ edges propagate inter-block correlations
+     * — creating coherent precision allocation across the tensor.
+     * ══════════════════════════════════════════════════════════════════ */
+
+    float *scale_mults = (float *)malloc(n_blocks * sizeof(float));
+    for (int64_t i = 0; i < n_blocks; i++)
+        scale_mults[i] = 1.0f;
+
+    if (opt_mode != OPT_MSE && n_blocks >= 2) {
+        float temperature = 0.5f;
+        HPCGraph *graph = build_sensitivity_graph(weights, n_elements,
+                                                    QK_K, temperature,
+                                                    imat_importance);
+        if (graph) {
+            MobiusAmplitudeSheet *mobius = mobius_create(graph);
+            int64_t graph_blocks = (int64_t)graph->n_sites;
+            int64_t stride = n_blocks / graph_blocks;
+
+            /* Ensemble-averaged BP (multiple seeds, like tesseract_factor.c) */
+            double (*marginals)[6] = (double (*)[6])calloc(graph_blocks, sizeof(double[6]));
+
+            for (int start = 0; start < 3; start++) {
+                z6_complex_amplitude_bp(mobius, (unsigned int)start, 200);
+                for (int64_t s = 0; s < graph_blocks; s++) {
+                    for (int v = 0; v < 6; v++) {
+                        double re = mobius->sheets[s].dressed_re[v];
+                        double im = mobius->sheets[s].dressed_im[v];
+                        marginals[s][v] += re * re + im * im;
+                    }
+                }
+            }
+
+            /* Convert marginals → weighted-average scale multiplier per block */
+            for (int64_t s = 0; s < graph_blocks; s++) {
+                double total = 0.0;
+                for (int v = 0; v < 6; v++) total += marginals[s][v];
+                if (total > 1e-30) {
+                    double weighted_scale = 0.0;
+                    for (int v = 0; v < 6; v++)
+                        weighted_scale += (marginals[s][v] / total) * (double)SCALE_MULTIPLIERS[v];
+                    for (int64_t b = s * stride; b < (s + 1) * stride && b < n_blocks; b++)
+                        scale_mults[b] = (float)weighted_scale;
+                }
+            }
+
+            free(marginals);
+            mobius_destroy(mobius);
+            hpc_destroy(graph);
+        }
+    }
+
+    /* ══ Per-block quantization with HPC-modulated d/dmin ══ */
     for (int64_t blk = 0; blk < n_blocks; blk++) {
         const float *block_x = weights + blk * QK_K;
+        float hpc_mult = scale_mults[blk];
 
-        /* ══ Phase A: ggml-quality per-sub-block optimization ══
-         * Weighted least-squares with 16 candidate scales.
-         * This alone should match or approach ggml's PPL. */
         uint8_t L[QK_K], Laux[16];
         float wt[16];
         float scales[N_SUB], mins[N_SUB], sw[N_SUB];
-        float max_scale = 0, max_min = 0;
 
-        /* Compute per-superblock sigma for importance weighting */
         float sumx2 = 0;
         for (int i = 0; i < QK_K; i++) sumx2 += block_x[i] * block_x[i];
         float sigma2 = sumx2 / (float)QK_K;
@@ -985,23 +1204,21 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
             const float *sx = block_x + 16 * j;
             sw[j] = 0;
             for (int l = 0; l < 16; l++) {
-                /* Weight = importance × sqrt(sigma² + x²) — same as ggml imatrix */
                 float imp = (imat_importance) ? imat_importance[blk * QK_K + 16 * j + l] : 1.0f;
                 wt[l] = imp * sqrtf(sigma2 + sx[l] * sx[l]);
                 sw[j] += wt[l];
             }
             scales[j] = hpc_make_qkx2_quants(16, 3, sx, wt, L + 16 * j,
                                                 &mins[j], Laux);
-            if (scales[j] > max_scale) max_scale = scales[j];
-            if (mins[j] > max_min) max_min = mins[j];
         }
 
-        /* ══ Phase B: Superblock d/dmin quantization ══
-         * d = max_scale / 15, dmin = max_min / 15
-         * Use make_qp_quants for optimal rounding of scales/mins arrays. */
         uint8_t Ls[N_SUB], Lm[N_SUB];
         float dm = hpc_make_qp_quants(N_SUB, 15, scales, Ls, sw);
         float mm = hpc_make_qp_quants(N_SUB, 15, mins, Lm, sw);
+
+        /* HPC modulation: scale d/dmin by graph-derived multiplier */
+        dm *= hpc_mult;
+        mm *= hpc_mult;
 
         output[blk].d = gguf_fp32_to_fp16(dm);
         output[blk].dmin = gguf_fp32_to_fp16(mm);
@@ -1011,7 +1228,6 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
         for (int j = 0; j < N_SUB; j++)
             output[blk].scales[j] = Ls[j] | (Lm[j] << 4);
 
-        /* Requantize with final d/dmin (accounts for FP16 rounding) */
         for (int j = 0; j < N_SUB; j++) {
             float d = dm * (float)(output[blk].scales[j] & 0xF);
             if (d < 1e-15f) continue;
@@ -1024,7 +1240,6 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
             }
         }
 
-        /* Pack 4 quants per byte */
         for (int j = 0; j < QK_K; j += 128) {
             for (int l = 0; l < 32; l++) {
                 output[blk].qs[j / 4 + l] = L[j + l]
@@ -1037,9 +1252,9 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
         total_err += gguf_q2_k_block_error(block_x, &output[blk]);
     }
 
+    free(scale_mults);
     if (out_total_error) *out_total_error = total_err;
 }
-
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
