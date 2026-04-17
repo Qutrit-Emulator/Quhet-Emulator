@@ -1133,16 +1133,18 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
      *
      * The HExState architecture: build a factor graph over ALL blocks
      * in the tensor, run complex amplitude BP, and use the dressed
-     * marginals to select per-block scale multipliers.
+     * marginals to modulate per-block importance weights.
      *
-     * Each block's 6 amplitudes encode Boltzmann-weighted error for
-     * 6 scale candidates. CZ edges propagate inter-block correlations
-     * — creating coherent precision allocation across the tensor.
+     * Sensitive blocks (high marginal weight on conservative scales)
+     * get amplified importance → Phase A's weighted least-squares
+     * allocates more precision to them. This is the correct way to
+     * apply cross-block interference: through the objective function,
+     * not by post-hoc scaling of d/dmin.
      * ══════════════════════════════════════════════════════════════════ */
 
-    float *scale_mults = (float *)malloc(n_blocks * sizeof(float));
+    float *hpc_importance = (float *)malloc(n_blocks * sizeof(float));
     for (int64_t i = 0; i < n_blocks; i++)
-        scale_mults[i] = 1.0f;
+        hpc_importance[i] = 1.0f;
 
     if (opt_mode != OPT_MSE && n_blocks >= 2) {
         float temperature = 0.5f;
@@ -1168,16 +1170,22 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                 }
             }
 
-            /* Convert marginals → weighted-average scale multiplier per block */
+            /* Convert marginals → importance weight per block.
+             * Higher marginal weight on conservative scales (v=4,5) means
+             * this block is sensitive → boost its importance weight.
+             * Higher weight on aggressive scales (v=0,1) means insensitive
+             * → reduce its importance weight (let it compress harder). */
             for (int64_t s = 0; s < graph_blocks; s++) {
                 double total = 0.0;
                 for (int v = 0; v < 6; v++) total += marginals[s][v];
                 if (total > 1e-30) {
-                    double weighted_scale = 0.0;
+                    /* Sensitivity score: weighted sum where conservative
+                     * scales contribute more. Range: ~0.6 to ~1.4 */
+                    double sensitivity = 0.0;
                     for (int v = 0; v < 6; v++)
-                        weighted_scale += (marginals[s][v] / total) * (double)SCALE_MULTIPLIERS[v];
+                        sensitivity += (marginals[s][v] / total) * (double)SCALE_MULTIPLIERS[v];
                     for (int64_t b = s * stride; b < (s + 1) * stride && b < n_blocks; b++)
-                        scale_mults[b] = (float)weighted_scale;
+                        hpc_importance[b] = (float)sensitivity;
                 }
             }
 
@@ -1187,10 +1195,10 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
         }
     }
 
-    /* ══ Per-block quantization with HPC-modulated d/dmin ══ */
+    /* ══ Per-block quantization with HPC-modulated importance ══ */
     for (int64_t blk = 0; blk < n_blocks; blk++) {
         const float *block_x = weights + blk * QK_K;
-        float hpc_mult = scale_mults[blk];
+        float hpc_weight = hpc_importance[blk];
 
         uint8_t L[QK_K], Laux[16];
         float wt[16];
@@ -1205,7 +1213,8 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
             sw[j] = 0;
             for (int l = 0; l < 16; l++) {
                 float imp = (imat_importance) ? imat_importance[blk * QK_K + 16 * j + l] : 1.0f;
-                wt[l] = imp * sqrtf(sigma2 + sx[l] * sx[l]);
+                /* HPC modulation: boost importance for sensitive blocks */
+                wt[l] = imp * hpc_weight * sqrtf(sigma2 + sx[l] * sx[l]);
                 sw[j] += wt[l];
             }
             scales[j] = hpc_make_qkx2_quants(16, 3, sx, wt, L + 16 * j,
@@ -1215,10 +1224,6 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
         uint8_t Ls[N_SUB], Lm[N_SUB];
         float dm = hpc_make_qp_quants(N_SUB, 15, scales, Ls, sw);
         float mm = hpc_make_qp_quants(N_SUB, 15, mins, Lm, sw);
-
-        /* HPC modulation: scale d/dmin by graph-derived multiplier */
-        dm *= hpc_mult;
-        mm *= hpc_mult;
 
         output[blk].d = gguf_fp32_to_fp16(dm);
         output[blk].dmin = gguf_fp32_to_fp16(mm);
@@ -1252,7 +1257,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
         total_err += gguf_q2_k_block_error(block_x, &output[blk]);
     }
 
-    free(scale_mults);
+    free(hpc_importance);
     if (out_total_error) *out_total_error = total_err;
 }
 
