@@ -678,25 +678,23 @@ def main():
                 dim0 = out_dims[0] if ti['n_dims'] >= 2 else ti['n_elements']
 
                 if dim0 % QK_K == 0:
-                    # Best case: Q2_K (2.6 bpw, block_size=256)
+                    # Q2_K (2.6 bpw, block_size=256)
                     out_type = GGML_TYPE_Q2_K
                     n_blocks = (ti['n_elements'] + QK_K - 1) // QK_K
                     out_size = n_blocks * 84
                 elif dim0 % 32 == 0:
-                    # Fallback: Q4_0 (4.5 bpw, block_size=32)
+                    # Q4_0 fallback (4.5 bpw, block_size=32)
                     out_type = GGML_TYPE_Q4_0
                     n_blocks = ti['n_elements'] // 32
                     out_size = n_blocks * 18
                     quant_plan[i] = 'Q4_0'
-                    print(f"  → Q4_0: {ti['name']} (dims[0]={dim0}, not QK_K-aligned)")
+                    print(f"  Q4_0: {ti['name']} (dims[0]={dim0})")
                 else:
-                    # Can't quantize — keep original
                     out_type = ti['type']
                     out_size = ti['data_size']
                     quant_plan[i] = False
-                    print(f"  → Keep: {ti['name']} (dims[0]={dim0}, no compatible quant)")
+                    print(f"  Keep: {ti['name']} (dims[0]={dim0})")
             else:
-                # Keep original type
                 out_type = ti['type']
                 out_size = ti['data_size']
                 out_dims = list(ti['dims'])
