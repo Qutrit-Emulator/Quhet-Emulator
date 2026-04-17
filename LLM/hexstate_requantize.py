@@ -242,6 +242,7 @@ QK_K = 256
 
 GGML_TYPE_F32   = 0
 GGML_TYPE_F16   = 1
+GGML_TYPE_Q4_0  = 2
 GGML_TYPE_Q2_K  = 10
 GGML_TYPE_BF16  = 30
 
@@ -553,10 +554,6 @@ def should_quantize(name, n_dims, dims):
     # Must be divisible by QK_K
     if n_elements % QK_K != 0:
         return False
-    # Row dimension (dims[0] in GGUF) must be divisible by QK_K
-    # This catches MoE expert tensors with row width like 704
-    if dims[0] % QK_K != 0:
-        return False
     return True
 
 
@@ -677,19 +674,37 @@ def main():
 
         for i, ti in enumerate(tensor_infos):
             if quant_plan[i]:
-                # Will become Q2_K
-                out_type = GGML_TYPE_Q2_K
-                n_blocks = (ti['n_elements'] + QK_K - 1) // QK_K
-                out_size = n_blocks * 84  # Q2_K block = 84 bytes
+                out_dims = list(ti['dims'])
+                dim0 = out_dims[0] if ti['n_dims'] >= 2 else ti['n_elements']
+
+                if dim0 % QK_K == 0:
+                    # Best case: Q2_K (2.6 bpw, block_size=256)
+                    out_type = GGML_TYPE_Q2_K
+                    n_blocks = (ti['n_elements'] + QK_K - 1) // QK_K
+                    out_size = n_blocks * 84
+                elif dim0 % 32 == 0:
+                    # Fallback: Q4_0 (4.5 bpw, block_size=32)
+                    out_type = GGML_TYPE_Q4_0
+                    n_blocks = ti['n_elements'] // 32
+                    out_size = n_blocks * 18
+                    quant_plan[i] = 'Q4_0'
+                    print(f"  → Q4_0: {ti['name']} (dims[0]={dim0}, not QK_K-aligned)")
+                else:
+                    # Can't quantize — keep original
+                    out_type = ti['type']
+                    out_size = ti['data_size']
+                    quant_plan[i] = False
+                    print(f"  → Keep: {ti['name']} (dims[0]={dim0}, no compatible quant)")
             else:
                 # Keep original type
                 out_type = ti['type']
                 out_size = ti['data_size']
+                out_dims = list(ti['dims'])
 
             out_tensor_infos.append({
                 'name': ti['name'],
                 'n_dims': ti['n_dims'],
-                'dims': ti['dims'],
+                'dims': out_dims,
                 'type': out_type,
                 'offset': out_data_offset,
                 'data_size': out_size,
@@ -842,7 +857,42 @@ def main():
                 fin.seek(abs_offset)
                 raw_data = fin.read(ti['data_size'])
 
-                if quant_plan[i]:
+                if quant_plan[i] == 'Q4_0':
+                    # ── Q4_0 for non-QK_K-aligned tensors ──
+                    if ti['type'] == GGML_TYPE_BF16:
+                        f32 = bf16_to_f32(raw_data, ti['n_elements'])
+                    elif ti['type'] == GGML_TYPE_F16:
+                        f32 = f16_to_f32(raw_data, ti['n_elements'])
+                    elif ti['type'] == GGML_TYPE_F32:
+                        f32 = np.frombuffer(raw_data, dtype=np.float32).copy()
+                    else:
+                        fout.write(raw_data)
+                        pad = align_offset(fout.tell()) - fout.tell()
+                        if pad > 0: fout.write(b'\x00' * pad)
+                        continue
+
+                    # Vectorized Q4_0: process all blocks at once
+                    blocks = f32.reshape(-1, 32)
+                    amax = np.max(np.abs(blocks), axis=1)
+                    d = amax / 7.0
+                    d[d == 0] = 1.0  # avoid div by zero
+                    qs = np.clip(np.round(blocks / d[:, None]) + 8, 0, 15).astype(np.uint8)
+                    d_orig = amax / 7.0  # restore zeros
+                    d_fp16 = d_orig.astype(np.float16)
+
+                    n_blocks_q4 = len(blocks)
+                    out_buf = bytearray(n_blocks_q4 * 18)
+                    for b in range(n_blocks_q4):
+                        off = b * 18
+                        struct.pack_into('<e', out_buf, off, float(d_fp16[b]))
+                        for j in range(16):
+                            out_buf[off + 2 + j] = int(qs[b, j]) | (int(qs[b, j + 16]) << 4)
+
+                    fout.write(bytes(out_buf))
+                    quant_count += 1
+                    total_quant_bytes += len(out_buf)
+
+                elif quant_plan[i]:
                     # Convert to F32 for quantization
                     if ti['type'] == GGML_TYPE_BF16:
                         f32 = bf16_to_f32(raw_data, ti['n_elements'])
@@ -858,24 +908,49 @@ def main():
                             fout.write(b'\x00' * pad)
                         continue
 
-                    # Quantize to Q2_K (HPC C library or Python fallback)
-                    # For massive tensors (embeddings), use chunked numpy path
-                    FAST_THRESHOLD = 50_000_000  # 50M elements
-                    if use_hpc and ti['n_elements'] < FAST_THRESHOLD:
-                        # Look up imatrix importance for this tensor
-                        imat_weights = None
-                        if imatrix_data and ti['name'] in imatrix_data:
-                            iw = imatrix_data[ti['name']]
-                            n_cols = iw.shape[0]
-                            n_rows = ti['n_elements'] // n_cols if n_cols > 0 else 1
-                            imat_weights = np.tile(iw, n_rows)[:ti['n_elements']]
-                        q2k_data, n_blocks = quantize_tensor_q2k_hpc(f32, opt_mode=2, importance=imat_weights)
+                    # Quantize to Q2_K — always use HPC with chunked processing
+                    # Each chunk gets full HPC treatment (no size threshold)
+                    HPC_CHUNK = 50_000_000  # 50M elements per HPC chunk
+                    HPC_CHUNK = (HPC_CHUNK // QK_K) * QK_K  # align to QK_K
+
+                    # Look up imatrix importance for this tensor
+                    imat_full = None
+                    if imatrix_data and ti['name'] in imatrix_data:
+                        iw = imatrix_data[ti['name']]
+                        n_cols = iw.shape[0]
+                        n_rows = ti['n_elements'] // n_cols if n_cols > 0 else 1
+                        imat_full = np.tile(iw, n_rows)[:ti['n_elements']]
+
+                    n_el = ti['n_elements']
+                    if use_hpc and n_el <= HPC_CHUNK:
+                        # Small tensor — single HPC pass
+                        q2k_data, n_blocks = quantize_tensor_q2k_hpc(f32, opt_mode=2, importance=imat_full)
+                    elif use_hpc:
+                        # Large tensor — chunked HPC (each chunk gets BP)
+                        chunks = []
+                        processed = 0
+                        while processed < n_el:
+                            end = min(processed + HPC_CHUNK, n_el)
+                            chunk_f32 = f32[processed:end]
+                            if len(chunk_f32) % QK_K != 0:
+                                pad_len = QK_K - (len(chunk_f32) % QK_K)
+                                chunk_f32 = np.concatenate([chunk_f32, np.zeros(pad_len, dtype=np.float32)])
+                            chunk_imp = imat_full[processed:end] if imat_full is not None else None
+                            if chunk_imp is not None and len(chunk_imp) < len(chunk_f32):
+                                chunk_imp = np.concatenate([chunk_imp, np.ones(len(chunk_f32) - len(chunk_imp), dtype=np.float32)])
+                            chunk_data, _ = quantize_tensor_q2k_hpc(chunk_f32, opt_mode=2, importance=chunk_imp)
+                            actual_blocks = (end - processed + QK_K - 1) // QK_K
+                            chunks.append(chunk_data[:actual_blocks * 84])
+                            processed = end
+                            pct = 100.0 * processed / n_el
+                            print(f"\r    → {processed/1e6:.0f}M/{n_el/1e6:.0f}M ({pct:.0f}%)", end='', flush=True)
+                        print()
+                        q2k_data = b''.join(chunks)
+                        n_blocks = n_el // QK_K
                     else:
-                        # Chunked numpy path for massive tensors
-                        CHUNK_SIZE = 10_000_000  # 10M elements per chunk
-                        # Round chunk size to QK_K boundary
+                        # No HPC available — python fallback
+                        CHUNK_SIZE = 10_000_000
                         CHUNK_SIZE = (CHUNK_SIZE // QK_K) * QK_K
-                        n_el = ti['n_elements']
                         chunks = []
                         processed = 0
                         while processed < n_el:
