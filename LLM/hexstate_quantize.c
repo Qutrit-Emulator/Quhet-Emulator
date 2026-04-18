@@ -1186,58 +1186,270 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
     float total_err = 0.0f;
     const int N_SUB = QK_K / 16;
 
+    init_scale_table_36();
+
     /* ══════════════════════════════════════════════════════════════════
-     * HPC SENSITIVITY GRAPH — Cross-Block Interference
-     *
-     * The HExState architecture: build a factor graph over ALL blocks
-     * in the tensor, run complex amplitude BP, and use the dressed
-     * marginals to modulate per-block importance weights.
-     *
-     * Sensitive blocks (high marginal weight on conservative scales)
-     * get amplified importance → Phase A's weighted least-squares
-     * allocates more precision to them. This is the correct way to
-     * apply cross-block interference: through the objective function,
-     * not by post-hoc scaling of d/dmin.
+     * PHASE 1: Greedy quantization — produce seed (d, dmin) per block
      * ══════════════════════════════════════════════════════════════════ */
 
-    float *hpc_importance = (float *)malloc(n_blocks * sizeof(float));
+    /* Store Phase A/B results for all blocks */
+    typedef struct {
+        float dm, mm;                 /* greedy d, dmin (fp32) */
+        uint16_t d_fp16, dmin_fp16;   /* greedy d, dmin (fp16) */
+        uint8_t Ls[16], Lm[16];       /* sub-block scale/min indices */
+        float scales[16], mins[16], sw[16];
+    } BlockSeed;
+
+    BlockSeed *seeds = (BlockSeed *)calloc(n_blocks, sizeof(BlockSeed));
+
+    for (int64_t blk = 0; blk < n_blocks; blk++) {
+        const float *block_x = weights + blk * QK_K;
+        uint8_t L[QK_K], Laux[16];
+        float wt[16];
+
+        float sumx2 = 0;
+        for (int i = 0; i < QK_K; i++) sumx2 += block_x[i] * block_x[i];
+        float sigma2 = sumx2 / (float)QK_K;
+
+        for (int j = 0; j < N_SUB; j++) {
+            const float *sx = block_x + 16 * j;
+            seeds[blk].sw[j] = 0;
+            for (int l = 0; l < 16; l++) {
+                float imp = (imat_importance) ? imat_importance[blk * QK_K + 16 * j + l] : 1.0f;
+                wt[l] = imp * sqrtf(sigma2 + sx[l] * sx[l]);
+                seeds[blk].sw[j] += wt[l];
+            }
+            seeds[blk].scales[j] = hpc_make_qkx2_quants(16, 3, sx, wt,
+                                        L + 16 * j, &seeds[blk].mins[j], Laux);
+        }
+
+        seeds[blk].dm = hpc_make_qp_quants(N_SUB, 15, seeds[blk].scales,
+                                              seeds[blk].Ls, seeds[blk].sw);
+        seeds[blk].mm = hpc_make_qp_quants(N_SUB, 15, seeds[blk].mins,
+                                              seeds[blk].Lm, seeds[blk].sw);
+        seeds[blk].d_fp16 = gguf_fp32_to_fp16(seeds[blk].dm);
+        seeds[blk].dmin_fp16 = gguf_fp32_to_fp16(seeds[blk].mm);
+    }
+
+    /* ══════════════════════════════════════════════════════════════════
+     * PHASE 2: Generate 36 FP16 (d, dmin) candidates per block
+     *          and measure actual reconstruction MSE for each
+     * ══════════════════════════════════════════════════════════════════ */
+
+    /* For each block, generate a 6×6 grid of (d, dmin) FP16 neighbors.
+     * d_candidates[6]:  greedy_d × {0.85, 0.90, 0.95, 1.00, 1.05, 1.10}
+     * dm_candidates[6]: greedy_dm × {0.85, 0.90, 0.95, 1.00, 1.05, 1.10}
+     * Total: 36 (d, dmin) pairs per block */
+    static const float NEIGHBOR_MULTS[6] = {
+        0.85f, 0.90f, 0.95f, 1.00f, 1.05f, 1.10f
+    };
+
+    /* candidate_errors[blk][36] — MSE per candidate */
+    float (*candidate_errors)[TOTAL_SCALE_CANDIDATES] = NULL;
+    uint16_t (*candidate_d)[TOTAL_SCALE_CANDIDATES] = NULL;
+    uint16_t (*candidate_dmin)[TOTAL_SCALE_CANDIDATES] = NULL;
+    /* Per-candidate Ls/Lm — must recompute for each (d, dmin) */
+    uint8_t (*candidate_Ls)[TOTAL_SCALE_CANDIDATES][16] = NULL;
+    uint8_t (*candidate_Lm)[TOTAL_SCALE_CANDIDATES][16] = NULL;
+
+    candidate_errors = (float (*)[TOTAL_SCALE_CANDIDATES])calloc(n_blocks,
+                            sizeof(float[TOTAL_SCALE_CANDIDATES]));
+    candidate_d = (uint16_t (*)[TOTAL_SCALE_CANDIDATES])calloc(n_blocks,
+                            sizeof(uint16_t[TOTAL_SCALE_CANDIDATES]));
+    candidate_dmin = (uint16_t (*)[TOTAL_SCALE_CANDIDATES])calloc(n_blocks,
+                            sizeof(uint16_t[TOTAL_SCALE_CANDIDATES]));
+    candidate_Ls = (uint8_t (*)[TOTAL_SCALE_CANDIDATES][16])calloc(n_blocks,
+                            sizeof(uint8_t[TOTAL_SCALE_CANDIDATES][16]));
+    candidate_Lm = (uint8_t (*)[TOTAL_SCALE_CANDIDATES][16])calloc(n_blocks,
+                            sizeof(uint8_t[TOTAL_SCALE_CANDIDATES][16]));
+
+    for (int64_t blk = 0; blk < n_blocks; blk++) {
+        const float *block_x = weights + blk * QK_K;
+        float base_dm = seeds[blk].dm;
+        float base_mm = seeds[blk].mm;
+
+        for (int di = 0; di < 6; di++) {
+            float trial_dm = base_dm * NEIGHBOR_MULTS[di];
+            uint16_t trial_d16 = gguf_fp32_to_fp16(trial_dm);
+            float actual_dm = gguf_fp16_to_fp32(trial_d16);
+
+            for (int mi = 0; mi < 6; mi++) {
+                int cidx = di * 6 + mi;
+                float trial_mm = base_mm * NEIGHBOR_MULTS[mi];
+                uint16_t trial_dmin16 = gguf_fp32_to_fp16(trial_mm);
+                float actual_mm = gguf_fp16_to_fp32(trial_dmin16);
+
+                candidate_d[blk][cidx] = trial_d16;
+                candidate_dmin[blk][cidx] = trial_dmin16;
+
+                /* Recompute Ls/Lm for THIS candidate dm/mm.
+                 * Ls[j] = best integer to represent scales[j] / dm
+                 * Lm[j] = best integer to represent mins[j] / mm */
+                uint8_t trial_Ls[16], trial_Lm[16];
+                for (int j = 0; j < N_SUB; j++) {
+                    if (actual_dm > 1e-15f) {
+                        int ls = gguf_nearest_int(seeds[blk].scales[j] / actual_dm);
+                        if (ls < 0) ls = 0; if (ls > 15) ls = 15;
+                        trial_Ls[j] = (uint8_t)ls;
+                    } else {
+                        trial_Ls[j] = 0;
+                    }
+                    if (actual_mm > 1e-15f) {
+                        int lm = gguf_nearest_int(seeds[blk].mins[j] / actual_mm);
+                        if (lm < 0) lm = 0; if (lm > 15) lm = 15;
+                        trial_Lm[j] = (uint8_t)lm;
+                    } else {
+                        trial_Lm[j] = 0;
+                    }
+                    memcpy(candidate_Ls[blk][cidx], trial_Ls, 16);
+                    memcpy(candidate_Lm[blk][cidx], trial_Lm, 16);
+                }
+
+                /* Fully re-quantize and measure MSE with recomputed Ls/Lm */
+                float err = 0.0f;
+                for (int j = 0; j < N_SUB; j++) {
+                    float d = actual_dm * (float)trial_Ls[j];
+                    float m = actual_mm * (float)trial_Lm[j];
+                    if (d < 1e-15f) {
+                        for (int k = 0; k < 16; k++) {
+                            float x = block_x[16 * j + k];
+                            float w = (imat_importance) ?
+                                      imat_importance[blk * QK_K + 16 * j + k] : 1.0f;
+                            err += x * x * w;
+                        }
+                        continue;
+                    }
+                    for (int k = 0; k < 16; k++) {
+                        float x = block_x[16 * j + k];
+                        int q = gguf_nearest_int((x + m) / d);
+                        if (q < 0) q = 0; if (q > 3) q = 3;
+                        float deq = d * (float)q - m;
+                        float diff = x - deq;
+                        float w = (imat_importance) ?
+                                  imat_importance[blk * QK_K + 16 * j + k] : 1.0f;
+                        err += diff * diff * w;
+                    }
+                }
+                candidate_errors[blk][cidx] = err;
+            }
+        }
+    }
+
+    /* ══════════════════════════════════════════════════════════════════
+     * PHASE 3: HPC Graph — Direct (d, dmin) Selection via BP
+     *
+     * Build a multi-quhit graph where each block has 2 quhits
+     * encoding the 36 candidate errors. BP propagates cross-block
+     * interference. Dressed marginals directly select the optimal
+     * (d, dmin) per block.
+     * ══════════════════════════════════════════════════════════════════ */
+
+    /* Default: use greedy candidate (index 3*6+3 = 21, mult 1.00×1.00) */
+    int *best_candidate = (int *)malloc(n_blocks * sizeof(int));
     for (int64_t i = 0; i < n_blocks; i++)
-        hpc_importance[i] = 1.0f;
+        best_candidate[i] = 3 * 6 + 3;  /* NEIGHBOR_MULTS[3] = 1.00 */
 
     if (opt_mode != OPT_MSE && n_blocks >= 2) {
         float temperature = 0.5f;
-        HPCGraph *graph = build_sensitivity_graph(weights, n_elements,
-                                                    QK_K, temperature,
-                                                    imat_importance);
-        if (graph) {
-            MobiusAmplitudeSheet *mobius = mobius_create(graph);
-            int64_t n_sites = (int64_t)graph->n_sites;
-            int64_t graph_blocks = n_sites / QUHITS_PER_BLOCK;
-            int64_t stride = n_blocks / graph_blocks;
+        int64_t graph_blocks = (n_blocks > 8192) ? 8192 : n_blocks;
+        int64_t stride = n_blocks / graph_blocks;
+        int64_t n_sites = graph_blocks * QUHITS_PER_BLOCK;
 
-            /* Allocate marginals for both quhits per block: [block][quhit][6] */
+        HPCGraph *graph = hpc_create(n_sites);
+        if (graph) {
+            for (int64_t i = 0; i < n_sites; i++)
+                triality_dft(&graph->locals[i]);
+
+            /* Encode each block's 36 candidate errors as dual-quhit amplitudes */
+            for (int64_t i = 0; i < graph_blocks; i++) {
+                int64_t blk = i * stride;
+                float min_err = 1e30f;
+                for (int c = 0; c < TOTAL_SCALE_CANDIDATES; c++)
+                    if (candidate_errors[blk][c] < min_err)
+                        min_err = candidate_errors[blk][c];
+
+                /* Quhit 0 (coarse = d dimension): marginalize over dmin */
+                double coarse_re[6];
+                double coarse_norm = 0.0;
+                for (int di = 0; di < 6; di++) {
+                    coarse_re[di] = 0.0;
+                    for (int mi = 0; mi < 6; mi++) {
+                        int cidx = di * 6 + mi;
+                        coarse_re[di] += exp(-(double)(candidate_errors[blk][cidx] - min_err) /
+                                              (2.0 * (double)temperature));
+                    }
+                    coarse_norm += coarse_re[di] * coarse_re[di];
+                }
+                if (coarse_norm > 1e-30) {
+                    double inv = 1.0 / sqrt(coarse_norm);
+                    for (int v = 0; v < 6; v++) coarse_re[v] *= inv;
+                }
+
+                /* Quhit 1 (fine = dmin dimension): marginalize over d */
+                double fine_re[6];
+                double fine_norm = 0.0;
+                for (int mi = 0; mi < 6; mi++) {
+                    fine_re[mi] = 0.0;
+                    for (int di = 0; di < 6; di++) {
+                        int cidx = di * 6 + mi;
+                        fine_re[mi] += exp(-(double)(candidate_errors[blk][cidx] - min_err) /
+                                            (2.0 * (double)temperature));
+                    }
+                    fine_norm += fine_re[mi] * fine_re[mi];
+                }
+                if (fine_norm > 1e-30) {
+                    double inv = 1.0 / sqrt(fine_norm);
+                    for (int v = 0; v < 6; v++) fine_re[v] *= inv;
+                }
+
+                /* Write quhits */
+                int64_t s0 = 2 * i, s1 = 2 * i + 1;
+                for (int v = 0; v < 6; v++) {
+                    graph->locals[s0].edge_re[v] = coarse_re[v];
+                    graph->locals[s0].edge_im[v] = 0.0;
+                    graph->locals[s1].edge_re[v] = fine_re[v];
+                    graph->locals[s1].edge_im[v] = 0.0;
+                }
+                graph->locals[s0].primary = VIEW_EDGE;
+                graph->locals[s0].dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+                graph->locals[s0].delta_valid = 0;
+                triality_update_mask(&graph->locals[s0]);
+                graph->locals[s1].primary = VIEW_EDGE;
+                graph->locals[s1].dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+                graph->locals[s1].delta_valid = 0;
+                triality_update_mask(&graph->locals[s1]);
+            }
+
+            /* Build edges */
+            for (int64_t i = 0; i < graph_blocks; i++) {
+                hpc_cz(graph, 2 * i, 2 * i + 1);  /* intra-block: d ↔ dmin */
+                if (i + 1 < graph_blocks) {
+                    hpc_cz(graph, 2 * i, 2 * (i + 1));         /* d ↔ d neighbor */
+                    hpc_cz(graph, 2 * i + 1, 2 * (i + 1) + 1); /* dmin ↔ dmin    */
+                }
+            }
+
+            /* Run ensemble BP */
+            MobiusAmplitudeSheet *mobius = mobius_create(graph);
             double (*coarse_marg)[6] = (double (*)[6])calloc(graph_blocks, sizeof(double[6]));
             double (*fine_marg)[6]   = (double (*)[6])calloc(graph_blocks, sizeof(double[6]));
 
             for (int start = 0; start < 3; start++) {
                 z6_complex_amplitude_bp(mobius, (unsigned int)start, 200);
                 for (int64_t i = 0; i < graph_blocks; i++) {
-                    int64_t s_coarse = 2 * i;
-                    int64_t s_fine   = 2 * i + 1;
                     for (int v = 0; v < 6; v++) {
-                        double re_c = mobius->sheets[s_coarse].dressed_re[v];
-                        double im_c = mobius->sheets[s_coarse].dressed_im[v];
+                        double re_c = mobius->sheets[2*i].dressed_re[v];
+                        double im_c = mobius->sheets[2*i].dressed_im[v];
                         coarse_marg[i][v] += re_c * re_c + im_c * im_c;
 
-                        double re_f = mobius->sheets[s_fine].dressed_re[v];
-                        double im_f = mobius->sheets[s_fine].dressed_im[v];
+                        double re_f = mobius->sheets[2*i+1].dressed_re[v];
+                        double im_f = mobius->sheets[2*i+1].dressed_im[v];
                         fine_marg[i][v] += re_f * re_f + im_f * im_f;
                     }
                 }
             }
 
-            /* Reconstruct joint 36-candidate marginals from coarse × fine,
-             * then compute weighted-average sensitivity from SCALE_TABLE_36 */
+            /* Select best candidate per block from joint marginals */
             for (int64_t i = 0; i < graph_blocks; i++) {
                 double c_total = 0.0, f_total = 0.0;
                 for (int v = 0; v < 6; v++) {
@@ -1246,25 +1458,30 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                 }
                 if (c_total < 1e-30 || f_total < 1e-30) continue;
 
-                /* Joint probability: p(v0,v1) ≈ p_coarse(v0) × p_fine(v1)
-                 * Weighted average over 36 scale candidates */
-                double sensitivity = 0.0;
-                double joint_total = 0.0;
-                for (int v0 = 0; v0 < 6; v0++) {
-                    double p_c = coarse_marg[i][v0] / c_total;
-                    for (int v1 = 0; v1 < 6; v1++) {
-                        double p_f = fine_marg[i][v1] / f_total;
-                        double p_joint = p_c * p_f;
-                        int idx = v0 * 6 + v1;
-                        sensitivity += p_joint * (double)SCALE_TABLE_36[idx];
-                        joint_total += p_joint;
+                /* Find the (di, mi) with highest joint probability,
+                 * weighted by INVERSE error (lower error = better) */
+                int64_t blk = i * stride;
+                double best_score = -1e30;
+                int best_idx = 3 * 6 + 3;
+
+                for (int di = 0; di < 6; di++) {
+                    double p_d = coarse_marg[i][di] / c_total;
+                    for (int mi = 0; mi < 6; mi++) {
+                        double p_m = fine_marg[i][mi] / f_total;
+                        int cidx = di * 6 + mi;
+                        /* Score = joint probability × (1 / error)
+                         * BP marginal favors low-error candidates that
+                         * are also compatible with neighbors */
+                        double score = p_d * p_m / (candidate_errors[blk][cidx] + 1e-15);
+                        if (score > best_score) {
+                            best_score = score;
+                            best_idx = cidx;
+                        }
                     }
                 }
-                if (joint_total > 1e-30) {
-                    sensitivity /= joint_total;
-                    for (int64_t b = i * stride; b < (i + 1) * stride && b < n_blocks; b++)
-                        hpc_importance[b] = (float)sensitivity;
-                }
+
+                for (int64_t b = i * stride; b < (i + 1) * stride && b < n_blocks; b++)
+                    best_candidate[b] = best_idx;
             }
 
             free(coarse_marg);
@@ -1272,49 +1489,45 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
             mobius_destroy(mobius);
             hpc_destroy(graph);
         }
+    } else {
+        /* OPT_MSE or single block: pick candidate with lowest raw error */
+        for (int64_t blk = 0; blk < n_blocks; blk++) {
+            float best_err = candidate_errors[blk][0];
+            int best_idx = 0;
+            for (int c = 1; c < TOTAL_SCALE_CANDIDATES; c++) {
+                if (candidate_errors[blk][c] < best_err) {
+                    best_err = candidate_errors[blk][c];
+                    best_idx = c;
+                }
+            }
+            best_candidate[blk] = best_idx;
+        }
     }
 
-    /* ══ Per-block quantization with HPC-modulated importance ══ */
+    /* ══════════════════════════════════════════════════════════════════
+     * PHASE 4: Write final blocks using HPC-selected (d, dmin)
+     * ══════════════════════════════════════════════════════════════════ */
+
     for (int64_t blk = 0; blk < n_blocks; blk++) {
         const float *block_x = weights + blk * QK_K;
-        float hpc_weight = hpc_importance[blk];
+        int cidx = best_candidate[blk];
+        uint8_t L[QK_K];
 
-        uint8_t L[QK_K], Laux[16];
-        float wt[16];
-        float scales[N_SUB], mins[N_SUB], sw[N_SUB];
-
-        float sumx2 = 0;
-        for (int i = 0; i < QK_K; i++) sumx2 += block_x[i] * block_x[i];
-        float sigma2 = sumx2 / (float)QK_K;
-
-        for (int j = 0; j < N_SUB; j++) {
-            const float *sx = block_x + 16 * j;
-            sw[j] = 0;
-            for (int l = 0; l < 16; l++) {
-                float imp = (imat_importance) ? imat_importance[blk * QK_K + 16 * j + l] : 1.0f;
-                /* HPC modulation: boost importance for sensitive blocks */
-                wt[l] = imp * hpc_weight * sqrtf(sigma2 + sx[l] * sx[l]);
-                sw[j] += wt[l];
-            }
-            scales[j] = hpc_make_qkx2_quants(16, 3, sx, wt, L + 16 * j,
-                                                &mins[j], Laux);
-        }
-
-        uint8_t Ls[N_SUB], Lm[N_SUB];
-        float dm = hpc_make_qp_quants(N_SUB, 15, scales, Ls, sw);
-        float mm = hpc_make_qp_quants(N_SUB, 15, mins, Lm, sw);
-
-        output[blk].d = gguf_fp32_to_fp16(dm);
-        output[blk].dmin = gguf_fp32_to_fp16(mm);
-        dm = gguf_fp16_to_fp32(output[blk].d);
-        mm = gguf_fp16_to_fp32(output[blk].dmin);
+        output[blk].d    = candidate_d[blk][cidx];
+        output[blk].dmin = candidate_dmin[blk][cidx];
+        float dm = gguf_fp16_to_fp32(output[blk].d);
+        float mm = gguf_fp16_to_fp32(output[blk].dmin);
 
         for (int j = 0; j < N_SUB; j++)
-            output[blk].scales[j] = Ls[j] | (Lm[j] << 4);
+            output[blk].scales[j] = candidate_Ls[blk][cidx][j]
+                                   | (candidate_Lm[blk][cidx][j] << 4);
 
         for (int j = 0; j < N_SUB; j++) {
             float d = dm * (float)(output[blk].scales[j] & 0xF);
-            if (d < 1e-15f) continue;
+            if (d < 1e-15f) {
+                for (int k = 0; k < 16; k++) L[16 * j + k] = 0;
+                continue;
+            }
             float m = mm * (float)(output[blk].scales[j] >> 4);
             for (int k = 0; k < 16; k++) {
                 int q = gguf_nearest_int((block_x[16 * j + k] + m) / d);
@@ -1336,7 +1549,13 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
         total_err += gguf_q2_k_block_error(block_x, &output[blk]);
     }
 
-    free(hpc_importance);
+    free(seeds);
+    free(candidate_errors);
+    free(candidate_d);
+    free(candidate_dmin);
+    free(candidate_Ls);
+    free(candidate_Lm);
+    free(best_candidate);
     if (out_total_error) *out_total_error = total_err;
 }
 
