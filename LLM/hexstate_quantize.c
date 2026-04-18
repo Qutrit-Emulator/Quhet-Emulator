@@ -534,6 +534,30 @@ static const float SCALE_MULTIPLIERS[SCALE_FACTOR_COUNT] = {
     0.60f, 0.75f, 0.90f, 1.00f, 1.15f, 1.40f
 };
 
+/* ── Multi-quhit expanded scale table: 6×6 = 36 candidates ──
+ * Two quhits per block:
+ *   Quhit 0 (coarse): selects one of 6 scale ranges
+ *   Quhit 1 (fine):   selects refinement within that range
+ * Total: 36 scale candidates spanning 0.50 to 1.50 */
+#define QUHITS_PER_BLOCK  2
+#define TOTAL_SCALE_CANDIDATES (SCALE_FACTOR_COUNT * SCALE_FACTOR_COUNT)
+
+static float SCALE_TABLE_36[TOTAL_SCALE_CANDIDATES];
+static int scale_table_initialized = 0;
+
+static void init_scale_table_36(void) {
+    if (scale_table_initialized) return;
+    /* 36 candidates: geometric spacing centered on 1.0 */
+    for (int coarse = 0; coarse < 6; coarse++) {
+        for (int fine = 0; fine < 6; fine++) {
+            int idx = coarse * 6 + fine;
+            /* Range: 0.50 to 1.50, 36 steps */
+            SCALE_TABLE_36[idx] = 0.50f + (float)idx * (1.00f / 35.0f);
+        }
+    }
+    scale_table_initialized = 1;
+}
+
 /* Compute the Q2_K sub-block reconstruction error for a block at a given
  * scale multiplier, optionally weighted by importance vector */
 static float compute_block_error_q2k(const float *weights, int block_size,
@@ -549,25 +573,33 @@ static float compute_block_error_q2k(const float *weights, int block_size,
     if (min_val > 0) min_val = 0;
 
     float range = (max_val - min_val) * scale_mult;
-    float d = range / 3.0f;
-    if (d < 1e-15f) return 0.0f;
+    if (range < 1e-15f) return 0.0f;
+    float inv_range = 3.0f / range;
 
     float err = 0.0f;
     for (int j = 0; j < block_size; j++) {
-        int q = gguf_nearest_int((weights[j] - min_val) / d);
-        if (q < 0) q = 0;
-        if (q > 3) q = 3;
-        float deq = min_val + (float)q * d;
-        float diff = weights[j] - deq;
-        float w = (importance && imp_offset + j < block_size * 256) ?
-                  importance[imp_offset + j] : 1.0f;
+        float x = weights[j];
+        int q = (int)((x - min_val * scale_mult) * inv_range + 0.5f);
+        if (q < 0) q = 0; if (q > 3) q = 3;
+        float deq = min_val * scale_mult + (float)q * range / 3.0f;
+        float diff = x - deq;
+        float w = (importance) ? importance[imp_offset + j] : 1.0f;
         err += diff * diff * w;
     }
     return err;
 }
 
-/* Build the HPC sensitivity graph for a single tensor.
- * block_size: QK_K (256) for Q2_K */
+/* Build multi-quhit HPC sensitivity graph.
+ * 2 quhits per block → 36 scale candidates per block.
+ *
+ * Graph layout: sites [0..2*n-1] where:
+ *   site 2*i     = coarse quhit for block i
+ *   site 2*i + 1 = fine quhit for block i
+ *
+ * Edges:
+ *   Intra-block: CZ(2i, 2i+1) — coarse↔fine coupling
+ *   Inter-block: CZ(2i, 2(i+1)) — coarse↔coarse neighbor
+ *                CZ(2i+1, 2(i+1)+1) — fine↔fine neighbor */
 static HPCGraph *build_sensitivity_graph(const float *weights,
                                            int64_t n_elements,
                                            int block_size,
@@ -577,79 +609,105 @@ static HPCGraph *build_sensitivity_graph(const float *weights,
     int64_t n_blocks = n_elements / block_size;
     if (n_blocks < 2) return NULL;
 
-    /* Cap graph size to prevent memory explosion on very large tensors.
-     * For tensors with > 16384 blocks, we subsample. */
-    int64_t graph_blocks = (n_blocks > 16384) ? 16384 : n_blocks;
-    int64_t stride = n_blocks / graph_blocks;
+    init_scale_table_36();
 
-    HPCGraph *graph = hpc_create(graph_blocks);
+    int64_t graph_blocks = (n_blocks > 8192) ? 8192 : n_blocks;
+    int64_t stride = n_blocks / graph_blocks;
+    int64_t n_sites = graph_blocks * QUHITS_PER_BLOCK;
+
+    HPCGraph *graph = hpc_create(n_sites);
     if (!graph) return NULL;
 
-    /* Initialize all sites with DFT (uniform superposition) */
-    for (int64_t i = 0; i < graph_blocks; i++)
+    for (int64_t i = 0; i < n_sites; i++)
         triality_dft(&graph->locals[i]);
 
-    /* Encode block statistics as local amplitudes */
+    /* Compute errors for all 36 scale candidates per block,
+     * then project onto coarse (quhit 0) and fine (quhit 1) marginals */
     for (int64_t i = 0; i < graph_blocks; i++) {
         int64_t block_idx = i * stride;
         const float *block_weights = weights + block_idx * block_size;
 
-        /* Compute error for each of the 6 scale candidates */
-        float errors[SCALE_FACTOR_COUNT];
+        /* Evaluate all 36 candidates */
+        float errors[TOTAL_SCALE_CANDIDATES];
         float min_err = 1e30f;
-        for (int v = 0; v < SCALE_FACTOR_COUNT; v++) {
-            errors[v] = compute_block_error_q2k(block_weights, block_size,
-                                                  SCALE_MULTIPLIERS[v],
+        for (int c = 0; c < TOTAL_SCALE_CANDIDATES; c++) {
+            errors[c] = compute_block_error_q2k(block_weights, block_size,
+                                                  SCALE_TABLE_36[c],
                                                   importance,
                                                   (int)(block_idx * block_size));
-            if (errors[v] < min_err) min_err = errors[v];
+            if (errors[c] < min_err) min_err = errors[c];
         }
 
-        /* Convert errors to Boltzmann amplitudes:
-         *   a_k(v) = exp(-error_v / (2 * temperature))
-         * This is the quantization analog of the oracle phase encoding. */
-        double amp_re[6], amp_im[6];
-        double norm = 0.0;
-        for (int v = 0; v < 6; v++) {
-            amp_re[v] = exp(-(double)(errors[v] - min_err) /
-                            (2.0 * (double)temperature));
-            amp_im[v] = 0.0;
-            norm += amp_re[v] * amp_re[v];
-        }
-
-        /* Normalize */
-        if (norm > 1e-30) {
-            double inv_norm = 1.0 / sqrt(norm);
-            for (int v = 0; v < 6; v++) {
-                amp_re[v] *= inv_norm;
+        /* Project onto quhit 0 (coarse): marginalize over fine dimension
+         * amp_coarse[v0] = Σ_{v1} exp(-error(v0*6+v1) / 2T) */
+        double coarse_re[6], coarse_im[6];
+        double coarse_norm = 0.0;
+        for (int v0 = 0; v0 < 6; v0++) {
+            coarse_re[v0] = 0.0;
+            coarse_im[v0] = 0.0;
+            for (int v1 = 0; v1 < 6; v1++) {
+                int idx = v0 * 6 + v1;
+                coarse_re[v0] += exp(-(double)(errors[idx] - min_err) /
+                                      (2.0 * (double)temperature));
             }
+            coarse_norm += coarse_re[v0] * coarse_re[v0];
+        }
+        if (coarse_norm > 1e-30) {
+            double inv = 1.0 / sqrt(coarse_norm);
+            for (int v = 0; v < 6; v++) coarse_re[v] *= inv;
         }
 
-        /* Write into the quhit local state */
-        for (int v = 0; v < 6; v++) {
-            graph->locals[i].edge_re[v] = amp_re[v];
-            graph->locals[i].edge_im[v] = amp_im[v];
+        /* Project onto quhit 1 (fine): marginalize over coarse dimension
+         * amp_fine[v1] = Σ_{v0} exp(-error(v0*6+v1) / 2T) */
+        double fine_re[6], fine_im[6];
+        double fine_norm = 0.0;
+        for (int v1 = 0; v1 < 6; v1++) {
+            fine_re[v1] = 0.0;
+            fine_im[v1] = 0.0;
+            for (int v0 = 0; v0 < 6; v0++) {
+                int idx = v0 * 6 + v1;
+                fine_re[v1] += exp(-(double)(errors[idx] - min_err) /
+                                    (2.0 * (double)temperature));
+            }
+            fine_norm += fine_re[v1] * fine_re[v1];
         }
-        graph->locals[i].primary = VIEW_EDGE;
-        graph->locals[i].dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
-        graph->locals[i].delta_valid = 0;
-        triality_update_mask(&graph->locals[i]);
+        if (fine_norm > 1e-30) {
+            double inv = 1.0 / sqrt(fine_norm);
+            for (int v = 0; v < 6; v++) fine_re[v] *= inv;
+        }
+
+        /* Write coarse quhit (site 2*i) */
+        int64_t s_coarse = 2 * i;
+        for (int v = 0; v < 6; v++) {
+            graph->locals[s_coarse].edge_re[v] = coarse_re[v];
+            graph->locals[s_coarse].edge_im[v] = 0.0;
+        }
+        graph->locals[s_coarse].primary = VIEW_EDGE;
+        graph->locals[s_coarse].dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+        graph->locals[s_coarse].delta_valid = 0;
+        triality_update_mask(&graph->locals[s_coarse]);
+
+        /* Write fine quhit (site 2*i + 1) */
+        int64_t s_fine = 2 * i + 1;
+        for (int v = 0; v < 6; v++) {
+            graph->locals[s_fine].edge_re[v] = fine_re[v];
+            graph->locals[s_fine].edge_im[v] = 0.0;
+        }
+        graph->locals[s_fine].primary = VIEW_EDGE;
+        graph->locals[s_fine].dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+        graph->locals[s_fine].delta_valid = 0;
+        triality_update_mask(&graph->locals[s_fine]);
     }
 
-    /* ── Build intra-tensor edges ──
-     * Nearest-neighbor CZ edges between adjacent blocks. */
-    for (int64_t i = 0; i < graph_blocks - 1; i++) {
-        hpc_cz(graph, i, i + 1);
-    }
+    /* ── Build edges ── */
+    for (int64_t i = 0; i < graph_blocks; i++) {
+        /* Intra-block: coarse ↔ fine coupling */
+        hpc_cz(graph, 2 * i, 2 * i + 1);
 
-    /* Add Z₆ hexagram edges within groups of 6 blocks
-     * (preserving the D=6 triality structure) */
-    for (int64_t base = 0; base + 5 < graph_blocks; base += 6) {
-        for (int a = 0; a < 6; a++) {
-            int b = (a + 1) % 6;
-            if (abs(a - b) > 1 || (a == 0 && b == 5)) {
-                hpc_cz(graph, base + a, base + b);
-            }
+        /* Inter-block: neighbor coupling */
+        if (i + 1 < graph_blocks) {
+            hpc_cz(graph, 2 * i, 2 * (i + 1));         /* coarse ↔ coarse */
+            hpc_cz(graph, 2 * i + 1, 2 * (i + 1) + 1); /* fine ↔ fine     */
         }
     }
 
@@ -1153,43 +1211,64 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                                                     imat_importance);
         if (graph) {
             MobiusAmplitudeSheet *mobius = mobius_create(graph);
-            int64_t graph_blocks = (int64_t)graph->n_sites;
+            int64_t n_sites = (int64_t)graph->n_sites;
+            int64_t graph_blocks = n_sites / QUHITS_PER_BLOCK;
             int64_t stride = n_blocks / graph_blocks;
 
-            /* Ensemble-averaged BP (multiple seeds, like tesseract_factor.c) */
-            double (*marginals)[6] = (double (*)[6])calloc(graph_blocks, sizeof(double[6]));
+            /* Allocate marginals for both quhits per block: [block][quhit][6] */
+            double (*coarse_marg)[6] = (double (*)[6])calloc(graph_blocks, sizeof(double[6]));
+            double (*fine_marg)[6]   = (double (*)[6])calloc(graph_blocks, sizeof(double[6]));
 
             for (int start = 0; start < 3; start++) {
                 z6_complex_amplitude_bp(mobius, (unsigned int)start, 200);
-                for (int64_t s = 0; s < graph_blocks; s++) {
+                for (int64_t i = 0; i < graph_blocks; i++) {
+                    int64_t s_coarse = 2 * i;
+                    int64_t s_fine   = 2 * i + 1;
                     for (int v = 0; v < 6; v++) {
-                        double re = mobius->sheets[s].dressed_re[v];
-                        double im = mobius->sheets[s].dressed_im[v];
-                        marginals[s][v] += re * re + im * im;
+                        double re_c = mobius->sheets[s_coarse].dressed_re[v];
+                        double im_c = mobius->sheets[s_coarse].dressed_im[v];
+                        coarse_marg[i][v] += re_c * re_c + im_c * im_c;
+
+                        double re_f = mobius->sheets[s_fine].dressed_re[v];
+                        double im_f = mobius->sheets[s_fine].dressed_im[v];
+                        fine_marg[i][v] += re_f * re_f + im_f * im_f;
                     }
                 }
             }
 
-            /* Convert marginals → importance weight per block.
-             * Higher marginal weight on conservative scales (v=4,5) means
-             * this block is sensitive → boost its importance weight.
-             * Higher weight on aggressive scales (v=0,1) means insensitive
-             * → reduce its importance weight (let it compress harder). */
-            for (int64_t s = 0; s < graph_blocks; s++) {
-                double total = 0.0;
-                for (int v = 0; v < 6; v++) total += marginals[s][v];
-                if (total > 1e-30) {
-                    /* Sensitivity score: weighted sum where conservative
-                     * scales contribute more. Range: ~0.6 to ~1.4 */
-                    double sensitivity = 0.0;
-                    for (int v = 0; v < 6; v++)
-                        sensitivity += (marginals[s][v] / total) * (double)SCALE_MULTIPLIERS[v];
-                    for (int64_t b = s * stride; b < (s + 1) * stride && b < n_blocks; b++)
+            /* Reconstruct joint 36-candidate marginals from coarse × fine,
+             * then compute weighted-average sensitivity from SCALE_TABLE_36 */
+            for (int64_t i = 0; i < graph_blocks; i++) {
+                double c_total = 0.0, f_total = 0.0;
+                for (int v = 0; v < 6; v++) {
+                    c_total += coarse_marg[i][v];
+                    f_total += fine_marg[i][v];
+                }
+                if (c_total < 1e-30 || f_total < 1e-30) continue;
+
+                /* Joint probability: p(v0,v1) ≈ p_coarse(v0) × p_fine(v1)
+                 * Weighted average over 36 scale candidates */
+                double sensitivity = 0.0;
+                double joint_total = 0.0;
+                for (int v0 = 0; v0 < 6; v0++) {
+                    double p_c = coarse_marg[i][v0] / c_total;
+                    for (int v1 = 0; v1 < 6; v1++) {
+                        double p_f = fine_marg[i][v1] / f_total;
+                        double p_joint = p_c * p_f;
+                        int idx = v0 * 6 + v1;
+                        sensitivity += p_joint * (double)SCALE_TABLE_36[idx];
+                        joint_total += p_joint;
+                    }
+                }
+                if (joint_total > 1e-30) {
+                    sensitivity /= joint_total;
+                    for (int64_t b = i * stride; b < (i + 1) * stride && b < n_blocks; b++)
                         hpc_importance[b] = (float)sensitivity;
                 }
             }
 
-            free(marginals);
+            free(coarse_marg);
+            free(fine_marg);
             mobius_destroy(mobius);
             hpc_destroy(graph);
         }
