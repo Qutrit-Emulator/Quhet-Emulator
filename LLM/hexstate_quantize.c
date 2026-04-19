@@ -1302,9 +1302,9 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                     } else {
                         trial_Lm[j] = 0;
                     }
-                    memcpy(candidate_Ls[blk][cidx], trial_Ls, 16);
-                    memcpy(candidate_Lm[blk][cidx], trial_Lm, 16);
                 }
+                memcpy(candidate_Ls[blk][cidx], trial_Ls, 16);
+                memcpy(candidate_Lm[blk][cidx], trial_Lm, 16);
 
                 /* Fully re-quantize and measure MSE with recomputed Ls/Lm */
                 float err = 0.0f;
