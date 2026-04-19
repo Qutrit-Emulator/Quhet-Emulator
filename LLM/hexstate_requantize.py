@@ -70,6 +70,18 @@ def _load_hexstate_lib():
             ctypes.c_int,                     # verbose
         ]
 
+        # Q4_0 HPC quantizer (for attention tensors)
+        if hasattr(lib, 'hexstate_quantize_tensor_q4_0_hpc'):
+            lib.hexstate_quantize_tensor_q4_0_hpc.restype = None
+            lib.hexstate_quantize_tensor_q4_0_hpc.argtypes = [
+                ctypes.POINTER(ctypes.c_float),  # weights
+                ctypes.c_int64,                   # n_elements
+                ctypes.c_void_p,                  # output
+                ctypes.POINTER(ctypes.c_float),   # out_error
+                ctypes.POINTER(ctypes.c_float),   # imat_importance (can be NULL)
+                ctypes.c_int,                     # verbose
+            ]
+
         lib.hexstate_init()
         _HEXSTATE_LIB = lib
         return lib
@@ -515,6 +527,21 @@ def quantize_tensor_q2k(f32_data):
     return result.tobytes(), n_blocks
 
 
+def is_attention_tensor(name):
+    """Detect attention Q/K/V/O projection tensors.
+    These are the most sensitive to quantization and get promoted to Q4_0."""
+    attn_patterns = [
+        'attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'attn_output.weight',
+        'attn_qkv.weight',
+        'self_attn.q_proj.weight', 'self_attn.k_proj.weight',
+        'self_attn.v_proj.weight', 'self_attn.o_proj.weight',
+    ]
+    for pat in attn_patterns:
+        if pat in name:
+            return True
+    return False
+
+
 def should_quantize(name, n_dims, dims):
     """Should this tensor be quantized to Q2_K?
 
@@ -655,17 +682,26 @@ def main():
         # ── Determine output types ──
         quant_plan = []
         total_quant = 0
+        total_attn = 0
         total_keep = 0
         for ti in tensor_infos:
-            will_quant = False if quantize_none else should_quantize(ti['name'], ti['n_dims'], ti['dims'])
-            quant_plan.append(will_quant)
-            if will_quant:
-                total_quant += 1
+            if quantize_none:
+                will_quant = False
+            elif should_quantize(ti['name'], ti['n_dims'], ti['dims']):
+                if is_attention_tensor(ti['name']):
+                    will_quant = 'ATTN_Q4'  # Promote attention to Q4_0 HPC
+                    total_attn += 1
+                else:
+                    will_quant = True
+                    total_quant += 1
             else:
+                will_quant = False
                 total_keep += 1
+            quant_plan.append(will_quant)
 
-        print(f"  Tensors to quantize (Q2_K): {total_quant}")
-        print(f"  Tensors to keep as-is:      {total_keep}")
+        print(f"  Tensors to quantize (Q2_K):     {total_quant}")
+        print(f"  Tensors to promote (Q4_0·HPC):  {total_attn}")
+        print(f"  Tensors to keep as-is:          {total_keep}")
         print()
 
         # ── Compute output tensor sizes and offsets ──
@@ -677,7 +713,13 @@ def main():
                 out_dims = list(ti['dims'])
                 dim0 = out_dims[0] if ti['n_dims'] >= 2 else ti['n_elements']
 
-                if dim0 % QK_K == 0:
+                if quant_plan[i] == 'ATTN_Q4':
+                    # Attention tensor → Q4_0 HPC (4.5 bpw)
+                    out_type = GGML_TYPE_Q4_0
+                    n_blocks = (ti['n_elements'] + 31) // 32
+                    out_size = n_blocks * 18
+                    print(f"  [ATTN→Q4_0·HPC] {ti['name']} ({ti['n_elements']} elements)")
+                elif dim0 % QK_K == 0:
                     # Q2_K (2.6 bpw, block_size=256)
                     out_type = GGML_TYPE_Q2_K
                     n_blocks = (ti['n_elements'] + QK_K - 1) // QK_K
@@ -855,8 +897,8 @@ def main():
                 fin.seek(abs_offset)
                 raw_data = fin.read(ti['data_size'])
 
-                if quant_plan[i] == 'Q4_0':
-                    # ── Q4_0 for non-QK_K-aligned tensors ──
+                if quant_plan[i] in ('Q4_0', 'ATTN_Q4'):
+                    # ── Q4_0 quantization (fallback or attention HPC) ──
                     if ti['type'] == GGML_TYPE_BF16:
                         f32 = bf16_to_f32(raw_data, ti['n_elements'])
                     elif ti['type'] == GGML_TYPE_F16:
@@ -869,26 +911,61 @@ def main():
                         if pad > 0: fout.write(b'\x00' * pad)
                         continue
 
-                    # Vectorized Q4_0: process all blocks at once
-                    blocks = f32.reshape(-1, 32)
-                    amax = np.max(np.abs(blocks), axis=1)
-                    d = amax / 7.0
-                    d[d == 0] = 1.0  # avoid div by zero
-                    qs = np.clip(np.round(blocks / d[:, None]) + 8, 0, 15).astype(np.uint8)
-                    d_orig = amax / 7.0  # restore zeros
-                    d_fp16 = d_orig.astype(np.float16)
+                    # Pad to 32-element boundary
+                    n_el = len(f32)
+                    pad_to = ((n_el + 31) // 32) * 32
+                    if pad_to > n_el:
+                        f32 = np.concatenate([f32, np.zeros(pad_to - n_el, dtype=np.float32)])
+                        n_el = pad_to
 
-                    n_blocks_q4 = len(blocks)
-                    out_buf = bytearray(n_blocks_q4 * 18)
-                    for b in range(n_blocks_q4):
-                        off = b * 18
-                        struct.pack_into('<e', out_buf, off, float(d_fp16[b]))
-                        for j in range(16):
-                            out_buf[off + 2 + j] = int(qs[b, j]) | (int(qs[b, j + 16]) << 4)
+                    n_blocks_q4 = n_el // 32
 
-                    fout.write(bytes(out_buf))
+                    # Use HPC for attention tensors if available
+                    if quant_plan[i] == 'ATTN_Q4' and use_hpc and hasattr(_HEXSTATE_LIB, 'hexstate_quantize_tensor_q4_0_hpc'):
+                        output_buf = np.zeros(n_blocks_q4 * 18, dtype=np.uint8)
+                        error = ctypes.c_float(0.0)
+                        f32_c = np.ascontiguousarray(f32, dtype=np.float32)
+
+                        # Look up imatrix importance
+                        imat_ptr = None
+                        if imatrix_data and ti['name'] in imatrix_data:
+                            iw = imatrix_data[ti['name']]
+                            n_cols = iw.shape[0]
+                            n_rows = n_el // n_cols if n_cols > 0 else 1
+                            imat_full = np.tile(iw, n_rows)[:n_el].astype(np.float32)
+                            imat_c = np.ascontiguousarray(imat_full)
+                            imat_ptr = imat_c.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+                        _HEXSTATE_LIB.hexstate_quantize_tensor_q4_0_hpc(
+                            f32_c.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                            ctypes.c_int64(n_el),
+                            output_buf.ctypes.data_as(ctypes.c_void_p),
+                            ctypes.byref(error),
+                            imat_ptr,
+                            ctypes.c_int(0),  # verbose
+                        )
+                        fout.write(output_buf.tobytes())
+                        print(f"\n  [Q4_0·HPC] {ti['name']} RMSE={np.sqrt(error.value / ti['n_elements']):.6e}")
+                    else:
+                        # Vectorized Q4_0: process all blocks at once
+                        blocks = f32.reshape(-1, 32)
+                        amax = np.max(np.abs(blocks), axis=1)
+                        d = amax / 7.0
+                        d[d == 0] = 1.0  # avoid div by zero
+                        qs = np.clip(np.round(blocks / d[:, None]) + 8, 0, 15).astype(np.uint8)
+                        d_orig = amax / 7.0  # restore zeros
+                        d_fp16 = d_orig.astype(np.float16)
+
+                        out_buf = bytearray(n_blocks_q4 * 18)
+                        for b in range(n_blocks_q4):
+                            off = b * 18
+                            struct.pack_into('<e', out_buf, off, float(d_fp16[b]))
+                            for j in range(16):
+                                out_buf[off + 2 + j] = int(qs[b, j]) | (int(qs[b, j + 16]) << 4)
+                        fout.write(bytes(out_buf))
+
                     quant_count += 1
-                    total_quant_bytes += len(out_buf)
+                    total_quant_bytes += n_blocks_q4 * 18
 
                 elif quant_plan[i]:
                     # Convert to F32 for quantization
