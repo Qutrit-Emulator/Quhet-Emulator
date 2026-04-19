@@ -397,11 +397,17 @@ static void map_tensor_name(const char *hf_name, char *gguf_name, int buflen)
         }
     }
 
-    /* Layer mappings: "model.layers.N.xxx" → "blk.N.xxx" */
-    if (strncmp(hf_name, "model.layers.", 13) == 0) {
+    /* Layer mappings: "model.layers.N.xxx" or "model.language_model.layers.N.xxx" → "blk.N.xxx" */
+    const char *layer_prefix = NULL;
+    if (strncmp(hf_name, "model.layers.", 13) == 0)
+        layer_prefix = hf_name + 13;
+    else if (strncmp(hf_name, "model.language_model.layers.", 27) == 0)
+        layer_prefix = hf_name + 27;
+
+    if (layer_prefix) {
         int layer_idx;
         char rest[ST_MAX_NAME_LEN];
-        if (sscanf(hf_name, "model.layers.%d.%255s", &layer_idx, rest) == 2) {
+        if (sscanf(layer_prefix, "%d.%255s", &layer_idx, rest) == 2) {
             /* Map sublayer names */
             struct { const char *from; const char *to; } layer_maps[] = {
                 /* Standard attention projections */
@@ -517,16 +523,17 @@ static int should_quantize(const STTensorInfo *ti, const char *gguf_name)
  * Promoting these to Q4_0 (~4.5bpw) doubles their precision. */
 static int is_attention_tensor(const char *gguf_name)
 {
-    /* Gemma / LLaMA style: blk.N.attn_q/k/v/output.weight */
+    /* Gemma / LLaMA style GGUF names: blk.N.attn_q/k/v/output.weight */
     if (strstr(gguf_name, "attn_q.weight") != NULL) return 1;
     if (strstr(gguf_name, "attn_k.weight") != NULL) return 1;
     if (strstr(gguf_name, "attn_v.weight") != NULL) return 1;
     if (strstr(gguf_name, "attn_output.weight") != NULL) return 1;
-    /* HuggingFace style: q_proj, k_proj, v_proj, o_proj */
-    if (strstr(gguf_name, "q_proj") != NULL) return 1;
-    if (strstr(gguf_name, "k_proj") != NULL) return 1;
-    if (strstr(gguf_name, "v_proj") != NULL) return 1;
-    if (strstr(gguf_name, "o_proj") != NULL) return 1;
+    if (strstr(gguf_name, "attn_qkv.weight") != NULL) return 1;
+    /* HuggingFace style (fallthrough names) */
+    if (strstr(gguf_name, "self_attn.q_proj.weight") != NULL) return 1;
+    if (strstr(gguf_name, "self_attn.k_proj.weight") != NULL) return 1;
+    if (strstr(gguf_name, "self_attn.v_proj.weight") != NULL) return 1;
+    if (strstr(gguf_name, "self_attn.o_proj.weight") != NULL) return 1;
     return 0;
 }
 
@@ -1191,6 +1198,281 @@ static double z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int see
 
     free(msgs);
     return prev_residual;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * HPC-OPTIMIZED Q4_0 QUANTIZATION (for attention tensors)
+ *
+ * Same architecture as Q2_K HPC pipeline, but simpler:
+ *   - One parameter per block (scale d only, no dmin)
+ *   - Single quhit per block (6 states)
+ *   - 10 candidate scales → bin to 6 for BP
+ *   - 12-beam Hensel search for globally optimal configuration
+ *   - Triality 3-view marginals for robust scoring
+ *
+ * Q4_0 block: 32 weights, 16 levels (0–15), dequant: w = (q - 8) * d
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#define Q4_N_CAND 10  /* scale candidates for Q4_0 */
+#define Q4_N_BEAMS 12
+
+static const float Q4_NEIGHBOR_MULTS[Q4_N_CAND] = {
+    0.82f, 0.855f, 0.89f, 0.925f, 0.96f, 1.00f, 1.035f, 1.07f, 1.105f, 1.15f
+};
+static const int Q4_CAND_TO_QUHIT[Q4_N_CAND] = { 0, 0, 1, 1, 2, 3, 3, 4, 4, 5 };
+
+static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
+                                       BlockQ4_0 *output, float *out_total_error,
+                                       const float *imat_importance, int verbose)
+{
+    int64_t n_blocks = n_elements / QK4_0;
+    float total_err = 0.0f;
+
+    /* ── Phase 1: Greedy seed — compute scale per block ── */
+    float *greedy_d = (float *)calloc(n_blocks, sizeof(float));
+
+    for (int64_t blk = 0; blk < n_blocks; blk++) {
+        const float *bw = weights + blk * QK4_0;
+        float amax = 0.0f;
+        for (int j = 0; j < QK4_0; j++) {
+            float av = fabsf(bw[j]);
+            if (av > amax) amax = av;
+        }
+        greedy_d[blk] = amax / 7.0f;
+    }
+
+    /* ── Phase 2: Generate 10 candidate scales per block, measure MSE ── */
+    float (*cand_errors)[Q4_N_CAND] = (float (*)[Q4_N_CAND])
+        calloc(n_blocks, sizeof(float[Q4_N_CAND]));
+    uint16_t (*cand_d16)[Q4_N_CAND] = (uint16_t (*)[Q4_N_CAND])
+        calloc(n_blocks, sizeof(uint16_t[Q4_N_CAND]));
+
+    for (int64_t blk = 0; blk < n_blocks; blk++) {
+        const float *bw = weights + blk * QK4_0;
+        for (int ci = 0; ci < Q4_N_CAND; ci++) {
+            float trial_d = greedy_d[blk] * Q4_NEIGHBOR_MULTS[ci];
+            uint16_t d16 = gguf_fp32_to_fp16(trial_d);
+            float actual_d = gguf_fp16_to_fp32(d16);
+            cand_d16[blk][ci] = d16;
+
+            float id = (actual_d > 1e-15f) ? 1.0f / actual_d : 0.0f;
+            float err = 0.0f;
+
+            for (int j = 0; j < QK4_0; j++) {
+                float x = bw[j];
+                int q = (int)(x * id + 8.5f);
+                if (q < 0) q = 0; if (q > 15) q = 15;
+                float deq = ((float)q - 8.0f) * actual_d;
+                float diff = x - deq;
+                float w = (imat_importance) ?
+                          imat_importance[blk * QK4_0 + j] : 1.0f;
+                err += diff * diff * w;
+            }
+            cand_errors[blk][ci] = err;
+        }
+    }
+
+    /* ── Phase 3: HPC graph — single quhit per block ── */
+    int *best_candidate = (int *)malloc(n_blocks * sizeof(int));
+    for (int64_t i = 0; i < n_blocks; i++)
+        best_candidate[i] = 5;  /* Q4_NEIGHBOR_MULTS[5] = 1.00 */
+
+    if (n_blocks >= 2) {
+        float temperature = 0.5f;
+        int64_t graph_blocks = (n_blocks > 8192) ? 8192 : n_blocks;
+        int64_t stride = n_blocks / graph_blocks;
+        int64_t n_sites = graph_blocks;  /* 1 quhit per block */
+
+        HPCGraph *graph = hpc_create(n_sites);
+        if (graph) {
+            for (int64_t i = 0; i < n_sites; i++)
+                triality_dft(&graph->locals[i]);
+
+            /* Encode candidate errors as Boltzmann amplitudes */
+            for (int64_t i = 0; i < graph_blocks; i++) {
+                int64_t blk = i * stride;
+                float min_err = 1e30f;
+                for (int c = 0; c < Q4_N_CAND; c++)
+                    if (cand_errors[blk][c] < min_err)
+                        min_err = cand_errors[blk][c];
+
+                double amp_re[6];
+                double amp_norm = 0.0;
+                for (int qi = 0; qi < 6; qi++) amp_re[qi] = 0.0;
+                for (int ci = 0; ci < Q4_N_CAND; ci++) {
+                    int qi = Q4_CAND_TO_QUHIT[ci];
+                    amp_re[qi] += exp(-(double)(cand_errors[blk][ci] - min_err) /
+                                      (2.0 * (double)temperature));
+                }
+                for (int qi = 0; qi < 6; qi++)
+                    amp_norm += amp_re[qi] * amp_re[qi];
+                if (amp_norm > 1e-30) {
+                    double inv = 1.0 / sqrt(amp_norm);
+                    for (int v = 0; v < 6; v++) amp_re[v] *= inv;
+                }
+
+                for (int v = 0; v < 6; v++) {
+                    graph->locals[i].edge_re[v] = amp_re[v];
+                    graph->locals[i].edge_im[v] = 0.0;
+                }
+                graph->locals[i].primary = VIEW_EDGE;
+                graph->locals[i].dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+                graph->locals[i].delta_valid = 0;
+                triality_update_mask(&graph->locals[i]);
+            }
+
+            /* Neighbor edges */
+            for (int64_t i = 0; i < graph_blocks - 1; i++)
+                hpc_cz(graph, i, i + 1);
+
+            /* Ensemble BP with triality marginals */
+            MobiusAmplitudeSheet *mobius = mobius_create(graph);
+            double (*marg)[6] = (double (*)[6])calloc(graph_blocks, sizeof(double[6]));
+
+            for (int start = 0; start < 3; start++) {
+                z6_complex_amplitude_bp(mobius, (unsigned int)start, 200);
+                for (int64_t i = 0; i < graph_blocks; i++) {
+                    /* Triality 3-view marginal */
+                    double edge_prob[6], vert_re[6], vert_im[6], vert_prob[6], diag_prob[6];
+                    for (int v = 0; v < 6; v++) {
+                        double re = mobius->sheets[i].dressed_re[v];
+                        double im = mobius->sheets[i].dressed_im[v];
+                        edge_prob[v] = re * re + im * im;
+                    }
+                    for (int j = 0; j < 6; j++) {
+                        double sr = 0, si = 0;
+                        for (int k = 0; k < 6; k++) {
+                            int idx = (j * k) % 6;
+                            sr += mobius->sheets[i].dressed_re[k] * W6_RE[idx]
+                                - mobius->sheets[i].dressed_im[k] * W6_IM[idx];
+                            si += mobius->sheets[i].dressed_re[k] * W6_IM[idx]
+                                + mobius->sheets[i].dressed_im[k] * W6_RE[idx];
+                        }
+                        vert_re[j] = sr * INV_SQRT6;
+                        vert_im[j] = si * INV_SQRT6;
+                        vert_prob[j] = vert_re[j]*vert_re[j] + vert_im[j]*vert_im[j];
+                    }
+                    for (int j = 0; j < 6; j++) {
+                        double sr = 0, si = 0;
+                        for (int k = 0; k < 6; k++) {
+                            int idx = (j * k) % 6;
+                            sr += vert_re[k] * W6_RE[idx] - vert_im[k] * W6_IM[idx];
+                            si += vert_re[k] * W6_IM[idx] + vert_im[k] * W6_RE[idx];
+                        }
+                        double dr = sr * INV_SQRT6, di = si * INV_SQRT6;
+                        diag_prob[j] = dr*dr + di*di;
+                    }
+                    for (int v = 0; v < 6; v++)
+                        marg[i][v] += cbrt(edge_prob[v] * vert_prob[v] * diag_prob[v]);
+                }
+            }
+
+            /* Beam search over candidates */
+            typedef struct { double acc_error; int *selections; } Q4Beam;
+            Q4Beam beams[Q4_N_BEAMS];
+            int active_beams = 1;
+            for (int b = 0; b < Q4_N_BEAMS; b++) {
+                beams[b].acc_error = 0.0;
+                beams[b].selections = (int *)calloc(graph_blocks, sizeof(int));
+                for (int64_t j = 0; j < graph_blocks; j++)
+                    beams[b].selections[j] = 5;
+            }
+
+            for (int64_t i = 0; i < graph_blocks; i++) {
+                double m_total = 0.0;
+                for (int v = 0; v < 6; v++) m_total += marg[i][v];
+
+                double cand_score[Q4_N_CAND];
+                int64_t blk = i * stride;
+                for (int ci = 0; ci < Q4_N_CAND; ci++) {
+                    int qi = Q4_CAND_TO_QUHIT[ci];
+                    double p = (m_total > 1e-30) ? marg[i][qi] / m_total : 1.0/6.0;
+                    cand_score[ci] = p / (cand_errors[blk][ci] + 1e-15);
+                }
+
+                typedef struct { double score; int beam_idx; int cand_idx; } Q4Ext;
+                Q4Ext extensions[Q4_N_BEAMS * Q4_N_CAND];
+                int n_ext = 0;
+                for (int b = 0; b < active_beams; b++) {
+                    for (int c = 0; c < Q4_N_CAND; c++) {
+                        double ext_err = beams[b].acc_error + cand_errors[blk][c];
+                        extensions[n_ext].score = cand_score[c] / (ext_err + 1e-15);
+                        extensions[n_ext].beam_idx = b;
+                        extensions[n_ext].cand_idx = c;
+                        n_ext++;
+                    }
+                }
+
+                int top_k = (n_ext < Q4_N_BEAMS) ? n_ext : Q4_N_BEAMS;
+                int top_indices[Q4_N_BEAMS];
+                for (int k = 0; k < top_k; k++) {
+                    int best = -1; double best_s = -1e30;
+                    for (int e = 0; e < n_ext; e++) {
+                        if (extensions[e].score > best_s) {
+                            best_s = extensions[e].score; best = e;
+                        }
+                    }
+                    top_indices[k] = best;
+                    extensions[best].score = -2e30;
+                }
+
+                Q4Beam new_beams[Q4_N_BEAMS];
+                for (int k = 0; k < top_k; k++) {
+                    int ei = top_indices[k];
+                    int sb = extensions[ei].beam_idx;
+                    int cand = extensions[ei].cand_idx;
+                    new_beams[k].selections = (int *)malloc(graph_blocks * sizeof(int));
+                    memcpy(new_beams[k].selections, beams[sb].selections,
+                           graph_blocks * sizeof(int));
+                    new_beams[k].selections[i] = cand;
+                    new_beams[k].acc_error = beams[sb].acc_error + cand_errors[blk][cand];
+                }
+                for (int b = 0; b < active_beams; b++) free(beams[b].selections);
+                for (int k = 0; k < top_k; k++) beams[k] = new_beams[k];
+                active_beams = top_k;
+            }
+
+            for (int64_t i = 0; i < graph_blocks; i++) {
+                int cidx = beams[0].selections[i];
+                for (int64_t b = i * stride; b < (i+1) * stride && b < n_blocks; b++)
+                    best_candidate[b] = cidx;
+            }
+            for (int b = 0; b < active_beams; b++) free(beams[b].selections);
+
+            free(marg);
+            mobius_destroy(mobius);
+            hpc_destroy(graph);
+        }
+    }
+
+    /* ── Phase 4: Write blocks using selected candidates ── */
+    for (int64_t blk = 0; blk < n_blocks; blk++) {
+        const float *bw = weights + blk * QK4_0;
+        int cidx = best_candidate[blk];
+        output[blk].d = cand_d16[blk][cidx];
+        float actual_d = gguf_fp16_to_fp32(cand_d16[blk][cidx]);
+        float id = (actual_d > 1e-15f) ? 1.0f / actual_d : 0.0f;
+
+        for (int j = 0; j < QK4_0 / 2; j++) {
+            float x0 = bw[2 * j];
+            float x1 = bw[2 * j + 1];
+            int q0 = (int)(x0 * id + 8.5f);
+            int q1 = (int)(x1 * id + 8.5f);
+            if (q0 < 0) q0 = 0; if (q0 > 15) q0 = 15;
+            if (q1 < 0) q1 = 0; if (q1 > 15) q1 = 15;
+            output[blk].qs[j] = (uint8_t)(q0 | (q1 << 4));
+
+            float deq0 = ((float)q0 - 8.0f) * actual_d;
+            float deq1 = ((float)q1 - 8.0f) * actual_d;
+            total_err += (x0 - deq0) * (x0 - deq0) + (x1 - deq1) * (x1 - deq1);
+        }
+    }
+
+    *out_total_error = total_err;
+    free(greedy_d);
+    free(cand_errors);
+    free(cand_d16);
+    free(best_candidate);
 }
 
 static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
@@ -2019,7 +2301,7 @@ static int write_gguf(const char *output_path, const STMultiFile *mf,
             free(quant_data);
             free(f32_data);
         } else if (tensor_types[i] == GGML_TYPE_Q4_0) {
-            /* ── Q4_0 Quantization (attention tensors, higher precision) ── */
+            /* ── HPC-Optimized Q4_0 Quantization (attention tensors) ── */
             float *f32_data = st_multi_tensor_to_f32(mf, src);
             if (!f32_data) {
                 fprintf(stderr, "\n  ERROR: Failed to convert tensor '%s' to F32\n",
@@ -2042,44 +2324,28 @@ static int write_gguf(const char *output_path, const STMultiFile *mf,
             BlockQ4_0 *q4_data = calloc(n_blocks_q4, sizeof(BlockQ4_0));
             float tensor_error = 0.0f;
 
-            for (int64_t blk = 0; blk < n_blocks_q4; blk++) {
-                const float *bw = f32_data + blk * QK4_0;
-
-                /* Find abs max for scale */
-                float amax = 0.0f;
-                for (int j = 0; j < QK4_0; j++) {
-                    float av = fabsf(bw[j]);
-                    if (av > amax) amax = av;
-                }
-
-                float d = amax / 7.0f;  /* Scale: maps [-amax, amax] to [-7, 7] offset by 8 */
-                q4_data[blk].d = gguf_fp32_to_fp16(d);
-                float id = (d > 1e-15f) ? 1.0f / d : 0.0f;
-
-                for (int j = 0; j < QK4_0 / 2; j++) {
-                    float x0 = bw[2 * j];
-                    float x1 = bw[2 * j + 1];
-
-                    int q0 = (int)(x0 * id + 8.5f);
-                    int q1 = (int)(x1 * id + 8.5f);
-                    if (q0 < 0) q0 = 0; if (q0 > 15) q0 = 15;
-                    if (q1 < 0) q1 = 0; if (q1 > 15) q1 = 15;
-
-                    q4_data[blk].qs[j] = (uint8_t)(q0 | (q1 << 4));
-
-                    /* Measure reconstruction error */
-                    float deq0 = ((float)q0 - 8.0f) * d;
-                    float deq1 = ((float)q1 - 8.0f) * d;
-                    tensor_error += (x0 - deq0) * (x0 - deq0)
-                                  + (x1 - deq1) * (x1 - deq1);
+            /* Look up imatrix importance for this tensor */
+            const float *imp = NULL;
+            if (imatrix) {
+                const IMatrixEntry *ime = imatrix_find_any(imatrix,
+                    gguf_names[i], tensor_hf_names[i]);
+                if (ime && ime->n_values > 0) {
+                    imp = ime->normalized;
+                    if (verbose)
+                        printf("\n    imatrix: using %d importance weights for %s\n",
+                               ime->n_values, gguf_names[i]);
                 }
             }
+
+            quantize_tensor_q4_0_hpc(f32_data, n_elements,
+                                       q4_data, &tensor_error,
+                                       imp, verbose);
 
             fwrite(q4_data, sizeof(BlockQ4_0), n_blocks_q4, fp);
 
             float rmse = sqrtf(tensor_error / (float)ti->n_elements);
             if (verbose) {
-                printf("\n  [Q4_0] %-50s  %10ld elements → %ld bytes  RMSE=%.6e\n",
+                printf("\n  [Q4_0·HPC] %-47s  %10ld elements → %ld bytes  RMSE=%.6e\n",
                        gguf_names[i], (long)ti->n_elements,
                        (long)(n_blocks_q4 * sizeof(BlockQ4_0)), rmse);
             }
