@@ -1029,6 +1029,7 @@ typedef struct {
 static const double W6_RE[6] = { 1.0, 0.5, -0.5, -1.0, -0.5,  0.5 };
 static const double W6_IM[6] = { 0.0, 0.866025403784438647, 0.866025403784438647,
                                   0.0, -0.866025403784438647, -0.866025403784438647 };
+static const double INV_SQRT6 = 0.40824829046386301637;  /* 1/√6 */
 
 static double z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed, int max_iter) {
     const HPCGraph *g = ms->graph;
@@ -1429,60 +1430,183 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                 }
             }
 
-            /* Run ensemble BP */
+            /* Run ensemble BP with TRIALITY-enhanced marginals.
+             * After BP converges, compute marginals in ALL THREE views:
+             * edge (computational), vertex (Fourier), diagonal (conj-Fourier).
+             * A candidate must score well in all three bases to be selected. */
             MobiusAmplitudeSheet *mobius = mobius_create(graph);
             double (*coarse_marg)[6] = (double (*)[6])calloc(graph_blocks, sizeof(double[6]));
             double (*fine_marg)[6]   = (double (*)[6])calloc(graph_blocks, sizeof(double[6]));
 
             for (int start = 0; start < 3; start++) {
                 z6_complex_amplitude_bp(mobius, (unsigned int)start, 200);
-                for (int64_t i = 0; i < graph_blocks; i++) {
-                    for (int v = 0; v < 6; v++) {
-                        double re_c = mobius->sheets[2*i].dressed_re[v];
-                        double im_c = mobius->sheets[2*i].dressed_im[v];
-                        coarse_marg[i][v] += re_c * re_c + im_c * im_c;
 
-                        double re_f = mobius->sheets[2*i+1].dressed_re[v];
-                        double im_f = mobius->sheets[2*i+1].dressed_im[v];
-                        fine_marg[i][v] += re_f * re_f + im_f * im_f;
+                /* After BP, graph->locals[s] has dressed amplitudes in edge view.
+                 * Compute vertex and diagonal views via DFT₆ triality. */
+                for (int64_t i = 0; i < graph_blocks; i++) {
+                    for (int qbit = 0; qbit < 2; qbit++) {
+                        int64_t s = 2 * i + qbit;
+                        double (*marg)[6] = (qbit == 0) ? &coarse_marg[i] : &fine_marg[i];
+
+                        /* Edge view marginals (standard) */
+                        double edge_prob[6];
+                        for (int v = 0; v < 6; v++) {
+                            double re = mobius->sheets[s].dressed_re[v];
+                            double im = mobius->sheets[s].dressed_im[v];
+                            edge_prob[v] = re * re + im * im;
+                        }
+
+                        /* Vertex view: DFT₆ of dressed edge amplitudes */
+                        double vert_re[6], vert_im[6], vert_prob[6];
+                        for (int j = 0; j < 6; j++) {
+                            double sr = 0, si = 0;
+                            for (int k = 0; k < 6; k++) {
+                                int idx = (j * k) % 6;
+                                sr += mobius->sheets[s].dressed_re[k] * W6_RE[idx]
+                                    - mobius->sheets[s].dressed_im[k] * W6_IM[idx];
+                                si += mobius->sheets[s].dressed_re[k] * W6_IM[idx]
+                                    + mobius->sheets[s].dressed_im[k] * W6_RE[idx];
+                            }
+                            vert_re[j] = sr * INV_SQRT6;
+                            vert_im[j] = si * INV_SQRT6;
+                            vert_prob[j] = vert_re[j]*vert_re[j] + vert_im[j]*vert_im[j];
+                        }
+
+                        /* Diagonal view: DFT₆ of vertex = DFT₆² of edge */
+                        double diag_prob[6];
+                        for (int j = 0; j < 6; j++) {
+                            double sr = 0, si = 0;
+                            for (int k = 0; k < 6; k++) {
+                                int idx = (j * k) % 6;
+                                sr += vert_re[k] * W6_RE[idx] - vert_im[k] * W6_IM[idx];
+                                si += vert_re[k] * W6_IM[idx] + vert_im[k] * W6_RE[idx];
+                            }
+                            double dr = sr * INV_SQRT6, di = si * INV_SQRT6;
+                            diag_prob[j] = dr*dr + di*di;
+                        }
+
+                        /* Triality-consistent marginal: geometric mean of all 3 views.
+                         * Suppresses spurious peaks that only appear in one basis. */
+                        for (int v = 0; v < 6; v++) {
+                            double tri_prob = cbrt(edge_prob[v] * vert_prob[v] * diag_prob[v]);
+                            (*marg)[v] += tri_prob;
+                        }
                     }
                 }
             }
 
-            /* Select best candidate per block from joint marginals */
+            /* ══ Hensel-Inspired Beam Search Constraint Propagation ══
+             * Like tesseract_factor's Hensel lift: process blocks sequentially,
+             * maintain K best configurations, prune by accumulated error.
+             *
+             * Each beam is a (selection[], accumulated_error) pair.
+             * At each block: extend all beams × 36 candidates = K×36 options,
+             * score by: accumulated_error + block_error × (1/triality_prob),
+             * keep top K. The constraint: blocks are selected JOINTLY. */
+
+            #define N_BEAMS 8  /* K beams — like the Hensel MAX_CAND */
+
+            typedef struct {
+                double acc_error;
+                int *selections;  /* candidate index per graph_block */
+            } QuantBeam;
+
+            QuantBeam beams[N_BEAMS];
+            int active_beams = 1;
+
+            for (int b = 0; b < N_BEAMS; b++) {
+                beams[b].acc_error = 0.0;
+                beams[b].selections = (int *)calloc(graph_blocks, sizeof(int));
+                for (int64_t j = 0; j < graph_blocks; j++)
+                    beams[b].selections[j] = 3 * 6 + 3;  /* default = greedy */
+            }
+
+            /* Process blocks sequentially with beam search */
             for (int64_t i = 0; i < graph_blocks; i++) {
                 double c_total = 0.0, f_total = 0.0;
                 for (int v = 0; v < 6; v++) {
                     c_total += coarse_marg[i][v];
                     f_total += fine_marg[i][v];
                 }
-                if (c_total < 1e-30 || f_total < 1e-30) continue;
 
-                /* Find the (di, mi) with highest joint probability,
-                 * weighted by INVERSE error (lower error = better) */
+                /* Candidate scores for this block: triality prob × (1/error) */
+                double cand_score[TOTAL_SCALE_CANDIDATES];
                 int64_t blk = i * stride;
-                double best_score = -1e30;
-                int best_idx = 3 * 6 + 3;
-
                 for (int di = 0; di < 6; di++) {
-                    double p_d = coarse_marg[i][di] / c_total;
+                    double p_d = (c_total > 1e-30) ? coarse_marg[i][di] / c_total : 1.0/6.0;
                     for (int mi = 0; mi < 6; mi++) {
-                        double p_m = fine_marg[i][mi] / f_total;
+                        double p_m = (f_total > 1e-30) ? fine_marg[i][mi] / f_total : 1.0/6.0;
                         int cidx = di * 6 + mi;
-                        /* Score = joint probability × (1 / error)
-                         * BP marginal favors low-error candidates that
-                         * are also compatible with neighbors */
-                        double score = p_d * p_m / (candidate_errors[blk][cidx] + 1e-15);
-                        if (score > best_score) {
-                            best_score = score;
-                            best_idx = cidx;
-                        }
+                        cand_score[cidx] = p_d * p_m / (candidate_errors[blk][cidx] + 1e-15);
                     }
                 }
 
-                for (int64_t b = i * stride; b < (i + 1) * stride && b < n_blocks; b++)
-                    best_candidate[b] = best_idx;
+                /* Extend beams × 36 candidates, keep top K */
+                typedef struct { double score; int beam_idx; int cand_idx; } BeamExt;
+                BeamExt extensions[N_BEAMS * TOTAL_SCALE_CANDIDATES];
+                int n_ext = 0;
+
+                for (int b = 0; b < active_beams; b++) {
+                    for (int c = 0; c < TOTAL_SCALE_CANDIDATES; c++) {
+                        /* Score = -(accumulated_error + this_block_error) × triality_prob
+                         * Lower accumulated error + higher prob = better */
+                        double ext_err = beams[b].acc_error + candidate_errors[blk][c];
+                        double ext_score = cand_score[c] / (ext_err + 1e-15);
+                        extensions[n_ext].score = ext_score;
+                        extensions[n_ext].beam_idx = b;
+                        extensions[n_ext].cand_idx = c;
+                        n_ext++;
+                    }
+                }
+
+                /* Top-K selection (like Hensel's constraint pruning) */
+                int top_k = (n_ext < N_BEAMS) ? n_ext : N_BEAMS;
+                int top_indices[N_BEAMS];
+                for (int k = 0; k < top_k; k++) {
+                    int best = -1;
+                    double best_s = -1e30;
+                    for (int e = 0; e < n_ext; e++) {
+                        if (extensions[e].score > best_s) {
+                            best_s = extensions[e].score;
+                            best = e;
+                        }
+                    }
+                    top_indices[k] = best;
+                    extensions[best].score = -2e30;  /* poison */
+                }
+
+                /* Build new beams from top-K extensions */
+                QuantBeam new_beams[N_BEAMS];
+                for (int k = 0; k < top_k; k++) {
+                    int ext_idx = top_indices[k];
+                    int src_beam = extensions[ext_idx].beam_idx;
+                    int cand = extensions[ext_idx].cand_idx;
+
+                    new_beams[k].selections = (int *)malloc(graph_blocks * sizeof(int));
+                    memcpy(new_beams[k].selections, beams[src_beam].selections,
+                           graph_blocks * sizeof(int));
+                    new_beams[k].selections[i] = cand;
+                    new_beams[k].acc_error = beams[src_beam].acc_error
+                                            + candidate_errors[blk][cand];
+                }
+
+                /* Swap in new beams */
+                for (int b = 0; b < active_beams; b++)
+                    free(beams[b].selections);
+                for (int k = 0; k < top_k; k++)
+                    beams[k] = new_beams[k];
+                active_beams = top_k;
             }
+
+            /* Use the best beam's selections */
+            for (int64_t i = 0; i < graph_blocks; i++) {
+                int cidx = beams[0].selections[i];
+                for (int64_t b = i * stride; b < (i + 1) * stride && b < n_blocks; b++)
+                    best_candidate[b] = cidx;
+            }
+
+            for (int b = 0; b < active_beams; b++)
+                free(beams[b].selections);
 
             free(coarse_marg);
             free(fine_marg);
