@@ -511,6 +511,25 @@ static int should_quantize(const STTensorInfo *ti, const char *gguf_name)
     return 1;
 }
 
+/* Detect attention Q/K/V/O projection tensors.
+ * These are the most sensitive to quantization — errors in attention scores
+ * cascade through the entire sequence, causing self-correction loops.
+ * Promoting these to Q4_0 (~4.5bpw) doubles their precision. */
+static int is_attention_tensor(const char *gguf_name)
+{
+    /* Gemma / LLaMA style: blk.N.attn_q/k/v/output.weight */
+    if (strstr(gguf_name, "attn_q.weight") != NULL) return 1;
+    if (strstr(gguf_name, "attn_k.weight") != NULL) return 1;
+    if (strstr(gguf_name, "attn_v.weight") != NULL) return 1;
+    if (strstr(gguf_name, "attn_output.weight") != NULL) return 1;
+    /* HuggingFace style: q_proj, k_proj, v_proj, o_proj */
+    if (strstr(gguf_name, "q_proj") != NULL) return 1;
+    if (strstr(gguf_name, "k_proj") != NULL) return 1;
+    if (strstr(gguf_name, "v_proj") != NULL) return 1;
+    if (strstr(gguf_name, "o_proj") != NULL) return 1;
+    return 0;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * HPC SENSITIVITY GRAPH BUILDER
  *
@@ -1813,8 +1832,19 @@ static int write_gguf(const char *output_path, const STMultiFile *mf,
         tensor_src_idx[i] = src;
 
         if (should_quantize(ti, gguf_names[i])) {
-            tensor_types[i] = quant_type;
-            tensor_sizes[i] = ggml_type_size(quant_type, ti->n_elements);
+            if (is_attention_tensor(gguf_names[i])) {
+                /* Promote attention Q/K/V/O to Q4_0 for higher precision.
+                 * Attention scores are most sensitive to quantization noise. */
+                tensor_types[i] = GGML_TYPE_Q4_0;
+                int64_t n_blocks_q4 = (ti->n_elements + QK4_0 - 1) / QK4_0;
+                tensor_sizes[i] = n_blocks_q4 * sizeof(BlockQ4_0);
+                if (verbose)
+                    printf("  [ATTN→Q4_0] %s (%ld elements)\n",
+                           gguf_names[i], (long)ti->n_elements);
+            } else {
+                tensor_types[i] = quant_type;
+                tensor_sizes[i] = ggml_type_size(quant_type, ti->n_elements);
+            }
         } else if (ti->n_dims >= 2) {
             /* 2D non-quantized tensors (embeddings, output) → F16 */
             tensor_types[i] = GGML_TYPE_F16;
@@ -1987,6 +2017,79 @@ static int write_gguf(const char *output_path, const STMultiFile *mf,
             quant_count++;
 
             free(quant_data);
+            free(f32_data);
+        } else if (tensor_types[i] == GGML_TYPE_Q4_0) {
+            /* ── Q4_0 Quantization (attention tensors, higher precision) ── */
+            float *f32_data = st_multi_tensor_to_f32(mf, src);
+            if (!f32_data) {
+                fprintf(stderr, "\n  ERROR: Failed to convert tensor '%s' to F32\n",
+                        ti->name);
+                continue;
+            }
+
+            int64_t n_elements = ti->n_elements;
+
+            /* Pad to QK4_0 boundary */
+            int64_t padded = (n_elements + QK4_0 - 1) / QK4_0 * QK4_0;
+            if (padded > n_elements) {
+                f32_data = realloc(f32_data, padded * sizeof(float));
+                for (int64_t j = n_elements; j < padded; j++)
+                    f32_data[j] = 0.0f;
+                n_elements = padded;
+            }
+
+            int64_t n_blocks_q4 = n_elements / QK4_0;
+            BlockQ4_0 *q4_data = calloc(n_blocks_q4, sizeof(BlockQ4_0));
+            float tensor_error = 0.0f;
+
+            for (int64_t blk = 0; blk < n_blocks_q4; blk++) {
+                const float *bw = f32_data + blk * QK4_0;
+
+                /* Find abs max for scale */
+                float amax = 0.0f;
+                for (int j = 0; j < QK4_0; j++) {
+                    float av = fabsf(bw[j]);
+                    if (av > amax) amax = av;
+                }
+
+                float d = amax / 7.0f;  /* Scale: maps [-amax, amax] to [-7, 7] offset by 8 */
+                q4_data[blk].d = gguf_fp32_to_fp16(d);
+                float id = (d > 1e-15f) ? 1.0f / d : 0.0f;
+
+                for (int j = 0; j < QK4_0 / 2; j++) {
+                    float x0 = bw[2 * j];
+                    float x1 = bw[2 * j + 1];
+
+                    int q0 = (int)(x0 * id + 8.5f);
+                    int q1 = (int)(x1 * id + 8.5f);
+                    if (q0 < 0) q0 = 0; if (q0 > 15) q0 = 15;
+                    if (q1 < 0) q1 = 0; if (q1 > 15) q1 = 15;
+
+                    q4_data[blk].qs[j] = (uint8_t)(q0 | (q1 << 4));
+
+                    /* Measure reconstruction error */
+                    float deq0 = ((float)q0 - 8.0f) * d;
+                    float deq1 = ((float)q1 - 8.0f) * d;
+                    tensor_error += (x0 - deq0) * (x0 - deq0)
+                                  + (x1 - deq1) * (x1 - deq1);
+                }
+            }
+
+            fwrite(q4_data, sizeof(BlockQ4_0), n_blocks_q4, fp);
+
+            float rmse = sqrtf(tensor_error / (float)ti->n_elements);
+            if (verbose) {
+                printf("\n  [Q4_0] %-50s  %10ld elements → %ld bytes  RMSE=%.6e\n",
+                       gguf_names[i], (long)ti->n_elements,
+                       (long)(n_blocks_q4 * sizeof(BlockQ4_0)), rmse);
+            }
+
+            total_error_sum += tensor_error;
+            total_elements_quantized += ti->n_elements;
+            total_bytes_quantized += n_blocks_q4 * sizeof(BlockQ4_0);
+            quant_count++;
+
+            free(q4_data);
             free(f32_data);
         } else if (tensor_types[i] == GGML_TYPE_F16) {
             /* ── Store as F16 (embeddings, output, 2D non-quantized) ── */
