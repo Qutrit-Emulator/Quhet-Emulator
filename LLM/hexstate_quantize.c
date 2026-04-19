@@ -2520,6 +2520,28 @@ void hexstate_quantize_tensor_q2k_imat(const float *weights, int64_t n_elements,
 int hexstate_q2k_block_bytes(void) { return sizeof(BlockQ2K); }
 int hexstate_q2k_block_elements(void) { return QK_K; }
 
+/* HPC-optimized Q4_0 quantization for attention tensors.
+ * Called from Python requantizer via ctypes.
+ *   weights:     input F32 weights
+ *   n_elements:  number of elements (must be multiple of 32)
+ *   output:      output buffer (must be n_elements/32 * 18 bytes)
+ *   out_error:   pointer to receive total MSE (can be NULL)
+ *   imat_importance: optional per-element importance weights
+ *   verbose:     1 for per-block diagnostics
+ */
+void hexstate_quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
+                                         void *output, float *out_error,
+                                         const float *imat_importance,
+                                         int verbose)
+{
+    hexstate_init();
+    float err = 0.0f;
+    quantize_tensor_q4_0_hpc(weights, n_elements,
+                               (BlockQ4_0 *)output, &err,
+                               imat_importance, verbose);
+    if (out_error) *out_error = err;
+}
+
 #ifndef HEXSTATE_LIBRARY
 /* ═══════════════════════════════════════════════════════════════════════════
  * MAIN
