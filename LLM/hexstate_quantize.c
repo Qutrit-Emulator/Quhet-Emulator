@@ -1235,13 +1235,14 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
      * ══════════════════════════════════════════════════════════════════ */
 
     /* For each block, generate a 10×10 grid of (d, dmin) FP16 neighbors.
-     * Wider range than before: 0.70–1.25 with finer spacing.
+     * Narrower range than wide-sweep: 0.82–1.15 with fine spacing.
+     * Wider ranges push Q2_K into degenerate clipping territory.
      * Total: 100 (d, dmin) pairs per block */
     static const float NEIGHBOR_MULTS_D[N_CAND_D] = {
-        0.70f, 0.76f, 0.82f, 0.88f, 0.94f, 1.00f, 1.06f, 1.12f, 1.18f, 1.25f
+        0.82f, 0.855f, 0.89f, 0.925f, 0.96f, 1.00f, 1.035f, 1.07f, 1.105f, 1.15f
     };
     static const float NEIGHBOR_MULTS_M[N_CAND_M] = {
-        0.70f, 0.76f, 0.82f, 0.88f, 0.94f, 1.00f, 1.06f, 1.12f, 1.18f, 1.25f
+        0.82f, 0.855f, 0.89f, 0.925f, 0.96f, 1.00f, 1.035f, 1.07f, 1.105f, 1.15f
     };
     /* Map 10 candidates → 6 quhit states for BP encoding */
     static const int CAND_TO_QUHIT[10] = { 0, 0, 1, 1, 2, 3, 3, 4, 4, 5 };
@@ -1509,7 +1510,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
              * score by: accumulated_error + block_error × (1/triality_prob),
              * keep top K. The constraint: blocks are selected JOINTLY. */
 
-            #define N_BEAMS 16  /* K beams — wider search, like Hensel MAX_CAND */
+            #define N_BEAMS 12  /* K beams — balanced search width */
 
             typedef struct {
                 double acc_error;
