@@ -534,26 +534,23 @@ static const float SCALE_MULTIPLIERS[SCALE_FACTOR_COUNT] = {
     0.60f, 0.75f, 0.90f, 1.00f, 1.15f, 1.40f
 };
 
-/* ── Multi-quhit expanded scale table: 6×6 = 36 candidates ──
- * Two quhits per block:
- *   Quhit 0 (coarse): selects one of 6 scale ranges
- *   Quhit 1 (fine):   selects refinement within that range
- * Total: 36 scale candidates spanning 0.50 to 1.50 */
+/* ── Multi-quhit expanded scale table ──
+ * Search grid: 10×10 = 100 (d, dmin) candidates
+ * Quhit encoding: bin 10 → 6 for D=6 quhits (BP operates on 6-state marginals)
+ * Beam search: operates on all 100 candidates directly */
 #define QUHITS_PER_BLOCK  2
-#define TOTAL_SCALE_CANDIDATES (SCALE_FACTOR_COUNT * SCALE_FACTOR_COUNT)
+#define N_CAND_D   10    /* d multiplier candidates */
+#define N_CAND_M   10    /* dmin multiplier candidates */
+#define TOTAL_SCALE_CANDIDATES (N_CAND_D * N_CAND_M)
 
-static float SCALE_TABLE_36[TOTAL_SCALE_CANDIDATES];
+static float SCALE_TABLE[TOTAL_SCALE_CANDIDATES];
 static int scale_table_initialized = 0;
 
-static void init_scale_table_36(void) {
+static void init_scale_table(void) {
     if (scale_table_initialized) return;
-    /* 36 candidates: geometric spacing centered on 1.0 */
-    for (int coarse = 0; coarse < 6; coarse++) {
-        for (int fine = 0; fine < 6; fine++) {
-            int idx = coarse * 6 + fine;
-            /* Range: 0.50 to 1.50, 36 steps */
-            SCALE_TABLE_36[idx] = 0.50f + (float)idx * (1.00f / 35.0f);
-        }
+    /* 100 candidates: uniform spacing centered on 1.0 */
+    for (int i = 0; i < TOTAL_SCALE_CANDIDATES; i++) {
+        SCALE_TABLE[i] = 0.50f + (float)i * (1.00f / (float)(TOTAL_SCALE_CANDIDATES - 1));
     }
     scale_table_initialized = 1;
 }
@@ -609,7 +606,7 @@ static HPCGraph *build_sensitivity_graph(const float *weights,
     int64_t n_blocks = n_elements / block_size;
     if (n_blocks < 2) return NULL;
 
-    init_scale_table_36();
+    init_scale_table();
 
     int64_t graph_blocks = (n_blocks > 8192) ? 8192 : n_blocks;
     int64_t stride = n_blocks / graph_blocks;
@@ -632,7 +629,7 @@ static HPCGraph *build_sensitivity_graph(const float *weights,
         float min_err = 1e30f;
         for (int c = 0; c < TOTAL_SCALE_CANDIDATES; c++) {
             errors[c] = compute_block_error_q2k(block_weights, block_size,
-                                                  SCALE_TABLE_36[c],
+                                                  SCALE_TABLE[c],
                                                   importance,
                                                   (int)(block_idx * block_size));
             if (errors[c] < min_err) min_err = errors[c];
@@ -1187,7 +1184,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
     float total_err = 0.0f;
     const int N_SUB = QK_K / 16;
 
-    init_scale_table_36();
+    init_scale_table();
 
     /* ══════════════════════════════════════════════════════════════════
      * PHASE 1: Greedy quantization — produce seed (d, dmin) per block
@@ -1233,17 +1230,21 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
     }
 
     /* ══════════════════════════════════════════════════════════════════
-     * PHASE 2: Generate 36 FP16 (d, dmin) candidates per block
+     * PHASE 2: Generate 100 FP16 (d, dmin) candidates per block
      *          and measure actual reconstruction MSE for each
      * ══════════════════════════════════════════════════════════════════ */
 
-    /* For each block, generate a 6×6 grid of (d, dmin) FP16 neighbors.
-     * d_candidates[6]:  greedy_d × {0.85, 0.90, 0.95, 1.00, 1.05, 1.10}
-     * dm_candidates[6]: greedy_dm × {0.85, 0.90, 0.95, 1.00, 1.05, 1.10}
-     * Total: 36 (d, dmin) pairs per block */
-    static const float NEIGHBOR_MULTS[6] = {
-        0.85f, 0.90f, 0.95f, 1.00f, 1.05f, 1.10f
+    /* For each block, generate a 10×10 grid of (d, dmin) FP16 neighbors.
+     * Wider range than before: 0.70–1.25 with finer spacing.
+     * Total: 100 (d, dmin) pairs per block */
+    static const float NEIGHBOR_MULTS_D[N_CAND_D] = {
+        0.70f, 0.76f, 0.82f, 0.88f, 0.94f, 1.00f, 1.06f, 1.12f, 1.18f, 1.25f
     };
+    static const float NEIGHBOR_MULTS_M[N_CAND_M] = {
+        0.70f, 0.76f, 0.82f, 0.88f, 0.94f, 1.00f, 1.06f, 1.12f, 1.18f, 1.25f
+    };
+    /* Map 10 candidates → 6 quhit states for BP encoding */
+    static const int CAND_TO_QUHIT[10] = { 0, 0, 1, 1, 2, 3, 3, 4, 4, 5 };
 
     /* candidate_errors[blk][36] — MSE per candidate */
     float (*candidate_errors)[TOTAL_SCALE_CANDIDATES] = NULL;
@@ -1269,14 +1270,14 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
         float base_dm = seeds[blk].dm;
         float base_mm = seeds[blk].mm;
 
-        for (int di = 0; di < 6; di++) {
-            float trial_dm = base_dm * NEIGHBOR_MULTS[di];
+        for (int di = 0; di < N_CAND_D; di++) {
+            float trial_dm = base_dm * NEIGHBOR_MULTS_D[di];
             uint16_t trial_d16 = gguf_fp32_to_fp16(trial_dm);
             float actual_dm = gguf_fp16_to_fp32(trial_d16);
 
-            for (int mi = 0; mi < 6; mi++) {
-                int cidx = di * 6 + mi;
-                float trial_mm = base_mm * NEIGHBOR_MULTS[mi];
+            for (int mi = 0; mi < N_CAND_M; mi++) {
+                int cidx = di * N_CAND_M + mi;
+                float trial_mm = base_mm * NEIGHBOR_MULTS_M[mi];
                 uint16_t trial_dmin16 = gguf_fp32_to_fp16(trial_mm);
                 float actual_mm = gguf_fp16_to_fp32(trial_dmin16);
 
@@ -1345,10 +1346,10 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
      * (d, dmin) per block.
      * ══════════════════════════════════════════════════════════════════ */
 
-    /* Default: use greedy candidate (index 3*6+3 = 21, mult 1.00×1.00) */
+    /* Default: use greedy candidate (index 5*10+5 = 55, mult 1.00×1.00) */
     int *best_candidate = (int *)malloc(n_blocks * sizeof(int));
     for (int64_t i = 0; i < n_blocks; i++)
-        best_candidate[i] = 3 * 6 + 3;  /* NEIGHBOR_MULTS[3] = 1.00 */
+        best_candidate[i] = 5 * N_CAND_M + 5;  /* NEIGHBOR_MULTS_D[5]=1.00, _M[5]=1.00 */
 
     if (opt_mode != OPT_MSE && n_blocks >= 2) {
         float temperature = 0.5f;
@@ -1372,15 +1373,17 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                 /* Quhit 0 (coarse = d dimension): marginalize over dmin */
                 double coarse_re[6];
                 double coarse_norm = 0.0;
-                for (int di = 0; di < 6; di++) {
-                    coarse_re[di] = 0.0;
-                    for (int mi = 0; mi < 6; mi++) {
-                        int cidx = di * 6 + mi;
-                        coarse_re[di] += exp(-(double)(candidate_errors[blk][cidx] - min_err) /
+                for (int qi = 0; qi < 6; qi++) coarse_re[qi] = 0.0;
+                for (int di = 0; di < N_CAND_D; di++) {
+                    int qi = CAND_TO_QUHIT[di];
+                    for (int mi = 0; mi < N_CAND_M; mi++) {
+                        int cidx = di * N_CAND_M + mi;
+                        coarse_re[qi] += exp(-(double)(candidate_errors[blk][cidx] - min_err) /
                                               (2.0 * (double)temperature));
                     }
-                    coarse_norm += coarse_re[di] * coarse_re[di];
                 }
+                for (int qi = 0; qi < 6; qi++)
+                    coarse_norm += coarse_re[qi] * coarse_re[qi];
                 if (coarse_norm > 1e-30) {
                     double inv = 1.0 / sqrt(coarse_norm);
                     for (int v = 0; v < 6; v++) coarse_re[v] *= inv;
@@ -1389,15 +1392,17 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                 /* Quhit 1 (fine = dmin dimension): marginalize over d */
                 double fine_re[6];
                 double fine_norm = 0.0;
-                for (int mi = 0; mi < 6; mi++) {
-                    fine_re[mi] = 0.0;
-                    for (int di = 0; di < 6; di++) {
-                        int cidx = di * 6 + mi;
-                        fine_re[mi] += exp(-(double)(candidate_errors[blk][cidx] - min_err) /
+                for (int qi = 0; qi < 6; qi++) fine_re[qi] = 0.0;
+                for (int mi = 0; mi < N_CAND_M; mi++) {
+                    int qi = CAND_TO_QUHIT[mi];
+                    for (int di = 0; di < N_CAND_D; di++) {
+                        int cidx = di * N_CAND_M + mi;
+                        fine_re[qi] += exp(-(double)(candidate_errors[blk][cidx] - min_err) /
                                             (2.0 * (double)temperature));
                     }
-                    fine_norm += fine_re[mi] * fine_re[mi];
                 }
+                for (int qi = 0; qi < 6; qi++)
+                    fine_norm += fine_re[qi] * fine_re[qi];
                 if (fine_norm > 1e-30) {
                     double inv = 1.0 / sqrt(fine_norm);
                     for (int v = 0; v < 6; v++) fine_re[v] *= inv;
@@ -1504,7 +1509,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
              * score by: accumulated_error + block_error × (1/triality_prob),
              * keep top K. The constraint: blocks are selected JOINTLY. */
 
-            #define N_BEAMS 8  /* K beams — like the Hensel MAX_CAND */
+            #define N_BEAMS 16  /* K beams — wider search, like Hensel MAX_CAND */
 
             typedef struct {
                 double acc_error;
@@ -1518,7 +1523,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                 beams[b].acc_error = 0.0;
                 beams[b].selections = (int *)calloc(graph_blocks, sizeof(int));
                 for (int64_t j = 0; j < graph_blocks; j++)
-                    beams[b].selections[j] = 3 * 6 + 3;  /* default = greedy */
+                    beams[b].selections[j] = 5 * N_CAND_M + 5;  /* default = greedy (1.00×1.00) */
             }
 
             /* Process blocks sequentially with beam search */
@@ -1529,14 +1534,17 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                     f_total += fine_marg[i][v];
                 }
 
-                /* Candidate scores for this block: triality prob × (1/error) */
+                /* Candidate scores for this block: triality prob × (1/error)
+                 * Map 10-state candidates to 6-state quhit marginals via binning */
                 double cand_score[TOTAL_SCALE_CANDIDATES];
                 int64_t blk = i * stride;
-                for (int di = 0; di < 6; di++) {
-                    double p_d = (c_total > 1e-30) ? coarse_marg[i][di] / c_total : 1.0/6.0;
-                    for (int mi = 0; mi < 6; mi++) {
-                        double p_m = (f_total > 1e-30) ? fine_marg[i][mi] / f_total : 1.0/6.0;
-                        int cidx = di * 6 + mi;
+                for (int di = 0; di < N_CAND_D; di++) {
+                    int qi_d = CAND_TO_QUHIT[di];
+                    double p_d = (c_total > 1e-30) ? coarse_marg[i][qi_d] / c_total : 1.0/6.0;
+                    for (int mi = 0; mi < N_CAND_M; mi++) {
+                        int qi_m = CAND_TO_QUHIT[mi];
+                        double p_m = (f_total > 1e-30) ? fine_marg[i][qi_m] / f_total : 1.0/6.0;
+                        int cidx = di * N_CAND_M + mi;
                         cand_score[cidx] = p_d * p_m / (candidate_errors[blk][cidx] + 1e-15);
                     }
                 }
