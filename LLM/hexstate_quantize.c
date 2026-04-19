@@ -1453,9 +1453,11 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
         float actual_d = gguf_fp16_to_fp32(cand_d16[blk][cidx]);
         float id = (actual_d > 1e-15f) ? 1.0f / actual_d : 0.0f;
 
+        /* Nibble packing: llama.cpp convention — first half in low nibble,
+         * second half in high nibble: qs[j] = quant(bw[j]) | (quant(bw[j+16]) << 4) */
         for (int j = 0; j < QK4_0 / 2; j++) {
-            float x0 = bw[2 * j];
-            float x1 = bw[2 * j + 1];
+            float x0 = bw[j];           /* first half:  elements 0..15  */
+            float x1 = bw[j + QK4_0/2]; /* second half: elements 16..31 */
             int q0 = (int)(x0 * id + 8.5f);
             int q1 = (int)(x1 * id + 8.5f);
             if (q0 < 0) q0 = 0; if (q0 > 15) q0 = 15;
