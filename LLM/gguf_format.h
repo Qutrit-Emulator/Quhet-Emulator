@@ -110,6 +110,26 @@ typedef struct {
 /* Verify: sizeof(BlockQ8_0) should be 34 bytes (2 + 32) */
 
 /* ═══════════════════════════════════════════════════════════════════════
+ * Q4_0 BLOCK STRUCTURE
+ *
+ * 32 weights per block with 4-bit quantization.
+ * Layout: 1 fp16 scale + 16 bytes packed quants (2 weights per byte)
+ * Total: 18 bytes per block = 4.5 bits per weight.
+ *
+ * Dequantization: w_i = (q_i - 8) * d
+ *   where q_i in {0..15}, stored as nibbles
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+#define QK4_0 32  /* Block size for Q4_0 */
+
+typedef struct {
+    uint16_t d;             /* fp16 scale (delta)                         */
+    uint8_t  qs[QK4_0/2];  /* 16 bytes: packed 4-bit quants (2 per byte) */
+} BlockQ4_0;
+
+/* sizeof(BlockQ4_0) = 2 + 16 = 18 bytes for 32 weights */
+
+/* ═══════════════════════════════════════════════════════════════════════
  * Q2_K BLOCK STRUCTURE (K-Quant, 2-bit)
  *
  * 256-weight superblock divided into 16 sub-blocks of 16 weights.
