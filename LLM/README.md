@@ -1,8 +1,10 @@
-# Gemma-4-26B-A4B-it — HexState Q2_K + Q4_0·HPC# Gemma-4-26B-A4B-it — HexState Q2_K + Q4_0·HPC
+# HexState Q2_K + Q4_0·HPC
 
 **The smallest functional quantization of Gemma 4 26B. 10.2 GB. Runs on 12 GB hardware.**
 
 No other public quantization of this model fits in 12 GB. The smallest community quant (IQ3_K_XXS) is ~12 GB and requires 14+ GB at runtime. HexState fits and runs with headroom to spare.
+
+This will work on ANY Gemma4 model, but was developed specifically for 26B (So it can run on 12GB GPUs)
 
 ---
 
