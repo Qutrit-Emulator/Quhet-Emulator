@@ -1,243 +1,454 @@
-# HexState LLM Quantizer
+# Gemma-4-26B-A4B-it — HexState Q2_K + Q4_0·HPC# Gemma-4-26B-A4B-it — HexState Q2_K + Q4_0·HPC
 
-**Uniform Q2_K quantization that preserves reasoning at extreme compression.**
+**The smallest functional quantization of Gemma 4 26B. 10.2 GB. Runs on 12 GB hardware.**
 
-HexState compresses LLMs to **2.63 bits per weight** — quantizing *every* tensor including
-embeddings — while preserving the model's reasoning, math, and instruction-following
-capabilities. A 4.65B parameter model compresses from 8.67 GB to **1.44 GB** (6x reduction)
-with no loss in practical reasoning benchmarks.
+No other public quantization of this model fits in 12 GB. The smallest community quant (IQ3_K_XXS) is ~12 GB and requires 14+ GB at runtime. HexState fits and runs with headroom to spare.
 
-## Key Results
+---
 
-Tested on **Gemma 4 E2B-it** (4.65B params):
+## Model Details
 
-| Model | Size | BPW | PPL | Math | Logic | Speed |
-|-------|------|-----|-----|------|-------|-------|
-| BF16 (original) | 8.67 GB | 16.00 | 154.0 | ✅ | ✅ | 4.2 t/s |
-| ggml Q2_K + iMatrix | 2.77 GB | 5.12 | 89.1 | ✅ | ✅ | 14.0 t/s |
-| **HexState Q2_K** | **1.44 GB** | **2.63** | **129.6** | **✅** | **✅** | **18.1 t/s** |
-| ggml Q2_K (no iMatrix) | 2.77 GB | 5.12 | 651.0 | ❌ | ❌ | 14.0 t/s |
+| | |
+|---|---|
+| **Base Model** | [google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it) |
+| **Architecture** | Gemma 4 MoE — 26B total params, 4B active per token, 64 experts |
+| **Quantization** | Mixed Q2_K (2.63 bpw) + Q4_0·HPC (4.5 bpw) |
+| **File Size** | **10.2 GB** |
+| **Format** | GGUF v3 — compatible with llama.cpp, LM Studio, Ollama |
+| **Quantizer** | [HexState HPC Engine](https://github.com/user/HexState) |
 
-> **Per-bit capability density:** HexState achieves the same reasoning accuracy as
-> ggml's mixed-precision quantization at **half the file size** and **29% faster** generation.
+### Precision Tiers
 
-## Philosophy: Uniform Quantization
+| Layer Type | Quantization | BPW | Method |
+|-----------|-------------|-----|--------|
+| Attention Q/K/V/O | Q4_0·HPC | 4.5 | 12-beam Hensel search + triality BP |
+| FFN / MLP / Experts | Q2_K·HPC | 2.63 | 100-candidate beam search + triality BP |
+| Embeddings / Norms | F16 / F32 | 16–32 | Preserved |
+| MoE Router / Gates | F16 / F32 | 16–32 | Preserved — quantizing these breaks expert dispatch |
 
-Standard quantizers use mixed precision — Q6_K for embeddings, Q4_K for attention,
-Q3_K for FFN, Q2_K for the rest. This introduces **asymmetric distortion**: different
-parts of the model operate at different precision levels, warping the internal geometry.
+---
 
-HexState takes the opposite approach: **every tensor gets Q2_K**. The HPC optimizer
-finds the best 4-level representation for each 256-weight block, preserving the model's
-internal coherence at uniform precision. The result is a model that reasons like the
-original despite extreme compression.
+## Size Comparison
 
-```
-Standard (ggml):     Q6_K ──→ Q4_K ──→ Q3_K ──→ Q2_K   (asymmetric distortion)
-HexState:            Q2_K ──→ Q2_K ──→ Q2_K ──→ Q2_K   (uniform compression)
-```
+| Quantization | Size | Fits 12 GB? | Source |
+|-------------|------|:-----------:|--------|
+| BF16 | 48.5 GB | ❌ | Google |
+| Q8_0 | ~27 GB | ❌ | Community |
+| Q6_K | ~22 GB | ❌ | Community |
+| Q4_K_M | 16.8 GB | ❌ | LM Studio / bartowski |
+| IQ3_K_XXS | ~12 GB | ⚠️ | Unsloth |
+| **HexState (this)** | **10.2 GB** | **✅** | **HexState HPC** |
+
+---
 
 ## Quick Start
 
-### Prerequisites
+### LM Studio
+
+1. Download the GGUF
+2. Place in your LM Studio models directory
+3. Load and chat — LM Studio auto-detects the Gemma 4 template
+
+### llama.cpp Server
 
 ```bash
-sudo apt install libgmp-dev libmpfr-dev gcc python3-numpy
+# Download the updated Gemma 4 chat template (required for correct output)
+curl -L -o gemma4_chat_template.jinja \
+  "https://huggingface.co/google/gemma-4-26B-A4B-it/raw/main/chat_template.jinja"
+
+# Launch the server
+llama-server \
+  -m Gemma-4-26B-A4B-it-Q2_K-HexState.gguf \
+  -ngl 0 \
+  -c 4096 \
+  --host 0.0.0.0 --port 8989 \
+  --jinja \
+  --chat-template-file gemma4_chat_template.jinja \
+  --cache-ram 0 \
+  -ctxcp 1
 ```
 
-### Build
+> **Important flags:**
+> - `--jinja --chat-template-file` — Uses Google's latest Gemma 4 template. The template embedded in older GGUFs is broken. Without this, you get garbage output.
+> - `--cache-ram 0 -ctxcp 1` — Prevents the sliding window attention checkpoint RAM explosion that affects all Gemma 4 models.
+> - `-ngl 0` — CPU-only. Increase for GPU offload (e.g., `-ngl 20` for partial offload on 12 GB VRAM).
+
+### llama.cpp CLI
 
 ```bash
-cd LLM
-
-# Build the HPC C engine (shared library for Python integration)
-gcc -O2 -std=gnu99 -shared -fPIC -I.. \
-    -DHEXSTATE_LIBRARY -o libhexstate_q2k.so \
-    hexstate_quantize.c ../quhit_triality.c ../quhit_hexagram.c ../s6_exotic.c \
-    -lm -lgmp -lmpfr
-
-# Or build the standalone binary
-make -f Makefile.quantize
+llama-cli \
+  -m Gemma-4-26B-A4B-it-Q2_K-HexState.gguf \
+  --jinja \
+  --chat-template-file gemma4_chat_template.jinja \
+  -p "Implement a concurrent hash map in C" \
+  -n 512 --temp 0.3
 ```
 
-### Quantize a Model
+### Ollama
+
+> ⚠️ **Ollama has known issues with Gemma 4.** If you get garbage output, switch to llama.cpp server or LM Studio. This is an [Ollama-side problem](https://old.reddit.com/r/LocalLLaMA/comments/1shs6sx/more_gemma4_fixes_in_the_past_24_hours/), not a model issue.
+
+```
+FROM ./Gemma-4-26B-A4B-it-Q2_K-HexState.gguf
+
+PARAMETER temperature 0.4
+PARAMETER num_ctx 2048
+PARAMETER repeat_penalty 1.15
+PARAMETER top_k 30
+PARAMETER top_p 0.85
+PARAMETER mlock true
+```
+
+### API Usage
+
+Once the server is running, use the OpenAI-compatible API:
 
 ```bash
-# Step 1: Convert HuggingFace model to BF16 GGUF (requires llama.cpp)
-python3 convert_hf_to_gguf.py gemma-4-E2B-it/ \
-    --outfile Gemma-4-E2B-it-BF16.gguf --outtype bf16
-
-# Step 2: Generate importance matrix (recommended, ~15 min)
-llama-imatrix -m Gemma-4-E2B-it-BF16.gguf \
-    -f calibration_data.txt \
-    -o imatrix.dat --chunks 100
-
-# Step 3: HexState quantization (~80 min for 4.65B model)
-python3 LLM/hexstate_requantize.py \
-    Gemma-4-E2B-it-BF16.gguf \
-    Gemma-4-E2B-it-Q2_K-HexState.gguf \
-    --keep-metadata \
-    --imatrix imatrix.dat
+curl http://localhost:8989/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Write a Python LRU cache"}],
+    "temperature": 0.3,
+    "max_tokens": 512
+  }'
 ```
 
-The quantizer automatically detects `libhexstate_q2k.so` in the `LLM/` directory:
+---
 
-```
-  ╔════════════════════════════════════════════════════════════════╗
-  ║  HExState GGUF Re-Quantizer                                  ║
-  ║  GGUF → Q2_K GGUF with metadata passthrough                  ║
-  ║  Engine: HPC + iMatrix (calibrated sensitivity propagation)  ║
-  ╚════════════════════════════════════════════════════════════════╝
+## Recommended Settings
 
-  Tensors to quantize (Q2_K): 318
-  Tensors to keep as-is:      283
-```
+| Parameter | Value | Why |
+|-----------|-------|-----|
+| `temperature` | 0.3–0.4 | Lower than default — reduces sampling noise at low BPW |
+| `top_k` | 20–30 | Narrow sampling keeps output coherent |
+| `top_p` | 0.8–0.85 | Cuts the noisy long tail |
+| `repeat_penalty` | 1.15–1.2 | Prevents self-correction loops |
+| `context` | 2048–4096 | Higher contexts increase RAM usage significantly |
 
-Without the `.so`, the quantizer falls back to a pure-Python numpy implementation
-(correct output, without HPC optimization).
+For **deterministic code generation**, use `temperature 0`.
 
-### Run Inference
-
-```bash
-# llama.cpp server
-llama-server -m Gemma-4-E2B-it-Q2_K-HexState.gguf \
-    --jinja --port 8899 -ngl 12 -c 4096
-
-# Or direct CLI
-llama-cli -m Gemma-4-E2B-it-Q2_K-HexState.gguf \
-    -p "What is 17 * 23?" -n 256 --temp 0
-```
+---
 
 ## How It Works
 
-### HPC Quantization Engine
+Standard quantizers use round-to-nearest: for each weight block, compute a scale and round. HexState uses **HPC beam search with triality-enhanced belief propagation** — a fundamentally different approach.
 
-For weight tensors (< 50M elements), the C engine performs sensitivity-aware
-optimization:
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  For each weight tensor:                                │
-│                                                         │
-│  1. Build HPCGraph over 256-weight superblocks          │
-│  2. Encode 6 scale candidates as Boltzmann amplitudes   │
-│     into Z₆ quhit local states (triality DFT)          │
-│  3. Wire CZ edges (nearest-neighbor) + hexagram edges   │
-│  4. Run Möbius amplitude belief propagation             │
-│  5. Extract marginal entropy per block:                 │
-│       high entropy → sensitive → needs precision        │
-│       low entropy  → confident → can compress harder    │
-│  6. Sensitivity-weighted MSE grid search with iMatrix   │
-│  7. Pack into Q2_K blocks (scales|qs|d|dmin)            │
-└─────────────────────────────────────────────────────────┘
-```
-
-### Embedding Quantization
-
-For massive embedding tensors (> 50M elements, e.g., the 262K-vocab table at
-2.35B elements), the engine uses chunked numpy vectorized quantization in
-10M-element batches for speed while maintaining Q2_K format compatibility.
-
-### iMatrix Integration
-
-The importance matrix (generated by `llama-imatrix`) provides per-column importance
-weights derived from calibration data. The quantizer uses these as weighted
-least-squares coefficients — columns with higher importance get prioritized in the
-scale optimization, allocating more of the Q2_K precision budget where it matters most.
-
-## Architecture
+### The Pipeline
 
 ```
-hexstate_requantize.py          Python GGUF-to-GGUF pipeline
-    │                           Reads source GGUF, copies all metadata,
-    │                           re-quantizes weight tensors to Q2_K
-    │
-    ├── libhexstate_q2k.so      HPC C engine (loaded via ctypes)
-    │   ├── HPCGraph             Sensitivity graph over weight blocks
-    │   ├── triality DFT         Z₆ amplitude encoding
-    │   ├── Möbius BP            Belief propagation convergence
-    │   └── MSE grid search      Sensitivity-weighted scale optimization
-    │
-    ├── hexstate_quantize.c      Source for the C engine + standalone binary
-    ├── gguf_format.h            GGUF v3 binary format (BlockQ2K, FP16, etc.)
-    ├── safetensors_reader.h     Direct safetensors loading (standalone mode)
-    ├── tokenizer_reader.h       HF tokenizer.json parser
-    ├── imatrix_reader.h         Importance matrix loader
-    └── Makefile.quantize        Build configuration
+┌─────────────────────────────────────────────────────────────┐
+│  For each weight tensor:                                     │
+│                                                              │
+│  1. Compute greedy reference scales per block                │
+│  2. Generate candidate grid (10–100 scale variants)          │
+│  3. Encode candidates as Z₆ complex amplitudes               │
+│  4. Build constraint graph (inter-block coupling)            │
+│  5. Run belief propagation in 3 simultaneous views:          │
+│       Edge × Vertex × Diagonal (triality)                    │
+│  6. Combine via geometric mean:                              │
+│       marginal[v] = ∛(edge × vertex × diagonal)             │
+│  7. 12-beam Hensel search using combined marginals           │
+│  8. Pack into GGUF blocks with optimal scales                │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-## Q2_K Block Layout
+### Why Attention Gets Q4_0
 
-The Q2_K block format (84 bytes per 256 weights) must match ggml's `block_q2_K` exactly:
+Quantization noise in attention projections cascades through `softmax(Q·K^T/√d)·V`. A single bad scale in a Q block shifts dot products enough to promote wrong tokens — manifesting as:
+- Korean/Arabic character injection
+- Word substitutions
+- Self-correction loops
+
+Promoting Q/K/V/O to Q4_0 (16 levels vs 4) eliminates these artifacts at a cost of only ~0.5 GB.
+
+### RMSE Quality
+
+| Metric | Value |
+|--------|-------|
+| Q4_0·HPC attention RMSE range | 2.8e-03 – 3.5e-03 |
+| e-02 outliers | **0 out of 115 tensors** |
+| Q2_K FFN RMSE range | consistent e-03 |
+
+Zero RMSE outliers across every attention tensor. Standard round-to-nearest quantizers cannot achieve this.
+
+---
+
+## Known Limitations
+
+1. **Low-frequency code patterns** (Win32 C, niche APIs) may have minor syntax errors — the Q2_K FFN layers lose precision on rare token sequences. Common patterns (Python, algorithms) are clean.
+
+2. **The `if __name__ == "__main__":` idiom** occasionally gets mangled — this is a known fragile pattern under aggressive quantization.
+
+3. **Safety alignment degradation** — extreme quantization (< 3 BPW) can weaken RLHF guardrails. The model may comply with requests the original would refuse. Evaluate safety properties before deployment.
+
+4. **Ollama compatibility** — Ollama's Gemma 4 support is unreliable as of April 2026. Use llama.cpp or LM Studio.
+
+---
+
+## Technical Details
+
+### Q2_K Block Layout (84 bytes / 256 weights)
 
 ```
 Offset  Size  Field
-──────  ────  ─────────────────────────────────
   0      16   scales[16]    4-bit scale | 4-bit min per sub-block
  16      64   qs[64]        packed 2-bit quants (4 per byte)
  80       2   d             fp16 super-block scale
  82       2   dmin          fp16 super-block min scale
-──────  ────
- 84 bytes total = 2.625 bits per weight
 ```
 
-> **Critical:** The field order is `scales → qs → d → dmin`. Many implementations
-> incorrectly place `d, dmin` first — this causes silent data corruption where
-> the model loads but generates garbage.
+### Q4_0 Block Layout (18 bytes / 32 weights)
 
-## Gemma 4 Specifics
-
-| Feature | How We Handle It |
-|---------|-----------------|
-| **Per-layer FFN sizes** (6144/12288) | Metadata passthrough from source GGUF |
-| **Sliding window attention** (512 tokens) | Preserved in `gemma4.attention.sliding_window` KV |
-| **Shared KV heads** (GQA, 8→1) | Preserved in per-layer `n_embd_k_gqa` arrays |
-| **262,144 token vocabulary** | Q2_K quantized (uniform precision) |
-| **Weight-tied embeddings** | Handled by llama.cpp internally |
-| **Gated Delta Net (linear attention)** | Transparent — handled at inference |
-
-## Optimizer Modes
-
-```bash
-./hexstate_quantize model_dir/ output.gguf --optimizer hybrid   # (default)
-./hexstate_quantize model_dir/ output.gguf --optimizer hpc      # BP only
-./hexstate_quantize model_dir/ output.gguf --optimizer mse      # grid search only
+```
+Offset  Size  Field
+  0       2   d             fp16 block scale
+  2      16   qs[16]        packed 4-bit quants (2 per byte)
+                             nibble order: qs[j] = w[j] | (w[j+16] << 4)
 ```
 
-| Mode | Description | Speed | Quality |
-|------|------------|-------|---------|
-| `hpc` | BP sensitivity only, reference quantization | Fast | Good |
-| `mse` | MSE grid search (from llm-compressor) | Medium | Better |
-| `hybrid` | BP sensitivity → weighted MSE grid | Slow | **Best** |
+### Gemma 4 MoE Handling
 
-## Benchmarks
+| Challenge | Solution |
+|-----------|----------|
+| `model.language_model.layers.` tensor prefix | Dual prefix detection |
+| Non-256-aligned expert dimensions | Auto-fallback to Q4_0 |
+| MoE router weights | Excluded from quantization |
+| 64 experts per layer | Fused tensor handling |
+| Sliding window attention (512) | Metadata passthrough |
 
-### Perplexity (wikitext-2, 59 chunks, n_ctx=512)
-
-| Quantization | Size | BPW | PPL ± σ |
-|-------------|------|-----|---------|
-| BF16 (baseline) | 8.67 GB | 16.00 | 154.0 ± 5.1 |
-| ggml Q2_K + iMatrix | 2.77 GB | 5.12 | 89.1 ± 3.3 |
-| **HexState full Q2_K** | **1.44 GB** | **2.63** | **129.6 ± 4.6** |
-| HexState selective Q2_K | 5.74 GB | 10.58 | 107.6 ± 3.7 |
-| ggml Q2_K (no iMatrix) | 2.77 GB | 5.12 | 651.0 |
-
-### Reasoning Tests (temp=0, Gemma 4 E2B-it)
-
-| Test | BF16 | HexState | ggml |
-|------|------|----------|------|
-| Arithmetic (17×23) | ✅ 391 | ✅ 391 | ✅ 391 |
-| Syllogism logic | ✅ No | ✅ No | ✅ No |
-| Word problem (eggs) | ✅ 5 | ✅ 5 | ✅ 5 |
-| Generation speed | 4.2 t/s | **18.1 t/s** | 14.0 t/s |
-
-### Safety Note
-
-Extreme quantization (< 3 BPW) can degrade RLHF safety alignment. Models may
-comply with requests that the original model would refuse. Always evaluate safety
-properties before deployment and include appropriate disclaimers when distributing
-heavily quantized models.
+---
 
 ## License
 
-Part of the HexState project.
+This quantization inherits the [Gemma license](https://ai.google.dev/gemma/terms) from the base model.
+
+## Credits
+
+Quantized with the [HexState HPC Engine](https://github.com/user/HexState) — triality-enhanced belief propagation over hexagonal constraint graphs.
+
+
+**The smallest functional quantization of Gemma 4 26B. 10.2 GB. Runs on 12 GB hardware.**
+
+No other public quantization of this model fits in 12 GB. The second smallest community quant is ~12 GB and requires 14+ GB at runtime.
+
+---
+
+## Model Details
+
+| | |
+|---|---|
+| **Base Model** | [google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it) |
+| **Architecture** | Gemma 4 MoE — 26B total params, 4B active per token, 64 experts |
+| **Quantization** | Mixed Q2_K (2.63 bpw) + Q4_0·HPC (4.5 bpw) |
+| **File Size** | **10.2 GB** |
+| **Format** | GGUF v3 — compatible with llama.cpp, LM Studio, Ollama |
+| **Quantizer** | [HexState HPC Engine](https://github.com/user/HexState) |
+
+### Precision Tiers
+
+| Layer Type | Quantization | BPW | Method |
+|-----------|-------------|-----|--------|
+| Attention Q/K/V/O | Q4_0·HPC | 4.5 | 12-beam Hensel search + triality BP |
+| FFN / MLP / Experts | Q2_K·HPC | 2.63 | 100-candidate beam search + triality BP |
+| Embeddings / Norms | F16 / F32 | 16–32 | Preserved |
+| MoE Router / Gates | F16 / F32 | 16–32 | Preserved — quantizing these breaks expert dispatch |
+
+---
+
+## Size Comparison
+
+| Quantization | Size | Fits 12 GB? | Source |
+|-------------|------|:-----------:|--------|
+| BF16 | 48.5 GB | ❌ | Google |
+| Q8_0 | ~27 GB | ❌ | Community |
+| Q6_K | ~22 GB | ❌ | Community |
+| Q4_K_M | 16.8 GB | ❌ | LM Studio / bartowski |
+| IQ3_K_XXS | ~12 GB | ⚠️ | Unsloth |
+| **HexState (this)** | **10.2 GB** | **✅** | **HexState HPC** |
+
+---
+
+## Quick Start
+
+### LM Studio
+
+1. Download the GGUF
+2. Place in your LM Studio models directory
+3. Load and chat — LM Studio auto-detects the Gemma 4 template
+
+### llama.cpp Server
+
+```bash
+# Download the updated Gemma 4 chat template (required for correct output)
+curl -L -o gemma4_chat_template.jinja \
+  "https://huggingface.co/google/gemma-4-26B-A4B-it/raw/main/chat_template.jinja"
+
+# Launch the server
+llama-server \
+  -m Gemma-4-26B-A4B-it-Q2_K-quant.gguf \
+  -ngl 0 \
+  -c 4096 \
+  --host 0.0.0.0 --port 8989 \
+  --jinja \
+  --chat-template-file gemma4_chat_template.jinja \
+  --cache-ram 0 \
+  -ctxcp 1
+```
+
+> **Important flags:**
+> - `--jinja --chat-template-file` — Uses Google's latest Gemma 4 template. The template embedded in older GGUFs is broken. Without this, you get garbage output.
+> - `--cache-ram 0 -ctxcp 1` — Prevents the sliding window attention checkpoint RAM explosion that affects all Gemma 4 models.
+> - `-ngl 0` — CPU-only. Increase for GPU offload (e.g., `-ngl 20` for partial offload on 12 GB VRAM).
+
+### llama.cpp CLI
+
+```bash
+llama-cli \
+  -m Gemma-4-26B-A4B-it-quant.gguf \
+  --jinja \
+  --chat-template-file gemma4_chat_template.jinja \
+  -p "Implement a concurrent hash map in C" \
+  -n 512 --temp 0.3
+```
+
+### Ollama
+
+> ⚠️ **Ollama has known issues with Gemma 4.** If you get garbage output, switch to llama.cpp server or LM Studio. This is an [Ollama-side problem](https://old.reddit.com/r/LocalLLaMA/comments/1shs6sx/more_gemma4_fixes_in_the_past_24_hours/), not a model issue.
+
+```
+FROM ./Gemma-4-26B-A4B-it-Q2_K-HexState.gguf
+
+PARAMETER temperature 0.4
+PARAMETER num_ctx 2048
+PARAMETER repeat_penalty 1.15
+PARAMETER top_k 30
+PARAMETER top_p 0.85
+PARAMETER mlock true
+```
+
+### API Usage
+
+Once the server is running, use the OpenAI-compatible API:
+
+```bash
+curl http://localhost:8989/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Write a Python LRU cache"}],
+    "temperature": 0.3,
+    "max_tokens": 512
+  }'
+```
+
+---
+
+## Recommended Settings
+
+| Parameter | Value | Why |
+|-----------|-------|-----|
+| `temperature` | 0.3–0.4 | Lower than default — reduces sampling noise at low BPW |
+| `top_k` | 20–30 | Narrow sampling keeps output coherent |
+| `top_p` | 0.8–0.85 | Cuts the noisy long tail |
+| `repeat_penalty` | 1.15–1.2 | Prevents self-correction loops |
+| `context` | 2048–4096 | Higher contexts increase RAM usage significantly |
+
+For **deterministic code generation**, use `temperature 0`.
+
+---
+
+## How It Works
+
+Standard quantizers use round-to-nearest: for each weight block, compute a scale and round. HexState uses **HPC beam search with triality-enhanced belief propagation** — a fundamentally different approach.
+
+### The Pipeline
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  For each weight tensor:                                     │
+│                                                              │
+│  1. Compute greedy reference scales per block                │
+│  2. Generate candidate grid (10–100 scale variants)          │
+│  3. Encode candidates as Z₆ complex amplitudes               │
+│  4. Build constraint graph (inter-block coupling)            │
+│  5. Run belief propagation in 3 simultaneous views:          │
+│       Edge × Vertex × Diagonal (triality)                    │
+│  6. Combine via geometric mean:                              │
+│       marginal[v] = ∛(edge × vertex × diagonal)             │
+│  7. 12-beam Hensel search using combined marginals           │
+│  8. Pack into GGUF blocks with optimal scales                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Why Attention Gets Q4_0
+
+Quantization noise in attention projections cascades through `softmax(Q·K^T/√d)·V`. A single bad scale in a Q block shifts dot products enough to promote wrong tokens — manifesting as:
+- Korean/Arabic character injection
+- Word substitutions
+- Self-correction loops
+
+Promoting Q/K/V/O to Q4_0 (16 levels vs 4) eliminates these artifacts at a cost of only ~0.5 GB.
+
+### RMSE Quality
+
+| Metric | Value |
+|--------|-------|
+| Q4_0·HPC attention RMSE range | 2.8e-03 – 3.5e-03 |
+| e-02 outliers | **0 out of 115 tensors** |
+| Q2_K FFN RMSE range | consistent e-03 |
+
+Zero RMSE outliers across every attention tensor. Standard round-to-nearest quantizers cannot achieve this.
+
+---
+
+## Known Limitations
+
+1. **Low-frequency code patterns** (Win32 C, niche APIs) may have minor syntax errors — the Q2_K FFN layers can sometimes lose precision on rare token sequences. Common patterns (Python, algorithms) are clean.
+
+2. **The `if __name__ == "__main__":` idiom** sometimes gets mangled — this is a known fragile pattern under aggressive quantization.
+
+3. **Safety alignment degradation** — extreme quantization (< 3 BPW) can weaken RLHF guardrails. The model may comply with requests the original would refuse. Evaluate safety properties before deployment.
+
+4. **Ollama compatibility** — Ollama's Gemma 4 support is unreliable as of April 2026. Use llama.cpp or LM Studio.
+
+---
+
+## Technical Details
+
+### Q2_K Block Layout (84 bytes / 256 weights)
+
+```
+Offset  Size  Field
+  0      16   scales[16]    4-bit scale | 4-bit min per sub-block
+ 16      64   qs[64]        packed 2-bit quants (4 per byte)
+ 80       2   d             fp16 super-block scale
+ 82       2   dmin          fp16 super-block min scale
+```
+
+### Q4_0 Block Layout (18 bytes / 32 weights)
+
+```
+Offset  Size  Field
+  0       2   d             fp16 block scale
+  2      16   qs[16]        packed 4-bit quants (2 per byte)
+                             nibble order: qs[j] = w[j] | (w[j+16] << 4)
+```
+
+### Gemma 4 MoE Handling
+
+| Challenge | Solution |
+|-----------|----------|
+| `model.language_model.layers.` tensor prefix | Dual prefix detection |
+| Non-256-aligned expert dimensions | Auto-fallback to Q4_0 |
+| MoE router weights | Excluded from quantization |
+| 64 experts per layer | Fused tensor handling |
+| Sliding window attention (512) | Metadata passthrough |
+
+---
+
+## License
+
+This quantization inherits the [Gemma license](https://ai.google.dev/gemma/terms) from the base model.
+
+## Credits
+
+Quantized with the [HexState HPC Engine](https://github.com/user/HexState) — triality-enhanced belief propagation over hexagonal constraint graphs.
